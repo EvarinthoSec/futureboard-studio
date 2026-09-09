@@ -25,6 +25,7 @@ fn main() {
         "src/editorplatform/windows/editor_windows_windowproc.cpp",
         "src/editorplatform/macos/editor_mac.mm",
         "src/editorplatform/macos/editor_mac_delegate.mm",
+        "src/editorplatform/macos/editor_mac_embed.mm",
         "src/editorplatform/macos/editor_mac_helpers.mm",
         "src/editorplatform/macos/editor_mac_internal.hpp",
         "src/editor_linux.cpp",
@@ -234,6 +235,7 @@ fn apply_vst3_platform_config(
             for source in &[
                 "src/editorplatform/macos/editor_mac.mm",
                 "src/editorplatform/macos/editor_mac_delegate.mm",
+                "src/editorplatform/macos/editor_mac_embed.mm",
                 "src/editorplatform/macos/editor_mac_helpers.mm",
             ] {
                 build.file(bridge_root.join(source));

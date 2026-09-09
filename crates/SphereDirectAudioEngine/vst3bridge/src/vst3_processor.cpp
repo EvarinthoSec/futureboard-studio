@@ -4178,6 +4178,16 @@ sphere_daux_vst3_embed_editor(SphereDauxVst3Processor *processor,
         title_copy.empty() ? "Plugin Editor" : title_copy.c_str(), width,
         height);
   }
+#elif defined(__APPLE__)
+  // `parent_hwnd` is the platform's native parent handle; on macOS that is the
+  // host's container NSView*, mounted in the GPUI editor window. The x/y are
+  // the host's business — it positions its own container — so only the size
+  // reaches the plug-in.
+  (void)x;
+  (void)y;
+  return embed_editor_mac(
+      processor, reinterpret_cast<void *>(static_cast<std::uintptr_t>(parent_hwnd)),
+      width, height);
 #else
   (void)processor;
   (void)parent_hwnd;
@@ -4258,6 +4268,13 @@ sphere_daux_vst3_embed_set_bounds(SphereDauxVst3Processor *processor, int x,
                  "constrained=%dx%d\n",
                  width, height, content_w, content_h);
   }
+#elif defined(__APPLE__)
+  // The host owns and positions its container view, so x/y are its business;
+  // only the size is the plug-in's. `embed_resize_mac` is a no-op unless an
+  // editor is actually embedded, so the NSWindow path is unaffected.
+  (void)x;
+  (void)y;
+  embed_resize_mac(processor, width, height);
 #else
   (void)processor;
   (void)x;
@@ -4706,8 +4723,14 @@ sphere_daux_vst3_embed_detach(SphereDauxVst3Processor *processor) {
   // instance stays alive (close_editor_linux only tears down the editor).
   close_editor_linux(processor);
 #elif defined(__APPLE__)
-  // Host-owned top-level NSWindow; the audio instance stays alive.
-  close_editor_mac(processor);
+  // Two macOS editor shapes, and they tear down differently: an embedded view
+  // is only detached (the host's container survives for the next open), while
+  // the bridge-owned NSWindow is closed. The audio instance stays alive either
+  // way — this is an editor lifecycle event, not a DSP one.
+  if (processor && processor->editor_embed_mode)
+    embed_detach_mac(processor);
+  else
+    close_editor_mac(processor);
 #else
   (void)processor;
 #endif
@@ -4753,7 +4776,14 @@ sphere_daux_vst3_embed_is_valid(SphereDauxVst3Processor *processor) {
           IsWindow(processor->editor_attach_hwnd))
              ? 1
              : 0;
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(__APPLE__)
+  // An embedded editor has no NSWindow of its own — the window is GPUI's — so
+  // asking for one would report every embedded editor as invalid and tear it
+  // down on the next poll.
+  if (processor && processor->editor_embed_mode)
+    return embed_is_attached_mac(processor);
+  return (processor && processor->editor_native_window) ? 1 : 0;
+#elif defined(__linux__)
   return (processor && processor->editor_native_window) ? 1 : 0;
 #else
   (void)processor;

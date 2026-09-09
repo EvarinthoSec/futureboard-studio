@@ -533,6 +533,15 @@ struct SphereDauxVst3Processor {
   // Installed before attached(), matching the VST3 editorhost contract. This
   // lets editors such as Kontakt finalize or later change their native size.
   MacPluginEditorFrame *editor_frame{nullptr};
+  // ── GPUI-embedded editor state (macOS) ───────────────────────────────────
+  // When the editor is hosted inside the GPUI plug-in editor window rather
+  // than the daux-owned NSWindow above, the container NSView belongs to the
+  // Rust side (SphereUIComponents `plugin_editor_mac_region`) and this is a
+  // *borrowed* reference to it: never retained, moved, resized or released
+  // here. Two layers each believing they own an AppKit view is how one gets
+  // released out from under a plug-in that is still drawing into it.
+  void *editor_embed_parent{nullptr};
+  bool editor_embed_mode{false};
 #endif
   // Host-owned top-level editor (Linux/macOS): set when the user closes the
   // editor window via its own titlebar so the external plugin-host process can
