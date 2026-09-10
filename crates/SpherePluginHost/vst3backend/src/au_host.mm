@@ -22,6 +22,9 @@
 
 #include "sphere_au_host.h"
 
+#include "sphere_daux_editor_chrome.h"
+#include "sphere_daux_editor_shell_mac.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -969,6 +972,8 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
 
   if (instance->editor_window != nullptr) {
     NSWindow* window = (__bridge NSWindow*)instance->editor_window;
+    // The unit's own view, not the window's content view — the content view is
+    // the shell, and its height includes the chrome.
     NSView* view = (__bridge NSView*)instance->editor_view;
     if (out_width != nullptr) {
       *out_width = static_cast<unsigned int>(std::max<CGFloat>(view.frame.size.width, 1.0));
@@ -1044,25 +1049,26 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
         std::max<unsigned int>(preferred_height, 360));
     [view setFrameSize:size];
   }
-  NSRect content_rect = NSMakeRect(0.0, 0.0, size.width, size.height);
-  NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskMiniaturizable;
-  NSWindow* window = [[NSWindow alloc] initWithContentRect:content_rect
-                                                 styleMask:style
-                                                   backing:NSBackingStoreBuffered
-                                                     defer:NO];
-  NSString* window_title = [NSString
-      stringWithUTF8String:(title != nullptr && title[0] != '\0') ? title : "Audio Unit"];
-  window.title = window_title;
-  window.backgroundColor = NSColor.blackColor;
-  window.level = NSFloatingWindowLevel;
-  window.releasedWhenClosed = NO;
-  window.contentView = view;
-  [window center];
-
+  // Window, chrome strip and the container the unit's view goes in all come
+  // from the shared editor window — the one place that knows a host-owned
+  // editor window is "chrome strip, then plug-in", and the same one a VST3,
+  // VST2 or CLAP editor is built from. `size` stays the *unit's* own size,
+  // which is what the caller reports back as the editor's dimensions.
   SphereAuEditorWindowDelegate* delegate = [[SphereAuEditorWindowDelegate alloc] init];
   delegate.instance = instance;
-  window.delegate = delegate;
+
+  NSString* window_title = [NSString
+      stringWithUTF8String:(title != nullptr && title[0] != '\0') ? title : "Audio Unit"];
+  // An Audio Unit's Cocoa view has no resize contract of its own — the factory
+  // hands back a view at the size it wants — so the window is fixed, like the
+  // fixed-size editors of every other format.
+  NSWindow* window = sphere_daux_editor_window_create(size, window_title, NO, delegate);
+  window.backgroundColor = NSColor.blackColor;
+
+  NSView* container = sphere_daux_editor_window_plugin_container(window);
+  [view setFrame:NSMakeRect(0.0, 0.0, size.width, size.height)];
+  view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [container addSubview:view];
 
   instance->editor_window = (__bridge_retained void*)window;
   instance->editor_view = (__bridge_retained void*)view;
@@ -1084,6 +1090,20 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
       handle, out_width != nullptr ? *out_width : 0,
       out_height != nullptr ? *out_height : 0);
   return handle;
+}
+
+/// The `NSWindow*` of this unit's editor, as an opaque handle.
+///
+/// 0 whenever no editor is open. The caller passes it straight to the shared
+/// editor-chrome ABI, which addresses the strip by the window it lives in — the
+/// same way it is addressed for a VST3, VST2 or CLAP editor, none of whose
+/// instance types this one can name.
+SPHERE_AU_HOST_API unsigned long long
+sphere_au_editor_native_window(SphereAuInstance* instance) {
+  if (instance == nullptr) {
+    return 0;
+  }
+  return reinterpret_cast<unsigned long long>(instance->editor_window);
 }
 
 SPHERE_AU_HOST_API void sphere_au_close_editor(SphereAuInstance* instance) {

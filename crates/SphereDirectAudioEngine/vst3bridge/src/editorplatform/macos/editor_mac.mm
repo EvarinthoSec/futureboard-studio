@@ -81,21 +81,18 @@ void daux_resize_editor_content(SphereDauxVst3Processor *proc, int width,
   if (!window_ptr || !embed_ptr)
     return;
 
+
   NSWindow *window = (__bridge NSWindow *)window_ptr;
-  NSView *embed = (__bridge NSView *)embed_ptr;
+  (void)embed_ptr;
   DauxEditorWindowDelegate *delegate =
       delegate_ptr ? (__bridge DauxEditorWindowDelegate *)delegate_ptr : nil;
-  NSRect old_frame = window.frame;
-  NSRect content = NSMakeRect(0.0, 0.0, (CGFloat)width, (CGFloat)height);
-  NSRect frame = [window frameRectForContentRect:content];
-  // AppKit screen coordinates grow upward. Keep the titlebar/top-left fixed so
-  // a plug-in resize never makes the editor jump around the display.
-  frame.origin.x = old_frame.origin.x;
-  frame.origin.y = NSMaxY(old_frame) - frame.size.height;
 
+  // `width`/`height` are the *plug-in's* content size; the shared helper adds
+  // the chrome strip, keeps the top-left fixed and re-frames both bands. The
+  // guard stops the resize we are about to cause coming back as a user resize.
   delegate.applyingHostResize = YES;
-  [window setFrame:frame display:YES];
-  [embed setFrame:content];
+  sphere_daux_editor_window_set_plugin_size(
+      window, NSMakeSize((CGFloat)width, (CGFloat)height));
   delegate.applyingHostResize = NO;
   sphere_daux_editor_set_content_size(proc, width, height);
 
@@ -104,6 +101,18 @@ void daux_resize_editor_content(SphereDauxVst3Processor *proc, int width,
   std::fprintf(stderr,
                "[SphereVST3/mac] content resize reason=%s size=%dx%d\n",
                reason ? reason : "unknown", width, height);
+}
+
+/// Host-requested resize of the editor window (`sphere_daux_vst3_view_set_size`).
+///
+/// Unlike `sphere_daux_editor_apply_plugin_resize`, which answers a size the
+/// *plug-in* asked for and therefore must not echo it back, this size comes
+/// from the host, so the view is told about it — that report is the whole point
+/// of the call.
+void resize_editor_mac(SphereDauxVst3Processor *proc, int width, int height,
+                       const char *reason) {
+  daux_resize_editor_content(proc, width, height, true,
+                             reason ? reason : "view-host-set-size");
 }
 
 extern "C" int sphere_daux_editor_apply_plugin_resize(
@@ -152,40 +161,26 @@ unsigned long long open_editor_mac(SphereDauxVst3Processor *proc,
     return 0;
   }
 
-  // ── Step 2: Create NSWindow ───────────────────────────────────────────────
+  // ── Step 2/3/4: Window, chrome strip and the IPlugView parent ────────────
 
-  NSRect content_rect = NSMakeRect(0.0, 0.0, (CGFloat)editor_width,
-                                   (CGFloat)editor_height);
-  bool editor_resizable = sphere_daux_editor_can_resize(proc) != 0;
-  NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskMiniaturizable;
-  if (editor_resizable)
-    style |= NSWindowStyleMaskResizable;
-
-  NSWindow *window = [[NSWindow alloc] initWithContentRect:content_rect
-                                                 styleMask:style
-                                                   backing:NSBackingStoreBuffered
-                                                     defer:NO];
-
-  NSString *ns_title = [NSString
-      stringWithUTF8String:(title && *title) ? title : "Plugin Editor"];
-  [window setTitle:ns_title];
-  [window setBackgroundColor:daux_bg_color()];
-  [window setLevel:NSFloatingWindowLevel];
-  [window center];
-
-  // ── Step 3: Create embed NSView (IPlugView parent) ────────────────────────
-
-  NSView *embed = [[NSView alloc] initWithFrame:content_rect];
-  embed.wantsLayer = YES;
-  embed.layer.backgroundColor = daux_bg_color().CGColor;
-  [window setContentView:embed];
-
-  // ── Step 4: Attach NSWindowDelegate ──────────────────────────────────────
-
+  // All three come from the shared editor window, which every format bridge
+  // opens through: it is the one place that knows a host-owned editor window is
+  // "chrome strip, then plug-in", and the one place that positions either band.
+  // `editor_width`/`editor_height` stay the *plug-in's* size throughout — the
+  // only size a plug-in ever agrees to.
   DauxEditorWindowDelegate *delegate = [[DauxEditorWindowDelegate alloc] init];
   delegate.processor = proc;
-  [window setDelegate:delegate];
+
+  const bool editor_resizable = sphere_daux_editor_can_resize(proc) != 0;
+  NSWindow *window = sphere_daux_editor_window_create(
+      NSMakeSize((CGFloat)editor_width, (CGFloat)editor_height),
+      [NSString stringWithUTF8String:(title && *title) ? title
+                                                       : "Plugin Editor"],
+      editor_resizable ? YES : NO, delegate);
+  [window setBackgroundColor:daux_bg_color()];
+
+  NSView *embed = sphere_daux_editor_window_plugin_container(window);
+  embed.layer.backgroundColor = daux_bg_color().CGColor;
 
   // ── Step 5: Attach IPlugView to NSView ────────────────────────────────────
 

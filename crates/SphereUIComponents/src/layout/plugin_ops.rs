@@ -9,6 +9,7 @@ use crate::components::plugin_picker::{
 };
 use crate::components::timeline::timeline_state::{PluginRuntimeBackend, PluginRuntimeState};
 use crate::components::transport_key::{self, TransportKeySource};
+use crate::layout::plugin_editor_chrome_ops::is_ara_editor_key;
 use SpherePluginHost::{load_au_cache_state, CatalogLoad};
 
 use super::{PluginCatalogStatus, PluginSearchIndex, StudioLayout};
@@ -2075,8 +2076,12 @@ impl StudioLayout {
         // one. Only drop the handle when its window is actually gone.
         if let Some(handle) = self.plugin_editors.open.get(&key) {
             if handle
-                .update(cx, |_, window, _| {
-                    window.activate_window();
+                .update(cx, |editor, window, cx| {
+                    // Not `activate_window` directly: on a host-owned backend
+                    // this window is not the one the user is asking for — the
+                    // editor is in the plug-in host's own window, and raising
+                    // an off-screen shell would look like nothing happened.
+                    editor.focus_editor_surface(window, cx);
                 })
                 .is_ok()
             {
@@ -2791,6 +2796,14 @@ impl StudioLayout {
         let stale: Vec<(String, String)> = {
             let state = &self.timeline.read(cx).state;
             let is_stale = |(track_id, insert_id): &&(String, String)| {
+                // An ARA editor is filed here under an `ara:` key so it sits
+                // beside the insert editors, but it is bound to a clip and has
+                // no insert slot to look up — every one of them would read as
+                // stale and be torn down the moment it opened. Its lifetime is
+                // the ARA session's (`ara_studio`), not a slot's.
+                if is_ara_editor_key(insert_id) {
+                    return false;
+                }
                 state.find_insert_slot(track_id, insert_id).is_none()
             };
             self.plugin_editors
