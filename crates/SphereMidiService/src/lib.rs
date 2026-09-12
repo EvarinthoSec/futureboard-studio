@@ -10,6 +10,15 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod expression;
+pub mod mpe;
+
+pub use expression::{
+    simplify_expression_curve, CustomExpressionLane, ExpressionCurve, ExpressionInterpolation,
+    ExpressionPoint, ExpressionSimplificationTolerances, NoteExpression, NoteExpressionLane,
+    NoteId, PitchExpressionConfig, Tick,
+};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MidiDeviceDirection {
@@ -77,6 +86,20 @@ pub enum MidiInputEvent {
     },
     ControlChange {
         controller: u8,
+        value: u8,
+        channel: u8,
+    },
+    PitchBend {
+        /// 14-bit unsigned MIDI value, where 8192 is centre.
+        value: u16,
+        channel: u8,
+    },
+    ChannelPressure {
+        value: u8,
+        channel: u8,
+    },
+    PolyPressure {
+        note: u8,
         value: u8,
         channel: u8,
     },
@@ -706,6 +729,9 @@ pub(crate) fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
         }
         0x80 => {
             let note = *bytes.get(1)?;
+            // A channel Note Off always carries release velocity, even though
+            // the legacy event type does not expose it yet.
+            let _release_velocity = *bytes.get(2)?;
             Some(MidiInputEvent::NoteOff { note, channel })
         }
         0xB0 => {
@@ -721,6 +747,19 @@ pub(crate) fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
                 })
             }
         }
+        0xA0 => Some(MidiInputEvent::PolyPressure {
+            note: *bytes.get(1)?,
+            value: *bytes.get(2)?,
+            channel,
+        }),
+        0xD0 => Some(MidiInputEvent::ChannelPressure {
+            value: *bytes.get(1)?,
+            channel,
+        }),
+        0xE0 => Some(MidiInputEvent::PitchBend {
+            value: u16::from(*bytes.get(1)?) | (u16::from(*bytes.get(2)?) << 7),
+            channel,
+        }),
         _ => None,
     }
 }

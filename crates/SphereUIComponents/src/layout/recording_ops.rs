@@ -8,6 +8,7 @@ use crate::components::timeline::timeline_state::{
     MidiNoteState, TrackAudioFormat, TrackState, TrackType, MIN_NOTE_BEATS,
 };
 use crate::components::timeline::waveform_cache::{self, WaveformPeak};
+use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
 use sphere_midi_service::MidiInputEvent;
 
 use super::{audio_recording_preview_clip_id, RecordingPreviewUi, RecordingUiState, StudioLayout};
@@ -74,6 +75,11 @@ pub(crate) struct MidiRecordingTrack {
     pub track_name: String,
     pub notes: Vec<MidiNoteState>,
     pub active_notes: HashMap<(u8, u8), ActiveMidiNote>,
+    /// Protocol-neutral recorder. It observes every event, but its result is
+    /// selected only when this take contains MPE expression data so standard
+    /// MIDI recording keeps its existing semantics.
+    pub mpe_session: MpeRecordingSession,
+    pub mpe_expression_seen: bool,
 }
 
 fn midi_recording_preview_clip_id(track_id: &str) -> String {
@@ -462,6 +468,8 @@ impl StudioLayout {
                     track_name: track.name.clone(),
                     notes: Vec::new(),
                     active_notes: HashMap::new(),
+                    mpe_session: MpeRecordingSession::new(MpeDecoder::default()),
+                    mpe_expression_seen: false,
                 })
                 .collect::<Vec<_>>();
             if !audio_armed && midi_tracks.is_empty() {
@@ -878,7 +886,30 @@ impl StudioLayout {
             MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => {
                 close_all_recorded_midi_notes(track, relative_beat);
             }
-            MidiInputEvent::ControlChange { .. } => {}
+            MidiInputEvent::ControlChange { controller, .. } => {
+                if matches!(controller, 64 | 74) {
+                    track.mpe_expression_seen = true;
+                }
+            }
+            MidiInputEvent::PitchBend { .. }
+            | MidiInputEvent::ChannelPressure { .. }
+            | MidiInputEvent::PolyPressure { .. } => {
+                track.mpe_expression_seen = true;
+            }
+        }
+        // Feed the same timestamped event to the protocol decoder. This is
+        // control-thread work; no curve optimization or project serialization
+        // occurs in the native MIDI callback.
+        if matches!(
+            event,
+            MidiInputEvent::NoteOn { .. }
+                | MidiInputEvent::NoteOff { .. }
+                | MidiInputEvent::ControlChange { .. }
+                | MidiInputEvent::PitchBend { .. }
+                | MidiInputEvent::ChannelPressure { .. }
+                | MidiInputEvent::PolyPressure { .. }
+        ) {
+            track.mpe_session.process(event, relative_beat);
         }
         self.recording.midi_preview_dirty = true;
     }
@@ -892,11 +923,20 @@ impl StudioLayout {
         let mut results = Vec::new();
         for (_, mut track) in take.tracks.drain() {
             close_all_recorded_midi_notes(&mut track, relative_end);
-            if track.notes.is_empty() {
+            let notes = if track.mpe_expression_seen {
+                track
+                    .mpe_session
+                    .finish(relative_end)
+                    .into_iter()
+                    .map(recorded_mpe_note_to_state)
+                    .collect()
+            } else {
+                track.notes
+            };
+            if notes.is_empty() {
                 continue;
             }
-            let note_end = track
-                .notes
+            let note_end = notes
                 .iter()
                 .map(|note| note.start + note.duration)
                 .fold(0.0_f32, f32::max);
@@ -905,7 +945,7 @@ impl StudioLayout {
                 track_name: track.track_name,
                 start_beat: take.start_beat,
                 duration_beats: relative_end.max(note_end).max(MIN_NOTE_BEATS),
-                notes: track.notes,
+                notes,
             });
         }
         results
@@ -1356,6 +1396,20 @@ fn push_recorded_midi_note(track: &mut MidiRecordingTrack, active: ActiveMidiNot
         duration,
         active.velocity,
     ));
+}
+
+fn recorded_mpe_note_to_state(note: RecordedNote) -> MidiNoteState {
+    let mut state = MidiNoteState::new(note.pitch, note.start, note.duration, note.velocity);
+    // The decoder id is scoped to the live take. Mint the project id through
+    // `MidiNoteState::new` so recording into an existing clip cannot collide
+    // with an older note; expression remains note-owned through this one
+    // conversion boundary, and channel assignment is intentionally discarded.
+    state.release_velocity = note
+        .release_velocity
+        .map(|value| (value.clamp(0.0, 1.0) * 127.0).round() as u8)
+        .filter(|value| *value > 0);
+    state.expression = note.expression;
+    state
 }
 
 fn close_all_recorded_midi_notes(track: &mut MidiRecordingTrack, end_beat: f32) {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sphere_midi_service::NoteExpression;
 use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
 use SphereAudioProcessor::StretchParams;
 
@@ -354,6 +355,11 @@ pub struct EngineMidiNoteSnapshot {
     pub velocity: u8,
     #[serde(default)]
     pub channel: u8,
+    /// Note-owned expression. Transport/channel assignment is resolved by
+    /// the playback adapter, so this field remains valid for MPE, native
+    /// plug-in note expression, and future MIDI 2.0 output.
+    #[serde(default)]
+    pub expression: NoteExpression,
     /// Which recorded articulation this note asks the instrument to play.
     ///
     /// A **sampled-instrument** articulation id (pizzicato, spiccato, sustain,

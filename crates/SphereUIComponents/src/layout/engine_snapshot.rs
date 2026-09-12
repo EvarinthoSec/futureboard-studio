@@ -1187,6 +1187,7 @@ fn build_engine_project_snapshot_inner(
                                 length_beats: length_beats.max(0.0) as f64,
                                 velocity,
                                 channel,
+                                expression: n.expression.clone(),
                                 // Resolved the same way playback resolves it,
                                 // so a note with no marking of its own still
                                 // follows the clip's direction lane.

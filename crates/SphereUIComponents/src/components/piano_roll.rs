@@ -38,6 +38,7 @@ use crate::components::timeline::timeline_state::{
     ScaleKind, ScaleRoot, TimelineState, MIN_NOTE_BEATS,
 };
 use crate::theme::Colors;
+use sphere_midi_service::{NoteExpression, NoteExpressionLane};
 
 // ── Layout constants (CSS px) ───────────────────────────────────────────────
 mod articulation_lane;
@@ -470,6 +471,9 @@ struct ClipboardNote {
     /// v4: the note's continuous pitch performance. Copied by value so a paste
     /// carries the expression, with fresh point ids so the copy is independent.
     pitch_curve: Option<PitchCurve>,
+    /// v5: protocol-neutral per-note expression. Curves are copied by value;
+    /// expression points have no transient editor identity to regenerate.
+    expression: NoteExpression,
 }
 
 /// Internal clipboard format version. Bumped if [`ClipboardNote`] layout or
@@ -477,8 +481,8 @@ struct ClipboardNote {
 /// mis-reading it. The clipboard is process-local today, but versioning keeps
 /// the contract explicit for a future cross-process / serialized clipboard.
 /// v2 added the per-note MIDI channel. v3 added the per-note articulation.
-/// v4 added the per-note pitch curve.
-const MIDI_CLIPBOARD_VERSION: u32 = 4;
+/// v4 added the per-note pitch curve; v5 added protocol-neutral expression.
+const MIDI_CLIPBOARD_VERSION: u32 = 5;
 
 /// Versioned clipboard payload — a version tag plus the copied notes.
 #[derive(Clone)]
@@ -2657,6 +2661,47 @@ impl PianoRoll {
         }
     }
 
+    /// Reset one or all note-owned expression lanes as a single undoable
+    /// operation. The existing full-note snapshot command is intentionally
+    /// reused so expression edits cannot bypass the normal dirty/undo path.
+    pub(super) fn reset_selected_expression(
+        &mut self,
+        lane: Option<NoteExpressionLane>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        let ids: Vec<u64> = self.selection.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let prev = self.snapshot_notes(cx, &clip_id, &ids);
+        self.timeline.update(cx, |tl, tcx| {
+            if let Some(notes) = tl.state.midi_clip_notes_mut(&clip_id) {
+                for note in notes.iter_mut() {
+                    if !ids.contains(&note.id) {
+                        continue;
+                    }
+                    if let Some(lane) = lane {
+                        match lane {
+                            NoteExpressionLane::Pitch => note.expression.pitch.points.clear(),
+                            NoteExpressionLane::Pressure => note.expression.pressure.points.clear(),
+                            NoteExpressionLane::Timbre => note.expression.timbre.points.clear(),
+                        }
+                    } else {
+                        note.expression = Default::default();
+                        note.release_velocity = None;
+                    }
+                }
+            }
+            tcx.notify();
+        });
+        let next = self.snapshot_notes(cx, &clip_id, &ids);
+        self.push_note_edit(cx, clip_id, prev, next);
+        cx.notify();
+    }
+
     /// Hand any note that left the edited clip to the clip it landed in.
     ///
     /// Returns `true` when it recorded the move, in which case the caller must
@@ -4256,6 +4301,7 @@ impl PianoRoll {
                                 .pitch_curve
                                 .as_ref()
                                 .map(PitchCurve::cloned_with_new_ids);
+                            note.expression = source.expression.clone();
                             Some(note)
                         })
                         .collect();
@@ -4754,25 +4800,30 @@ impl PianoRoll {
         if left_len < MIN_NOTE_BEATS || right_len < MIN_NOTE_BEATS {
             return;
         }
-        // Per-note expression follows the parts: the pitch curve is cut at the
-        // same beat and each half is re-based to its own note start, so a split
-        // never silently discards a performance.
+        // Per-note expression follows the parts: every expression curve is cut
+        // at the same beat and each right-hand half is re-based to its own
+        // note start, so a split never silently discards a performance.
         let (left_curve, right_curve) = original
             .pitch_curve
             .as_ref()
             .map(|curve| curve.split_at(left_len))
             .unwrap_or_default();
+        let (left_expression, right_expression) = original.expression.split_at(left_len);
         let mut left =
             MidiNoteState::new(original.pitch, original.start, left_len, original.velocity);
         left.muted = original.muted;
         left.channel = original.channel;
         left.articulation = original.articulation;
         left.pitch_curve = (!left_curve.is_empty()).then_some(left_curve);
+        left.release_velocity = None;
+        left.expression = left_expression;
         let mut right = MidiNoteState::new(original.pitch, cut, right_len, original.velocity);
         right.muted = original.muted;
         right.channel = original.channel;
         right.articulation = original.articulation;
         right.pitch_curve = (!right_curve.is_empty()).then_some(right_curve);
+        right.release_velocity = original.release_velocity;
+        right.expression = right_expression;
         let new_ids = [left.id, right.id];
         self.run_edit_command(
             EditCommand::SplitMidiNote {
@@ -4833,6 +4884,7 @@ impl PianoRoll {
                 channel: n.channel,
                 articulation: n.articulation,
                 pitch_curve: n.pitch_curve.clone(),
+                expression: n.expression.clone(),
             })
             .collect();
         MIDI_NOTE_CLIPBOARD.with(|cb| {
@@ -4870,6 +4922,7 @@ impl PianoRoll {
                     note.channel = c.channel;
                     note.articulation = c.articulation;
                     note.pitch_curve = c.pitch_curve.as_ref().map(PitchCurve::cloned_with_new_ids);
+                    note.expression = c.expression.clone();
                     note
                 })
                 .collect()
@@ -5049,6 +5102,7 @@ impl PianoRoll {
                 note.channel = n.channel;
                 note.articulation = n.articulation;
                 note.pitch_curve = n.pitch_curve.as_ref().map(PitchCurve::cloned_with_new_ids);
+                note.expression = n.expression.clone();
                 note
             })
             .collect();
@@ -5849,6 +5903,18 @@ pub struct ControllerPointRenderItem {
     pub value: f32,
 }
 
+/// Basic note-expression geometry for the dense editor renderer. Points are
+/// already in lane-local pixels and remain grouped by note id, so a renderer
+/// can overlay selected-note gestures without reconstructing transport state.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpressionRenderItem {
+    pub note_id: u64,
+    pub lane: NoteExpressionLane,
+    pub points: Vec<(f32, f32)>,
+    pub selected: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MidiEditorRenderSnapshot {
@@ -5858,6 +5924,7 @@ pub struct MidiEditorRenderSnapshot {
     pub notes: Vec<NoteRenderItem>,
     pub velocity: Vec<VelocityRenderItem>,
     pub controller_points: Vec<ControllerPointRenderItem>,
+    pub expression: Vec<ExpressionRenderItem>,
 }
 
 impl PianoRoll {
@@ -5880,6 +5947,7 @@ impl PianoRoll {
         let tl = self.timeline.read(cx);
         let mut notes = Vec::new();
         let mut velocity = Vec::new();
+        let mut expression = Vec::new();
         if let Some(ns) = tl.state.midi_clip_notes(clip_id) {
             for n in ns {
                 let d = self.display_note(n);
@@ -5907,6 +5975,37 @@ impl PianoRoll {
                         selected,
                     });
                 }
+                for (lane, curve) in [
+                    (NoteExpressionLane::Pitch, &n.expression.pitch),
+                    (NoteExpressionLane::Pressure, &n.expression.pressure),
+                    (NoteExpressionLane::Timbre, &n.expression.timbre),
+                ] {
+                    let points = curve
+                        .points
+                        .iter()
+                        .filter_map(|point| {
+                            let px = self.clip_beat_to_x(d.start + point.position);
+                            let normalized = match lane {
+                                NoteExpressionLane::Pitch => {
+                                    (point.value.clamp(-1.0, 1.0) + 1.0) * 0.5
+                                }
+                                NoteExpressionLane::Pressure | NoteExpressionLane::Timbre => {
+                                    point.value.clamp(0.0, 1.0)
+                                }
+                            };
+                            (px >= -6.0 && px <= view_w + 6.0)
+                                .then_some((px, (LANE_H - 1.0) * (1.0 - normalized)))
+                        })
+                        .collect::<Vec<_>>();
+                    if !points.is_empty() {
+                        expression.push(ExpressionRenderItem {
+                            note_id: d.id,
+                            lane,
+                            points,
+                            selected,
+                        });
+                    }
+                }
             }
         }
 
@@ -5932,6 +6031,7 @@ impl PianoRoll {
             notes,
             velocity,
             controller_points,
+            expression,
         }
     }
 }

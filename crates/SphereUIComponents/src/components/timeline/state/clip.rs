@@ -649,6 +649,7 @@ impl TimelineState {
                             .pitch_curve
                             .as_ref()
                             .map(super::PitchCurve::cloned_with_new_ids);
+                        cloned.expression = note.expression.clone();
                         cloned
                     })
                     .collect(),

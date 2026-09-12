@@ -235,6 +235,25 @@ impl StudioLayout {
                     controller.min(127),
                     value.min(127),
                 ),
+                MidiInputEvent::PitchBend { value, channel } => engine
+                    .plugin_preview_control_change(
+                        target.track_id.clone(),
+                        instance_id,
+                        MidiInputRouter::sanitize_channel(channel),
+                        129,
+                        (value.min(16_383) >> 7) as u8,
+                    ),
+                MidiInputEvent::ChannelPressure { value, channel } => engine
+                    .plugin_preview_control_change(
+                        target.track_id.clone(),
+                        instance_id,
+                        MidiInputRouter::sanitize_channel(channel),
+                        128,
+                        value.min(127),
+                    ),
+                // Poly pressure is decoded and preserved by the MPE layer;
+                // this legacy preview bridge has no per-note API yet.
+                MidiInputEvent::PolyPressure { .. } => Ok(()),
                 MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => {
                     engine.plugin_preview_all_notes_off(target.track_id.clone(), instance_id)
                 }
@@ -271,6 +290,21 @@ impl StudioLayout {
                             controller.min(127),
                             value.min(127),
                         ),
+                        MidiInputEvent::PitchBend { value, channel } => bridge
+                            .preview_control_change(
+                                instance_id,
+                                MidiInputRouter::sanitize_channel(channel),
+                                129,
+                                (value.min(16_383) >> 7) as u8,
+                            ),
+                        MidiInputEvent::ChannelPressure { value, channel } => bridge
+                            .preview_control_change(
+                                instance_id,
+                                MidiInputRouter::sanitize_channel(channel),
+                                128,
+                                value.min(127),
+                            ),
+                        MidiInputEvent::PolyPressure { .. } => Ok(()),
                         MidiInputEvent::AllNotesOff => bridge.preview_all_notes_off(instance_id),
                         MidiInputEvent::Panic => bridge.midi_panic(instance_id),
                     };
@@ -308,6 +342,20 @@ impl StudioLayout {
                 controller.min(127),
                 value.min(127),
             ),
+            MidiInputEvent::PitchBend { value, channel } => engine.midi_preview_control_change(
+                target.track_id.clone(),
+                MidiInputRouter::sanitize_channel(channel),
+                129,
+                (value.min(16_383) >> 7) as u8,
+            ),
+            MidiInputEvent::ChannelPressure { value, channel } => engine
+                .midi_preview_control_change(
+                    target.track_id.clone(),
+                    MidiInputRouter::sanitize_channel(channel),
+                    128,
+                    value.min(127),
+                ),
+            MidiInputEvent::PolyPressure { .. } => Ok(()),
             MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => {
                 engine.midi_preview_all_notes_off(target.track_id.clone())
             }
@@ -365,7 +413,10 @@ impl StudioLayout {
         let channel = match &message.event {
             MidiInputEvent::NoteOn { channel, .. }
             | MidiInputEvent::NoteOff { channel, .. }
-            | MidiInputEvent::ControlChange { channel, .. } => Some(*channel),
+            | MidiInputEvent::ControlChange { channel, .. }
+            | MidiInputEvent::PitchBend { channel, .. }
+            | MidiInputEvent::ChannelPressure { channel, .. }
+            | MidiInputEvent::PolyPressure { channel, .. } => Some(*channel),
             MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => None,
         };
         let targets = self.resolve_hardware_midi_targets(

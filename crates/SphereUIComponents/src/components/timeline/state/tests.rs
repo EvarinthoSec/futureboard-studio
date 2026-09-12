@@ -2104,6 +2104,7 @@ mod solfege_pitch_expression_tests {
     use super::midi_edit_tests::{note, state_with_midi_clip};
     use super::*;
     use crate::components::edit::EditCommand;
+    use sphere_midi_service::{ExpressionCurve, ExpressionPoint};
 
     fn scooped_curve() -> PitchCurve {
         PitchCurve::from_points(vec![
@@ -2118,7 +2119,12 @@ mod solfege_pitch_expression_tests {
             .add_midi_note(&clip_id, 60, 0.0, 2.0, 100)
             .expect("note added");
         let notes = state.midi_clip_notes_mut(&clip_id).unwrap();
-        notes.iter_mut().find(|n| n.id == id).unwrap().pitch_curve = Some(scooped_curve());
+        let note = notes.iter_mut().find(|n| n.id == id).unwrap();
+        note.pitch_curve = Some(scooped_curve());
+        note.expression.pitch = ExpressionCurve::from_points(vec![
+            ExpressionPoint::new(0.0, 0.0),
+            ExpressionPoint::new(1.0, 0.5),
+        ]);
         (state, clip_id, id)
     }
 
@@ -2176,9 +2182,29 @@ mod solfege_pitch_expression_tests {
         };
         cmd.execute(&mut state);
         assert_eq!(state.note_pitch_curve(&clip_id, id).len(), 3);
+        assert_eq!(
+            state
+                .midi_note(&clip_id, id)
+                .unwrap()
+                .expression
+                .pitch
+                .points[1]
+                .value,
+            0.5
+        );
 
         cmd.undo(&mut state);
         assert_eq!(state.note_pitch_curve(&clip_id, id).len(), 2);
+        assert_eq!(
+            state
+                .midi_note(&clip_id, id)
+                .unwrap()
+                .expression
+                .pitch
+                .points[1]
+                .value,
+            0.5
+        );
 
         cmd.execute(&mut state);
         assert!((state.note_pitch_curve(&clip_id, id).cents_at(1.0) - 42.0).abs() < 0.001);

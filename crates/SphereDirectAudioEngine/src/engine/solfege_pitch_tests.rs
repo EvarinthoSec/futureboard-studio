@@ -114,6 +114,7 @@ fn note(pitch: u8, start_beat: f64, length_beats: f64) -> EngineMidiNoteSnapshot
         length_beats,
         velocity: 100,
         channel: 0,
+        expression: sphere_midi_service::NoteExpression::default(),
         articulation: None,
         pitch_points: Vec::new(),
     }

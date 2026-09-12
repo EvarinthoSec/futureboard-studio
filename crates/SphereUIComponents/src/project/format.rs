@@ -15,6 +15,9 @@ use super::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, StretchAlgorithm, StretchMode, WarpMarker,
 };
+use sphere_midi_service::{
+    CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint, NoteExpression,
+};
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
 
@@ -106,7 +109,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v44 adds per-track recorded takes. A take names one of the track's own
 /// clips, so the audio is not duplicated — only the record of which pass made
 /// it and whether it is the one heard.
-pub const PROJECT_VERSION: u32 = 44;
+/// v45 appends protocol-neutral per-note expression curves. MPE/MIDI 2.0
+/// transport channels are deliberately not persisted with those curves.
+pub const PROJECT_VERSION: u32 = 45;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -593,6 +598,100 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
         }
         None => w.write_bool(false),
     }
+    // v45: protocol-neutral note-owned expression.  This is appended so every
+    // pre-v45 positional body remains readable.
+    encode_note_expression(w, &n.expression);
+}
+
+fn encode_expression_interpolation(w: &mut FbWriter, interpolation: ExpressionInterpolation) {
+    w.write_u8(match interpolation {
+        ExpressionInterpolation::Linear => 0,
+        ExpressionInterpolation::Step => 1,
+        ExpressionInterpolation::Smooth => 2,
+        ExpressionInterpolation::Bezier => 3,
+    });
+}
+
+fn decode_expression_interpolation(
+    r: &mut FbReader,
+) -> Result<ExpressionInterpolation, ProjectError> {
+    match r.read_u8()? {
+        0 => Ok(ExpressionInterpolation::Linear),
+        1 => Ok(ExpressionInterpolation::Step),
+        2 => Ok(ExpressionInterpolation::Smooth),
+        3 => Ok(ExpressionInterpolation::Bezier),
+        tag => Err(ProjectError::Corrupted(format!(
+            "bad expression interpolation tag {tag}"
+        ))),
+    }
+}
+
+fn encode_expression_curve(w: &mut FbWriter, curve: &ExpressionCurve) {
+    w.write_u32(curve.points.len() as u32);
+    for point in &curve.points {
+        w.write_f32(point.position);
+        w.write_f32(point.value);
+        encode_expression_interpolation(w, point.interpolation);
+    }
+}
+
+fn decode_expression_curve(r: &mut FbReader) -> Result<ExpressionCurve, ProjectError> {
+    let count = r.read_u32()? as usize;
+    if count > 1_000_000 {
+        return Err(ProjectError::Corrupted(
+            "invalid note expression point count".to_string(),
+        ));
+    }
+    let mut points = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        points.push(ExpressionPoint {
+            position: r.read_f32()?,
+            value: r.read_f32()?,
+            interpolation: decode_expression_interpolation(r)?,
+        });
+    }
+    Ok(ExpressionCurve::from_points(points))
+}
+
+fn encode_note_expression(w: &mut FbWriter, expression: &NoteExpression) {
+    encode_expression_curve(w, &expression.pitch);
+    encode_expression_curve(w, &expression.pressure);
+    encode_expression_curve(w, &expression.timbre);
+    w.write_opt_f32(&expression.release_velocity);
+    w.write_u32(expression.custom.len() as u32);
+    for lane in &expression.custom {
+        w.write_u32(lane.controller as u32);
+        w.write_str(&lane.name);
+        encode_expression_curve(w, &lane.curve);
+    }
+}
+
+fn decode_note_expression(r: &mut FbReader) -> Result<NoteExpression, ProjectError> {
+    let pitch = decode_expression_curve(r)?;
+    let pressure = decode_expression_curve(r)?;
+    let timbre = decode_expression_curve(r)?;
+    let release_velocity = r.read_opt_f32()?;
+    let count = r.read_u32()? as usize;
+    if count > 65_536 {
+        return Err(ProjectError::Corrupted(
+            "invalid custom expression lane count".to_string(),
+        ));
+    }
+    let mut custom = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        custom.push(CustomExpressionLane {
+            controller: r.read_u32()?.min(u16::MAX as u32) as u16,
+            name: r.read_str()?,
+            curve: decode_expression_curve(r)?,
+        });
+    }
+    Ok(NoteExpression {
+        pitch,
+        pressure,
+        timbre,
+        release_velocity,
+        custom,
+    })
 }
 
 /// v5: controller kind tag. CC carries its number; the rest are tag-only.
@@ -1700,6 +1799,13 @@ fn decode_midi_note(r: &mut FbReader, version: u32) -> Result<MidiNote, ProjectE
         } else {
             None
         },
+        // v45 adds note-owned expression curves; older files restore with no
+        // expression and remain binary-compatible.
+        expression: if version >= 45 {
+            decode_note_expression(r)?
+        } else {
+            NoteExpression::default()
+        },
     })
 }
 
@@ -2681,6 +2787,7 @@ mod tests {
             channel: 1,
             articulation: 0,
             pitch_curve: Vec::new(),
+            expression: NoteExpression::default(),
             accent: None,
         }
     }
@@ -2717,6 +2824,49 @@ mod tests {
             }),
             ..note(pitch, false)
         }
+    }
+
+    fn note_with_note_expression(pitch: u8) -> MidiNote {
+        MidiNote {
+            expression: NoteExpression {
+                pitch: ExpressionCurve::from_points(vec![
+                    ExpressionPoint {
+                        position: 0.0,
+                        value: 0.0,
+                        interpolation: ExpressionInterpolation::Step,
+                    },
+                    ExpressionPoint::new(0.5, 0.25),
+                ]),
+                pressure: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, 0.2)]),
+                timbre: ExpressionCurve::from_points(vec![ExpressionPoint::new(1.0, 0.8)]),
+                release_velocity: Some(0.65),
+                custom: vec![CustomExpressionLane {
+                    controller: 12_345,
+                    name: "breath".to_string(),
+                    curve: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, 0.5)]),
+                }],
+            },
+            ..note(pitch, false)
+        }
+    }
+
+    #[test]
+    fn v45_note_expression_round_trips_without_a_channel_identity() {
+        let mut w = FbWriter::new();
+        encode_midi_note(&mut w, &note_with_note_expression(60));
+        let bytes = w.into_bytes();
+        let mut r = FbReader::new(&bytes);
+        let decoded = decode_midi_note(&mut r, PROJECT_VERSION).unwrap();
+        assert_eq!(decoded.expression.pitch.points.len(), 2);
+        assert_eq!(
+            decoded.expression.pitch.points[0].interpolation,
+            ExpressionInterpolation::Step
+        );
+        assert_eq!(decoded.expression.pressure.points[0].value, 0.2);
+        assert_eq!(decoded.expression.timbre.points[0].value, 0.8);
+        assert_eq!(decoded.expression.release_velocity, Some(0.65));
+        assert_eq!(decoded.expression.custom[0].controller, 12_345);
+        assert_eq!(decoded.expression.custom[0].name, "breath");
     }
 
     #[test]

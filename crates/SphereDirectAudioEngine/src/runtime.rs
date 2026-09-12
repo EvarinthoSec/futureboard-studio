@@ -17,6 +17,7 @@ use solfege_engine::sfm::SfmMode;
 use solfege_engine::{EngineConfig as SolfegeEngineConfig, SamplerEngine, SharedMetrics};
 use solfege_event::Event as SolfegeEvent;
 use solfege_model::SfmFile;
+use sphere_midi_service::mpe::MpeChannelAllocator;
 
 use crate::audio_graph::{plan_runtime_audio_graph, GraphValidationError, RuntimeAudioGraph};
 use crate::audio_source::{open_clip_audio_source, ClipAudioSource};
@@ -4451,8 +4452,36 @@ fn sort_midi_events(events: &mut [RuntimeMidiEvent]) {
     events.sort_by(|a, b| {
         a.sample
             .cmp(&b.sample)
-            .then((a.kind as u8).cmp(&(b.kind as u8)))
+            .then(midi_event_priority(a.kind).cmp(&midi_event_priority(b.kind)))
     });
+}
+
+/// Ordering at one sample is part of the transport contract. Expression reset
+/// messages must precede a replacement NoteOn, while an old NoteOff must land
+/// before both. This also keeps articulation selection ahead of its note.
+fn midi_event_priority(kind: RuntimeMidiEventKind) -> u8 {
+    match kind {
+        RuntimeMidiEventKind::NoteOff => 0,
+        RuntimeMidiEventKind::ControlChange => 1,
+        RuntimeMidiEventKind::Articulation => 2,
+        RuntimeMidiEventKind::NoteOn => 3,
+        RuntimeMidiEventKind::Pitch => 4,
+    }
+}
+
+fn mpe_voice_release_beat(note_end: f64, clip_end: f64, sustain_changes: &[(f64, bool)]) -> f64 {
+    let sustain_down = sustain_changes
+        .iter()
+        .filter(|(beat, _)| *beat <= note_end)
+        .last()
+        .is_some_and(|(_, down)| *down);
+    if !sustain_down {
+        return note_end;
+    }
+    sustain_changes
+        .iter()
+        .find(|(beat, down)| *beat > note_end && !*down)
+        .map_or(clip_end, |(beat, _)| *beat)
 }
 
 /// Apply a note event to the active-note set (NoteOn inserts, NoteOff removes).
@@ -4491,18 +4520,141 @@ fn build_midi_runtime(
     let mut by_track: HashMap<String, Vec<RuntimeMidiEvent>> = HashMap::new();
 
     for clip in snapshot_clips {
-        let mut events: Vec<RuntimeMidiEvent> = Vec::with_capacity(clip.notes.len() * 2);
-        for note in &clip.notes {
-            if note.length_beats <= 0.0 {
-                continue; // skip zero/negative-length notes
-            }
+        let mpe_enabled = clip.notes.iter().any(|note| !note.expression.is_empty());
+        let mut events: Vec<RuntimeMidiEvent> =
+            Vec::with_capacity(clip.notes.len() * if mpe_enabled { 5 } else { 2 });
+        let clip_end_beat = clip.start_beat + clip.length_beats.max(0.0);
+        let mut sustain_changes: Vec<(f64, bool)> = clip
+            .controllers
+            .iter()
+            .filter(|lane| lane.controller == 64)
+            .flat_map(|lane| {
+                lane.points
+                    .iter()
+                    .map(|point| (clip.start_beat + point.beat.max(0.0), point.value >= 0.5))
+            })
+            .collect();
+        sustain_changes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut note_indices: Vec<usize> = clip
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| note.length_beats > 0.0)
+            .map(|(index, _)| index)
+            .collect();
+        // Allocation is a transport concern, so assign member channels in
+        // musical order rather than depending on the serialized note order.
+        note_indices.sort_by(|a, b| {
+            clip.notes[*a]
+                .start_beat
+                .total_cmp(&clip.notes[*b].start_beat)
+                .then_with(|| clip.notes[*a].id.cmp(&clip.notes[*b].id))
+        });
+        let mut mpe_allocator = MpeChannelAllocator::new(1, 15);
+        let mut mpe_active: Vec<(u64, f64)> = Vec::new();
+        let mut stolen_note_cutoffs = HashMap::new();
+        let mut deferred_mpe_note_offs = Vec::new();
+        for note_index in note_indices {
+            let note = &clip.notes[note_index];
             let pitch = note.pitch.min(127);
             let velocity = note.velocity.clamp(1, 127);
-            let channel = note.channel.min(15);
             let abs_start = clip.start_beat + note.start_beat.max(0.0);
             let abs_end = abs_start + note.length_beats;
             let on_sample = tempo_map.samples_at_beat(abs_start, sr);
             let off_sample = tempo_map.samples_at_beat(abs_end, sr);
+            let release_velocity = note
+                .expression
+                .release_velocity
+                .map(|value| (value.clamp(0.0, 1.0) * 127.0).round() as u8)
+                .unwrap_or(0);
+            let channel = if mpe_enabled {
+                // Ended voices are reusable before allocation. This is done
+                // at graph-build time, never in the audio callback.
+                for (note_id, end) in &mpe_active {
+                    if *end <= abs_start {
+                        mpe_allocator.release(*note_id);
+                    }
+                }
+                mpe_active.retain(|(_, end)| *end > abs_start);
+                let allocation = mpe_allocator
+                    .allocate(note.id, pitch, velocity)
+                    .expect("MPE allocator has at least one member channel");
+                if let Some(stolen_note) = allocation.stolen_note {
+                    stolen_note_cutoffs.insert(stolen_note, on_sample);
+                    mpe_active.retain(|(note_id, _)| *note_id != stolen_note);
+                    let stolen_pitch = allocation.stolen_pitch.unwrap_or(pitch);
+                    events.push(RuntimeMidiEvent {
+                        sample: on_sample,
+                        beat: abs_start,
+                        kind: RuntimeMidiEventKind::NoteOff,
+                        pitch: stolen_pitch,
+                        velocity: 0,
+                        channel: allocation.channel,
+                        note_id: stolen_note,
+                        cc_number: 0,
+                        cc_value: 0.0,
+                        pitch_hz: 0.0,
+                    });
+                }
+                if allocation.reset_required {
+                    // Reset all channel-wide MPE state before the replacement
+                    // NoteOn so the previous voice cannot leak its gesture.
+                    for (cc_number, cc_value) in [(129_u16, 0.5_f32), (128, 0.0), (74, 0.0)] {
+                        events.push(RuntimeMidiEvent {
+                            sample: on_sample,
+                            beat: abs_start,
+                            kind: RuntimeMidiEventKind::ControlChange,
+                            pitch: 0,
+                            velocity: 0,
+                            channel: allocation.channel,
+                            note_id: note.id,
+                            cc_number,
+                            cc_value,
+                            pitch_hz: 0.0,
+                        });
+                    }
+                }
+                for (cc_number, curve) in [
+                    (129_u16, &note.expression.pitch),
+                    (128_u16, &note.expression.pressure),
+                    (74_u16, &note.expression.timbre),
+                ] {
+                    for point in &curve.points {
+                        if !point.position.is_finite()
+                            || point.position < 0.0
+                            || point.position >= note.length_beats as f32
+                        {
+                            continue;
+                        }
+                        let beat = abs_start + point.position as f64;
+                        events.push(RuntimeMidiEvent {
+                            sample: tempo_map.samples_at_beat(beat, sr),
+                            beat,
+                            kind: RuntimeMidiEventKind::ControlChange,
+                            pitch: 0,
+                            velocity: 0,
+                            channel: allocation.channel,
+                            note_id: note.id,
+                            cc_number,
+                            cc_value: if cc_number == 129 {
+                                (point.value.clamp(-1.0, 1.0) + 1.0) * 0.5
+                            } else {
+                                point.value.clamp(0.0, 1.0)
+                            },
+                            pitch_hz: 0.0,
+                        });
+                    }
+                }
+                // A key release during sustain does not free the member
+                // channel. Keep it reserved until the next pedal-up event so
+                // a later note cannot inherit its pitch/pressure/timbre state.
+                let voice_release =
+                    mpe_voice_release_beat(abs_end, clip_end_beat, &sustain_changes);
+                mpe_active.push((note.id, voice_release));
+                allocation.channel
+            } else {
+                note.channel.min(15)
+            };
             if let Some(articulation) = note.articulation {
                 events.push(RuntimeMidiEvent {
                     sample: on_sample,
@@ -4529,18 +4681,23 @@ fn build_midi_runtime(
                 cc_value: 0.0,
                 pitch_hz: 0.0,
             });
-            events.push(RuntimeMidiEvent {
+            let note_off = RuntimeMidiEvent {
                 sample: off_sample,
                 beat: abs_end,
                 kind: RuntimeMidiEventKind::NoteOff,
                 pitch,
-                velocity: 0,
+                velocity: release_velocity,
                 channel,
                 note_id: note.id,
                 cc_number: 0,
                 cc_value: 0.0,
                 pitch_hz: 0.0,
-            });
+            };
+            if mpe_enabled {
+                deferred_mpe_note_offs.push((note.id, note_off));
+            } else {
+                events.push(note_off);
+            }
             // The note's drawn/derived pitch trajectory. Scheduled on the same
             // timeline as its own note events so a seek, a loop or a tempo
             // change moves the curve with the note it belongs to. Points
@@ -4569,6 +4726,19 @@ fn build_midi_runtime(
                 });
             }
         }
+        for (note_id, note_off) in deferred_mpe_note_offs {
+            if !stolen_note_cutoffs.contains_key(&note_id) {
+                events.push(note_off);
+            }
+        }
+        // A voice that was stolen must not keep sending its later expression
+        // samples (or its original future NoteOff) onto the replacement's
+        // member channel. Samples before the steal remain valid history.
+        events.retain(|event| {
+            stolen_note_cutoffs
+                .get(&event.note_id)
+                .is_none_or(|cutoff| event.sample <= *cutoff)
+        });
         // Controller points → ControlChange events (block-level value).
         for lane in &clip.controllers {
             let channel = lane.channel.min(15);
@@ -4591,7 +4761,7 @@ fn build_midi_runtime(
         }
         // Sort by sample; NoteOff before NoteOn at the same sample.
         sort_midi_events(&mut events);
-        let end_beat = clip.start_beat + clip.length_beats.max(0.0);
+        let end_beat = clip_end_beat;
         by_track
             .entry(clip.track_id.clone())
             .or_default()
@@ -4891,6 +5061,7 @@ mod stretch_runtime_tests {
                         length_beats: 0.25,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
@@ -4901,6 +5072,7 @@ mod stretch_runtime_tests {
                         length_beats: 0.25,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
@@ -5504,6 +5676,7 @@ mod midi_tests {
                 length_beats: 1.0,
                 velocity: 100,
                 channel: 0,
+                expression: sphere_midi_service::NoteExpression::default(),
                 pitch_points: Vec::new(),
                 articulation: None,
             }],
@@ -5541,6 +5714,124 @@ mod midi_tests {
         assert_eq!(off.sample, 120_000);
         assert_eq!(on.pitch, 60);
         assert_eq!(on.velocity, 100);
+    }
+
+    #[test]
+    fn note_expression_is_scheduled_on_an_allocated_mpe_member_channel() {
+        let mut clip = clip_with_one_note();
+        clip.notes[0].expression = sphere_midi_service::NoteExpression {
+            pitch: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.0),
+                sphere_midi_service::ExpressionPoint::new(0.5, 0.5),
+            ]),
+            pressure: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.75),
+            ]),
+            timbre: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.25),
+            ]),
+            ..Default::default()
+        };
+        let p = project_with(vec![clip]);
+        let evs = &p.midi_tracks[0].events;
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.cc_number == 129
+                && event.channel == 1
+                && (event.cc_value - 0.5).abs() < 0.001
+        }));
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.cc_number == 128
+                && event.channel == 1
+                && (event.cc_value - 0.75).abs() < 0.001
+        }));
+        let note_on = evs
+            .iter()
+            .find(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .unwrap();
+        assert_eq!(note_on.channel, 1);
+    }
+
+    #[test]
+    fn reused_mpe_channel_gets_expression_reset_before_the_next_note() {
+        let mut clip = clip_with_one_note();
+        clip.notes.push(EngineMidiNoteSnapshot {
+            id: 2,
+            pitch: 64,
+            start_beat: 2.0,
+            length_beats: 1.0,
+            velocity: 100,
+            channel: 0,
+            expression: Default::default(),
+            pitch_points: Vec::new(),
+            articulation: None,
+        });
+        clip.notes[0].expression.pitch = sphere_midi_service::ExpressionCurve::from_points(vec![
+            sphere_midi_service::ExpressionPoint::new(0.0, 0.8),
+        ]);
+        let p = project_with(vec![clip]);
+        let evs = &p.midi_tracks[0].events;
+        let second_start = 144_000; // clip beat 2 at 120 BPM
+        let reset = evs
+            .iter()
+            .filter(|event| {
+                event.sample == second_start
+                    && event.channel == 1
+                    && event.kind == RuntimeMidiEventKind::ControlChange
+            })
+            .collect::<Vec<_>>();
+        assert!(reset
+            .iter()
+            .any(|event| { event.cc_number == 129 && (event.cc_value - 0.5).abs() < 0.001 }));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 128 && event.cc_value == 0.0));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 74 && event.cc_value == 0.0));
+    }
+
+    #[test]
+    fn mpe_channel_stays_reserved_until_sustain_pedal_up() {
+        let mut clip = clip_with_one_note();
+        clip.notes[0].expression.pitch = sphere_midi_service::ExpressionCurve::from_points(vec![
+            sphere_midi_service::ExpressionPoint::new(0.0, 0.25),
+        ]);
+        clip.notes.push(EngineMidiNoteSnapshot {
+            id: 2,
+            pitch: 64,
+            start_beat: 1.5,
+            length_beats: 1.0,
+            velocity: 100,
+            channel: 0,
+            expression: Default::default(),
+            pitch_points: Vec::new(),
+            articulation: None,
+        });
+        clip.controllers.push(EngineMidiControllerLane {
+            controller: 64,
+            channel: 0,
+            points: vec![
+                EngineMidiControllerPoint {
+                    beat: 0.5,
+                    value: 1.0,
+                },
+                EngineMidiControllerPoint {
+                    beat: 2.0,
+                    value: 0.0,
+                },
+            ],
+        });
+        let p = project_with(vec![clip]);
+        let note_ons = p.midi_tracks[0]
+            .events
+            .iter()
+            .filter(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .collect::<Vec<_>>();
+        assert_eq!(note_ons.len(), 2);
+        assert_eq!(note_ons[0].channel, 1);
+        assert_eq!(note_ons[1].channel, 2);
     }
 
     #[test]

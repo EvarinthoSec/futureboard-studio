@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::solfege::SolfegeTrackState;
+use sphere_midi_service::NoteExpression;
 pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
 
 // ── Identifiers ───────────────────────────────────────────────────────────────
@@ -148,6 +149,9 @@ pub struct MidiNote {
     /// notated pitch. Points are cent deviations keyed by beats from the note
     /// start, so they survive transposition and moves.
     pub pitch_curve: Vec<MidiPitchPoint>,
+    /// Protocol-neutral per-note expression.  MPE/MIDI 2.0 are transport
+    /// adapters; their channels are never part of this project data.
+    pub expression: NoteExpression,
     /// Musical accent (v39+). `None` when the note has never been analysed or
     /// drawn, which is how a pre-v39 project and a freshly drawn note both
     /// load — an absent accent and a neutral one are different states and the
@@ -1186,6 +1190,7 @@ impl From<&TimelineState> for FutureboardProject {
                                                     .collect()
                                             })
                                             .unwrap_or_default(),
+                                        expression: n.expression.clone(),
                                         accent: n.accent.map(|accent| MidiAccent {
                                             prominence: accent.prominence,
                                             attack: accent.attack,
@@ -1841,6 +1846,7 @@ pub fn apply_to_timeline(
                                                 .collect(),
                                         )
                                     });
+                                    note.expression = n.expression.clone();
                                     note.accent = n.accent.map(|accent| {
                                         TlAccentState {
                                             prominence: accent.prominence,
@@ -2951,10 +2957,10 @@ mod v33_routing_adapter_tests {
 
     #[test]
     fn the_encoder_writes_the_current_format_version() {
-        let bytes = crate::project::format::encode_project(&FutureboardProject::new("v44"));
+        let bytes = crate::project::format::encode_project(&FutureboardProject::new("v45"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        assert_eq!(version, 44);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 44);
+        assert_eq!(version, 45);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 45);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
