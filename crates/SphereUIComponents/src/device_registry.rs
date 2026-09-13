@@ -250,7 +250,18 @@ pub fn scan_audio_for_engine(engine: &DirectAudio::AudioEngine) -> u64 {
 /// Cached audio snapshot. Lazily scans once if startup never did.
 pub fn audio_snapshot() -> AudioDeviceSnapshot {
     if !state().read().unwrap().audio_scanned {
+        // Do not let a lazy read from project/session migration enter the
+        // CoreAudio HAL. On macOS the supported-config query can block while a
+        // remote desktop or another DAW owns the audio session. Settings can
+        // still request an explicit refresh once the user is looking at the
+        // device list; the empty cache is safe for routing migration because
+        // missing hardware is intentionally non-destructive.
+        #[cfg(not(target_os = "macos"))]
         scan_audio();
+        #[cfg(target_os = "macos")]
+        {
+            state().write().unwrap().audio_scanned = true;
+        }
     }
     state().read().unwrap().audio.clone()
 }

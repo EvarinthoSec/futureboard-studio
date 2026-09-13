@@ -14,9 +14,9 @@ pub mod expression;
 pub mod mpe;
 
 pub use expression::{
-    simplify_expression_curve, CustomExpressionLane, ExpressionCurve, ExpressionInterpolation,
-    ExpressionPoint, ExpressionSimplificationTolerances, NoteExpression, NoteExpressionLane,
-    NoteId, PitchExpressionConfig, Tick,
+    CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint,
+    ExpressionSimplificationTolerances, NoteExpression, NoteExpressionLane, NoteId,
+    PitchExpressionConfig, Tick, simplify_expression_curve,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

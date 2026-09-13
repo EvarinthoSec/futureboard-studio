@@ -13,18 +13,19 @@
 
 use std::sync::Arc;
 
+use DirectAudio::EngineConfig;
+use DirectAudio::native::{AudioBackend, AudioDeviceId};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, App, AppContext, Context, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowHandle, WindowKind,
+    App, AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowHandle, WindowKind, div, px,
+    size,
 };
 use sphere_ui_components::components::controls::{
-    fb_button, fb_section_header, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
+    FbButtonKind, FbSegment, fb_button, fb_section_header, fb_segment, fb_segmented_track,
 };
-use sphere_ui_components::theme::{radius, space, typography, Colors};
+use sphere_ui_components::theme::{Colors, radius, space, typography};
 use sphere_ui_components::window_position::centered_window_bounds;
-use DirectAudio::native::{AudioBackend, AudioDeviceId};
-use DirectAudio::EngineConfig;
 
 use crate::monitor::JamMonitor;
 

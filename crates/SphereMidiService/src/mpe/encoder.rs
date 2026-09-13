@@ -59,6 +59,11 @@ pub struct MpeMidi1Output {
 
 impl MpeMidi1Output {
     pub fn new(allocator: MpeChannelAllocator, pitch_range_semitones: f32) -> Self {
+        let pitch_range_semitones = if pitch_range_semitones.is_finite() {
+            pitch_range_semitones
+        } else {
+            2.0
+        };
         Self {
             allocator,
             pitch_config: PitchExpressionConfig::new(pitch_range_semitones),
@@ -90,6 +95,11 @@ impl MpeMidi1Output {
     /// Configuration is explicit because hosts commonly send it once when a
     /// route is enabled, while note expression remains a per-note stream.
     pub fn send_mpe_configuration(&mut self, zone: MpeZone) {
+        self.pitch_config = PitchExpressionConfig::new(if zone.member_pitch_range.is_finite() {
+            zone.member_pitch_range
+        } else {
+            2.0
+        });
         push_rpn_range(
             &mut self.events,
             zone.manager_channel,
@@ -111,7 +121,12 @@ impl MpeMidi1Output {
     }
 
     fn emit_pitch(&mut self, channel: u8, value: f32) {
-        let value = (((value.clamp(-1.0, 1.0) + 1.0) * 0.5) * 16_383.0).round() as u16;
+        let value = if value.is_finite() {
+            value.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let value = (((value + 1.0) * 0.5) * 16_383.0).round() as u16;
         self.events.push(EncodedMidiMessage::new(
             channel,
             0xE0,
@@ -128,7 +143,11 @@ impl MpeMidi1Output {
 }
 
 fn push_rpn_range(events: &mut Vec<EncodedMidiMessage>, channel: u8, range: f32) {
-    let range = range.clamp(0.01, 127.99);
+    let range = if range.is_finite() {
+        range.clamp(0.01, 127.99)
+    } else {
+        2.0
+    };
     let msb = range.floor() as u8;
     let lsb = ((range.fract() * 100.0).round() as u8).min(99);
     events.push(EncodedMidiMessage::new(channel, 0xB0, 101, 0));
@@ -145,6 +164,7 @@ impl NoteExpressionOutput for MpeMidi1Output {
         velocity: f32,
         expression: &NoteExpression,
     ) -> Result<(), NoteExpressionOutputError> {
+        let expression = expression.sanitized();
         let allocation = self
             .allocator
             .allocate(
@@ -205,11 +225,14 @@ impl NoteExpressionOutput for MpeMidi1Output {
     ) -> Result<(), NoteExpressionOutputError> {
         let channel = self.channel_for(note_id)?;
         let pitch = self.allocator.pitch_for_channel(channel).unwrap_or(0);
+        let release_velocity = release_velocity
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
         self.events.push(EncodedMidiMessage::new(
             channel,
             0x80,
             pitch,
-            (release_velocity.unwrap_or(0.0).clamp(0.0, 1.0) * 127.0).round() as u8,
+            (release_velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
         ));
         self.allocator.release(note_id);
         Ok(())
@@ -288,6 +311,7 @@ macro_rules! native_output {
                 velocity: f32,
                 expression: &NoteExpression,
             ) -> Result<(), NoteExpressionOutputError> {
+                let expression = expression.sanitized();
                 self.events.push(NativeNoteExpressionEvent::NoteOn {
                     note_id,
                     pitch,
@@ -421,10 +445,12 @@ mod tests {
             .note_on(2, 64, 0.8, &NoteExpression::default())
             .unwrap();
         assert_eq!(output.allocator.channel_for_note(2), Some(1));
-        assert!(output
-            .events()
-            .iter()
-            .any(|event| event.bytes[0] & 0xF0 == 0xE0));
+        assert!(
+            output
+                .events()
+                .iter()
+                .any(|event| event.bytes[0] & 0xF0 == 0xE0)
+        );
     }
 
     #[test]

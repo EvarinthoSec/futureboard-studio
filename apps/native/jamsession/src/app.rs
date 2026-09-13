@@ -23,19 +23,19 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, App, AppContext, ClipboardItem, Context, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds,
-    WindowHandle,
+    App, AppContext, ClipboardItem, Context, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowHandle,
+    div, px, size,
 };
 use sphere_ui_components::components::controls::{
-    fb_badge, fb_button, fb_section_header, FbButtonKind,
+    FbButtonKind, fb_badge, fb_button, fb_section_header,
 };
 use sphere_ui_components::components::slider::slider;
-use sphere_ui_components::components::text_input::{text_field, TextInputState};
+use sphere_ui_components::components::text_input::{TextInputState, text_field};
 use sphere_ui_components::components::title_bar::external_window_titlebar;
 use sphere_ui_components::components::{account_chip, account_menu_overlay};
 use sphere_ui_components::jam::{self, JamStreamView, JamUiState};
-use sphere_ui_components::theme::{radius, space, typography, Colors};
+use sphere_ui_components::theme::{Colors, radius, space, typography};
 use sphere_ui_components::window_position::centered_window_bounds;
 
 use crate::monitor::{InputStatus, JamMonitor, Levels};
@@ -145,21 +145,23 @@ impl JamApp {
     }
 
     fn spawn_refresh(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH).await;
-            let alive = this
-                .update(cx, |this, cx| {
-                    // Read only. The controller's own poll thread advances the
-                    // published state; this just picks it up, with the meters.
-                    this.state = jam::snapshot();
-                    this.levels = this.monitor.levels();
-                    this.input = this.monitor.input_status();
-                    this.follow_room();
-                    cx.notify();
-                })
-                .is_ok();
-            if !alive {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        // Read only. The controller's own poll thread advances the
+                        // published state; this just picks it up, with the meters.
+                        this.state = jam::snapshot();
+                        this.levels = this.monitor.levels();
+                        this.input = this.monitor.input_status();
+                        this.follow_room();
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();
@@ -1004,7 +1006,7 @@ fn or_dash(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copied_recently, input_health, or_dash, peer_health, COPY_FEEDBACK};
+    use super::{COPY_FEEDBACK, copied_recently, input_health, or_dash, peer_health};
     use crate::monitor::InputStatus;
     use sphere_ui_components::jam::JamStreamView;
     use std::time::Instant;

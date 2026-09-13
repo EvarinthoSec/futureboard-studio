@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::components::timeline::timeline_state::{
-    AudioClipStretchState, AudioImportState, ClipState, ClipType, MidiControllerLane,
-    MidiNoteState, TrackAudioFormat, TrackState, TrackType, MIN_NOTE_BEATS,
+    AudioClipStretchState, AudioImportState, ClipState, ClipType, MIN_NOTE_BEATS,
+    MidiControllerLane, MidiNoteState, TrackAudioFormat, TrackState, TrackType,
 };
 use crate::components::timeline::waveform_cache::{self, WaveformPeak};
-use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
 use sphere_midi_service::MidiInputEvent;
+use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
 
-use super::{audio_recording_preview_clip_id, RecordingPreviewUi, RecordingUiState, StudioLayout};
+use super::{RecordingPreviewUi, RecordingUiState, StudioLayout, audio_recording_preview_clip_id};
 use DirectAudio::types::{JsRecordingTrackConfig, JsStartRecordingConfig};
 
 /// Active recording-session UI state — the take's start position, the UI phase,
@@ -75,6 +75,10 @@ pub(crate) struct MidiRecordingTrack {
     pub track_name: String,
     pub notes: Vec<MidiNoteState>,
     pub active_notes: HashMap<(u8, u8), ActiveMidiNote>,
+    /// MPE recording is a Professional-only tool. The shared recorder still
+    /// owns the protocol-neutral types so Community can preserve existing
+    /// expression data, but it falls back to its ordinary note capture path.
+    pub mpe_enabled: bool,
     /// Protocol-neutral recorder. It observes every event, but its result is
     /// selected only when this take contains MPE expression data so standard
     /// MIDI recording keeps its existing semantics.
@@ -456,6 +460,7 @@ impl StudioLayout {
                 .tracks
                 .iter()
                 .any(|t| t.armed && t.track_type == TrackType::Audio);
+            let mpe_enabled = crate::edition::professional_features_available();
             let midi_tracks = timeline
                 .state
                 .tracks
@@ -468,6 +473,7 @@ impl StudioLayout {
                     track_name: track.name.clone(),
                     notes: Vec::new(),
                     active_notes: HashMap::new(),
+                    mpe_enabled,
                     mpe_session: MpeRecordingSession::new(MpeDecoder::default()),
                     mpe_expression_seen: false,
                 })
@@ -868,14 +874,20 @@ impl StudioLayout {
                 if let Some(active) = track.active_notes.remove(&key) {
                     push_recorded_midi_note(track, active, relative_beat);
                 }
-                track.active_notes.insert(
-                    key,
-                    ActiveMidiNote {
-                        pitch,
-                        velocity,
-                        start_beat: relative_beat,
-                    },
-                );
+                // MIDI Note On with velocity zero is the running-status form
+                // of Note Off. Treating it as a fresh zero-velocity note
+                // leaves the plain recorder with a phantom note until the
+                // take ends (the MPE decoder already normalizes this case).
+                if velocity > 0 {
+                    track.active_notes.insert(
+                        key,
+                        ActiveMidiNote {
+                            pitch,
+                            velocity,
+                            start_beat: relative_beat,
+                        },
+                    );
+                }
             }
             MidiInputEvent::NoteOff { note, channel } => {
                 let key = (channel.min(15), note.min(127));
@@ -887,28 +899,32 @@ impl StudioLayout {
                 close_all_recorded_midi_notes(track, relative_beat);
             }
             MidiInputEvent::ControlChange { controller, .. } => {
-                if matches!(controller, 64 | 74) {
+                if track.mpe_enabled && matches!(controller, 64 | 74) {
                     track.mpe_expression_seen = true;
                 }
             }
             MidiInputEvent::PitchBend { .. }
             | MidiInputEvent::ChannelPressure { .. }
             | MidiInputEvent::PolyPressure { .. } => {
-                track.mpe_expression_seen = true;
+                if track.mpe_enabled {
+                    track.mpe_expression_seen = true;
+                }
             }
         }
         // Feed the same timestamped event to the protocol decoder. This is
         // control-thread work; no curve optimization or project serialization
         // occurs in the native MIDI callback.
-        if matches!(
-            event,
-            MidiInputEvent::NoteOn { .. }
-                | MidiInputEvent::NoteOff { .. }
-                | MidiInputEvent::ControlChange { .. }
-                | MidiInputEvent::PitchBend { .. }
-                | MidiInputEvent::ChannelPressure { .. }
-                | MidiInputEvent::PolyPressure { .. }
-        ) {
+        if track.mpe_enabled
+            && matches!(
+                event,
+                MidiInputEvent::NoteOn { .. }
+                    | MidiInputEvent::NoteOff { .. }
+                    | MidiInputEvent::ControlChange { .. }
+                    | MidiInputEvent::PitchBend { .. }
+                    | MidiInputEvent::ChannelPressure { .. }
+                    | MidiInputEvent::PolyPressure { .. }
+            )
+        {
             track.mpe_session.process(event, relative_beat);
         }
         self.recording.midi_preview_dirty = true;
@@ -1426,26 +1442,39 @@ impl StudioLayout {
         &self,
         cx: &Context<Self>,
     ) -> Option<(String, u32)> {
-        let engine = self.audio_bridge.engine.as_ref()?;
-        let wanted = self
-            .settings
-            .read(cx)
-            .current
-            .hardware
-            .audio
-            .device_out
-            .clone();
-        let devices = engine.list_output_devices();
-        if !wanted.trim().is_empty() {
-            if let Some(d) = devices.iter().find(|d| d.name == wanted || d.id == wanted) {
-                return Some((d.name.clone(), d.channels));
-            }
+        // Keep Studio mounting independent from CoreAudio's HAL capability
+        // query. The device list can be refreshed explicitly from Settings;
+        // the mixer only needs a safe stereo fallback while that inventory is
+        // unavailable.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = cx;
+            return Some(("System Default Output".to_string(), 2));
         }
-        devices
-            .iter()
-            .find(|d| d.is_default)
-            .or_else(|| devices.first())
-            .map(|d| (d.name.clone(), d.channels))
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let engine = self.audio_bridge.engine.as_ref()?;
+            let wanted = self
+                .settings
+                .read(cx)
+                .current
+                .hardware
+                .audio
+                .device_out
+                .clone();
+            let devices = engine.list_output_devices();
+            if !wanted.trim().is_empty() {
+                if let Some(d) = devices.iter().find(|d| d.name == wanted || d.id == wanted) {
+                    return Some((d.name.clone(), d.channels));
+                }
+            }
+            devices
+                .iter()
+                .find(|d| d.is_default)
+                .or_else(|| devices.first())
+                .map(|d| (d.name.clone(), d.channels))
+        }
     }
 }
 
@@ -1838,13 +1867,15 @@ mod tests {
 
         let device = input_device(4);
         let track = timeline.find_track(&track_id).unwrap();
-        assert!(recording_input_channels_checked(
-            track,
-            &timeline.audio_connections,
-            std::slice::from_ref(&device),
-            Some(&device),
-        )
-        .is_err());
+        assert!(
+            recording_input_channels_checked(
+                track,
+                &timeline.audio_connections,
+                std::slice::from_ref(&device),
+                Some(&device),
+            )
+            .is_err()
+        );
     }
 
     /// A connection whose device vanished must fail clearly rather than record

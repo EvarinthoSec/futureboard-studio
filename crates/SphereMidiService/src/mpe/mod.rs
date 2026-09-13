@@ -16,13 +16,13 @@ mod zone;
 
 pub use allocator::{MpeChannelAllocation, MpeChannelAllocator, MpeChannelExhaustionPolicy};
 pub use channel_state::{MpeChannelState, RpnSelection};
-pub use configuration::MpeConfiguration;
+pub use configuration::{MpeConfiguration, MpeOutputMode, MpeTrackConfiguration};
 pub use decoder::{ActiveMpeNote, MpeDecoder, MpeDecoderEvent, MpeMidiMessage};
 pub use encoder::{
-    choose_expression_route, ClapNoteExpressionOutput, EncodedMidiMessage,
-    Midi2NoteExpressionOutput, MpeMidi1Output, NativeNoteExpressionEvent, NoteExpressionOutput,
-    NoteExpressionOutputError, NoteExpressionRoute, PluginExpressionCapabilities,
-    Vst3NoteExpressionOutput,
+    ClapNoteExpressionOutput, EncodedMidiMessage, Midi2NoteExpressionOutput, MpeMidi1Output,
+    NativeNoteExpressionEvent, NoteExpressionOutput, NoteExpressionOutputError,
+    NoteExpressionRoute, PluginExpressionCapabilities, Vst3NoteExpressionOutput,
+    choose_expression_route,
 };
 pub use note_expression::{MpeRecordingSession, RecordedNote};
 pub use zone::MpeZone;

@@ -35,10 +35,10 @@ mod settings;
 
 use std::sync::Arc;
 
+use DirectAudio::EngineConfig;
 use gpui::Application;
 use sphere_ui_components::embedded_assets::EmbeddedAssets;
 use sphere_ui_components::theme;
-use DirectAudio::EngineConfig;
 
 use crate::monitor::JamMonitor;
 

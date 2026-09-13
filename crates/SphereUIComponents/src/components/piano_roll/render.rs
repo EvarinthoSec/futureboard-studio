@@ -2158,7 +2158,12 @@ impl PianoRoll {
             content.push(note_value_row("Channel", note.channel.label()).into_any_element());
             content
                 .push(note_value_row("Artic.", snapshot.articulation_label()).into_any_element());
-            content.push(self.render_note_expression_inspector(note, cx));
+            // Community keeps expression in the project and shows the inline
+            // curve below, but the mutating inspector is a Professional-only
+            // editing surface.
+            if crate::edition::professional_features_available() {
+                content.push(self.render_note_expression_inspector(note, cx));
+            }
             content.push(self.articulation_assign_row(cx));
             content.push(
                 note_button_row(vec![

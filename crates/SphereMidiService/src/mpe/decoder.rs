@@ -1,10 +1,10 @@
 use super::channel_state::MpeChannelState;
 use super::configuration::MpeConfiguration;
 use super::zone::MpeZone;
+use crate::MidiInputEvent;
 use crate::expression::{
     ExpressionInterpolation, ExpressionPoint, NoteExpression, NoteExpressionLane, NoteId, Tick,
 };
-use crate::MidiInputEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -209,6 +209,11 @@ impl MpeDecoder {
             MpeMidiMessage::NoteOn {
                 channel,
                 note,
+                velocity: 0,
+            } => self.note_off(channel, note, 0, position),
+            MpeMidiMessage::NoteOn {
+                channel,
+                note,
                 velocity,
             } => self.note_on(channel, note, velocity, position),
             MpeMidiMessage::NoteOff {
@@ -366,7 +371,11 @@ impl MpeDecoder {
             }
             6 => self.data_entry(channel, value, false),
             38 => self.data_entry(channel, value, true),
-            123 => self.finish_all(position),
+            // All Sound Off and All Notes Off both terminate live voices for
+            // recording purposes. Devices commonly use either panic message;
+            // treating only CC123 as a terminator leaves notes stuck when CC120
+            // is the one they actually send.
+            120 | 123 => self.finish_all(position),
             _ => Vec::new(),
         }
     }
@@ -382,15 +391,23 @@ impl MpeDecoder {
             (state.rpn, state.data_entry_msb, state.data_entry_lsb)
         };
         if rpn.msb == 0 && rpn.lsb == 0 {
-            let range = data_entry_msb as f32 + data_entry_lsb as f32 / 100.0;
+            let range = data_entry_msb as f32 + data_entry_lsb.min(99) as f32 / 100.0;
             let range = range.max(0.01);
             if let Some(index) = self
                 .zones
                 .iter()
                 .position(|zone| zone.manager_channel == channel)
             {
-                // MPE RPN 0 sent on the manager channel configures the member
-                // voices. The manager's own range remains independent.
+                self.zones[index].manager_pitch_range = range;
+                self.apply_zone_pitch_ranges();
+                return vec![MpeDecoderEvent::ConfigurationChanged(
+                    MpeConfiguration::from_zone(self.zones[index]),
+                )];
+            } else if let Some(index) = self
+                .zones
+                .iter()
+                .position(|zone| zone.contains_member(channel))
+            {
                 self.zones[index].member_pitch_range = range;
                 self.apply_zone_pitch_ranges();
                 return vec![MpeDecoderEvent::ConfigurationChanged(
@@ -463,6 +480,38 @@ impl MpeDecoder {
             NoteExpressionLane::Pitch => self.channels[channel as usize].pitch_bend = value,
             NoteExpressionLane::Pressure => self.channels[channel as usize].pressure = value,
             NoteExpressionLane::Timbre => self.channels[channel as usize].timbre = value,
+        }
+        // A controller arriving on an MPE manager channel is global to the
+        // zone. Fan it out to every currently sounding member note so a
+        // global pitch wheel/pressure/timbre gesture is not silently lost.
+        if let Some(zone) = self
+            .zones
+            .iter()
+            .find(|zone| zone.manager_channel == channel)
+            .copied()
+        {
+            let mut events = Vec::new();
+            for member_channel in zone.member_channels() {
+                let Some(active) = self.active_notes.get_mut(&member_channel) else {
+                    continue;
+                };
+                let point = ExpressionPoint {
+                    position: (position - active.start).max(0.0),
+                    value,
+                    interpolation: ExpressionInterpolation::Linear,
+                };
+                match lane {
+                    NoteExpressionLane::Pitch => active.expression.pitch.push_raw(point),
+                    NoteExpressionLane::Pressure => active.expression.pressure.push_raw(point),
+                    NoteExpressionLane::Timbre => active.expression.timbre.push_raw(point),
+                }
+                events.push(MpeDecoderEvent::Expression {
+                    note_id: active.note_id,
+                    lane,
+                    point,
+                });
+            }
+            return events;
         }
         match self.active_notes.get_mut(&channel) {
             Some(active) => {
@@ -684,16 +733,18 @@ mod tests {
                 ..
             }] if *id == note_id
         ));
-        assert!(decoder
-            .process(
-                MpeMidiMessage::PolyPressure {
-                    channel: 1,
-                    note: 61,
-                    value: 96,
-                },
-                0.6,
-            )
-            .is_empty());
+        assert!(
+            decoder
+                .process(
+                    MpeMidiMessage::PolyPressure {
+                        channel: 1,
+                        note: 61,
+                        value: 96,
+                    },
+                    0.6,
+                )
+                .is_empty()
+        );
     }
 
     #[test]
@@ -739,16 +790,18 @@ mod tests {
             },
             0.0,
         );
-        assert!(decoder
-            .process(
-                MpeMidiMessage::NoteOff {
-                    channel: 1,
-                    note: 60,
-                    release_velocity: 0,
-                },
-                1.0,
-            )
-            .is_empty());
+        assert!(
+            decoder
+                .process(
+                    MpeMidiMessage::NoteOff {
+                        channel: 1,
+                        note: 60,
+                        release_velocity: 0,
+                    },
+                    1.0,
+                )
+                .is_empty()
+        );
         assert!(decoder.active_notes().contains_key(&1));
         let events = decoder.process(
             MpeMidiMessage::ControlChange {
@@ -785,16 +838,18 @@ mod tests {
             },
             0.1,
         );
-        assert!(decoder
-            .process(
-                MpeMidiMessage::NoteOff {
-                    channel: 3,
-                    note: 60,
-                    release_velocity: 0,
-                },
-                1.0,
-            )
-            .is_empty());
+        assert!(
+            decoder
+                .process(
+                    MpeMidiMessage::NoteOff {
+                        channel: 3,
+                        note: 60,
+                        release_velocity: 0,
+                    },
+                    1.0,
+                )
+                .is_empty()
+        );
         assert_eq!(decoder.active_notes().get(&3).unwrap().note_id, note_id);
         let events = decoder.process(
             MpeMidiMessage::ControlChange {
@@ -848,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_rpn_zero_updates_member_pitch_range() {
+    fn manager_rpn_zero_updates_manager_pitch_range() {
         let mut decoder = MpeDecoder::new(vec![MpeZone::lower(3)]);
         for message in [
             MpeMidiMessage::ControlChange {
@@ -869,7 +924,136 @@ mod tests {
         ] {
             decoder.process(message, 0.0);
         }
+        assert_eq!(decoder.pitch_range_for(1), 48.0);
+        assert_eq!(decoder.pitch_range_for(0), 24.0);
+    }
+
+    #[test]
+    fn member_rpn_zero_updates_member_pitch_range() {
+        let mut decoder = MpeDecoder::new(vec![MpeZone::lower(3)]);
+        for message in [
+            MpeMidiMessage::ControlChange {
+                channel: 1,
+                controller: 101,
+                value: 0,
+            },
+            MpeMidiMessage::ControlChange {
+                channel: 1,
+                controller: 100,
+                value: 0,
+            },
+            MpeMidiMessage::ControlChange {
+                channel: 1,
+                controller: 6,
+                value: 24,
+            },
+        ] {
+            decoder.process(message, 0.0);
+        }
         assert_eq!(decoder.pitch_range_for(1), 24.0);
         assert_eq!(decoder.pitch_range_for(0), 2.0);
+    }
+
+    #[test]
+    fn manager_expression_is_applied_to_all_active_member_notes() {
+        let mut decoder = MpeDecoder::default();
+        let first = match decoder.process(
+            MpeMidiMessage::NoteOn {
+                channel: 1,
+                note: 60,
+                velocity: 100,
+            },
+            0.0,
+        )[0]
+        {
+            MpeDecoderEvent::NoteOn { note_id, .. } => note_id,
+            _ => unreachable!(),
+        };
+        let second = match decoder.process(
+            MpeMidiMessage::NoteOn {
+                channel: 2,
+                note: 64,
+                velocity: 100,
+            },
+            0.0,
+        )[0]
+        {
+            MpeDecoderEvent::NoteOn { note_id, .. } => note_id,
+            _ => unreachable!(),
+        };
+        let events = decoder.process(
+            MpeMidiMessage::PitchBend {
+                channel: 0,
+                value: 12_288,
+            },
+            0.5,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            MpeDecoderEvent::Expression {
+                lane: NoteExpressionLane::Pitch,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MpeDecoderEvent::Expression { note_id, .. } if *note_id == first
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MpeDecoderEvent::Expression { note_id, .. } if *note_id == second
+        )));
+    }
+
+    #[test]
+    fn zero_velocity_note_on_is_treated_as_note_off() {
+        let mut decoder = MpeDecoder::default();
+        decoder.process(
+            MpeMidiMessage::NoteOn {
+                channel: 1,
+                note: 60,
+                velocity: 100,
+            },
+            0.0,
+        );
+        let events = decoder.process(
+            MpeMidiMessage::NoteOn {
+                channel: 1,
+                note: 60,
+                velocity: 0,
+            },
+            1.0,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [MpeDecoderEvent::NoteOff { .. }]
+        ));
+    }
+
+    #[test]
+    fn all_sound_off_terminates_active_notes() {
+        let mut decoder = MpeDecoder::default();
+        decoder.process(
+            MpeMidiMessage::NoteOn {
+                channel: 1,
+                note: 60,
+                velocity: 100,
+            },
+            0.0,
+        );
+        let events = decoder.process(
+            MpeMidiMessage::ControlChange {
+                channel: 0,
+                controller: 120,
+                value: 0,
+            },
+            1.0,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [MpeDecoderEvent::NoteOff { .. }]
+        ));
+        assert!(decoder.active_notes().is_empty());
     }
 }

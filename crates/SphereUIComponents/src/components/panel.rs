@@ -49,6 +49,7 @@ use crate::i18n::I18n;
 use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
 use crate::solfege::{ModelLoadState, SolfegeModelInfo};
 use crate::theme::{space, typography, Colors};
+use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 
 type RoutingComboToggleCb =
     Arc<dyn Fn(InspectorRoutingCombo, Option<OverlayAnchor>, &mut Window, &mut App) + 'static>;
@@ -62,6 +63,8 @@ type OutputRoutingCb = Arc<dyn Fn(&(String, TrackOutputRouting), &mut Window, &m
 type AudioFormatCb = Arc<dyn Fn(&(String, TrackAudioFormat), &mut Window, &mut App) + 'static>;
 type MidiInputCb = Arc<dyn Fn(&(String, TrackMidiInputRouting), &mut Window, &mut App) + 'static>;
 type MidiChannelCb = Arc<dyn Fn(&(String, Option<u8>), &mut Window, &mut App) + 'static>;
+type MpeConfigurationCb =
+    Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertMoveCb = Arc<dyn Fn(&(String, String, bool), &mut Window, &mut App) + 'static>;
@@ -155,6 +158,7 @@ pub struct InspectorCallbacks {
     pub on_set_audio_format: AudioFormatCb,
     pub on_set_midi_input: MidiInputCb,
     pub on_set_midi_channel: MidiChannelCb,
+    pub on_set_mpe_configuration: MpeConfigurationCb,
     pub on_open_insert_picker: InsertPickerCb,
     pub on_remove_insert: InsertPairCb,
     pub on_toggle_insert_bypass: InsertPairCb,
@@ -1346,6 +1350,121 @@ fn routing_section(
     section_card("routing", "Routing", callbacks, rows)
 }
 
+const MPE_MODE_OPTIONS: &[InspectorSelectOption<MpeOutputMode>] = &[
+    InspectorSelectOption {
+        label: "Off",
+        value: MpeOutputMode::Off,
+    },
+    InspectorSelectOption {
+        label: "Auto Detect",
+        value: MpeOutputMode::Auto,
+    },
+    InspectorSelectOption {
+        label: "Lower Zone",
+        value: MpeOutputMode::Lower,
+    },
+    InspectorSelectOption {
+        label: "Upper Zone",
+        value: MpeOutputMode::Upper,
+    },
+];
+
+/// Professional-only MPE transport settings. The expression curves remain
+/// visible and playable in Community; only editing the track-level transport
+/// policy is edition-gated here.
+fn mpe_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoElement {
+    let tid = track.id.clone();
+    let config = track.routing.mpe.sanitized();
+    let enabled = config.mode != MpeOutputMode::Off;
+    let cb = callbacks.on_set_mpe_configuration.clone();
+
+    let mode_cb = cb.clone();
+    let mode_id = tid.clone();
+    let mode = inspector_select(
+        "inspector-mpe-mode",
+        config.mode,
+        MPE_MODE_OPTIONS,
+        false,
+        move |mode, window, cx| {
+            let mut next = config;
+            next.mode = mode;
+            mode_cb(&(mode_id.clone(), next), window, cx);
+        },
+    );
+
+    let members_cb = cb.clone();
+    let members_id = tid.clone();
+    let members = inspector_numeric_stepper(
+        "inspector-mpe-members",
+        f64::from(config.member_channels),
+        format!("{} channels", config.member_channels),
+        1.0,
+        15.0,
+        1.0,
+        !enabled,
+        move |value, window, cx| {
+            let mut next = config;
+            next.member_channels = value.round().clamp(1.0, 15.0) as u8;
+            members_cb(&(members_id.clone(), next), window, cx);
+        },
+    );
+
+    let member_range_cb = cb.clone();
+    let member_range_id = tid.clone();
+    let member_range = inspector_numeric_stepper(
+        "inspector-mpe-member-range",
+        f64::from(config.member_pitch_range),
+        format!("{:.0} st", config.member_pitch_range),
+        1.0,
+        96.0,
+        1.0,
+        !enabled,
+        move |value, window, cx| {
+            let mut next = config;
+            next.member_pitch_range = value as f32;
+            member_range_cb(&(member_range_id.clone(), next), window, cx);
+        },
+    );
+
+    let manager_range_cb = cb;
+    let manager_range_id = tid;
+    let manager_range = inspector_numeric_stepper(
+        "inspector-mpe-manager-range",
+        f64::from(config.manager_pitch_range),
+        format!("{:.0} st", config.manager_pitch_range),
+        1.0,
+        96.0,
+        1.0,
+        !enabled,
+        move |value, window, cx| {
+            let mut next = config;
+            next.manager_pitch_range = value as f32;
+            manager_range_cb(&(manager_range_id.clone(), next), window, cx);
+        },
+    );
+
+    let hint = match config.mode {
+        MpeOutputMode::Off => "MPE output is disabled; notes use the track MIDI channel.",
+        MpeOutputMode::Auto => {
+            "Expression notes use the Lower Zone; ordinary notes keep their MIDI channel."
+        }
+        MpeOutputMode::Lower => "All notes use Lower Zone member channels 2–16.",
+        MpeOutputMode::Upper => "All notes use Upper Zone member channels 1–15.",
+    };
+
+    section_card(
+        "mpe",
+        "MPE",
+        callbacks,
+        section_rows()
+            .child(fb_form_row("Mode", mode))
+            .child(fb_form_row("Members", members))
+            .child(fb_form_row("Member Range", member_range))
+            .child(fb_form_row("Manager Range", manager_range))
+            .child(inspector_hint_text(hint)),
+    )
+}
+
 fn compact_action_button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<String>,
@@ -2355,6 +2474,11 @@ fn track_inspector(
             instrument_targets,
             callbacks,
         ))
+        .when(
+            crate::edition::professional_features_available()
+                && matches!(track.track_type, TrackType::Midi | TrackType::Instrument),
+            |this| this.child(mpe_section(track, callbacks)),
+        )
         .when(track.track_type == TrackType::Instrument, |this| {
             this.child(instrument_section(track, callbacks))
         })

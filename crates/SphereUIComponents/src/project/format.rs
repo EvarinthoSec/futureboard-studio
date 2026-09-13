@@ -15,6 +15,7 @@ use super::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, StretchAlgorithm, StretchMode, WarpMarker,
 };
+use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 use sphere_midi_service::{
     CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint, NoteExpression,
 };
@@ -109,9 +110,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v44 adds per-track recorded takes. A take names one of the track's own
 /// clips, so the audio is not duplicated — only the record of which pass made
 /// it and whether it is the one heard.
-/// v45 appends protocol-neutral per-note expression curves. MPE/MIDI 2.0
-/// transport channels are deliberately not persisted with those curves.
-pub const PROJECT_VERSION: u32 = 45;
+/// v45 appends protocol-neutral per-note expression curves. v46 appends
+/// per-track MPE output settings at the tail of each track block.
+pub const PROJECT_VERSION: u32 = 46;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -574,8 +575,8 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
     w.write_u8(n.articulation); // v25 (0 = none)
     w.write_u64(n.id); // v26 (0 = mint on load for legacy writers)
     w.write_u8(n.release_velocity); // v26 (0 = unset)
-                                    // v38: continuous pitch performance. Cent deviations keyed by beats from
-                                    // the note start, so the shape survives transposition and moves.
+    // v38: continuous pitch performance. Cent deviations keyed by beats from
+    // the note start, so the shape survives transposition and moves.
     w.write_u32(n.pitch_curve.len() as u32);
     for point in &n.pitch_curve {
         w.write_u64(point.id);
@@ -654,6 +655,7 @@ fn decode_expression_curve(r: &mut FbReader) -> Result<ExpressionCurve, ProjectE
 }
 
 fn encode_note_expression(w: &mut FbWriter, expression: &NoteExpression) {
+    let expression = expression.sanitized();
     encode_expression_curve(w, &expression.pitch);
     encode_expression_curve(w, &expression.pressure);
     encode_expression_curve(w, &expression.timbre);
@@ -691,7 +693,8 @@ fn decode_note_expression(r: &mut FbReader) -> Result<NoteExpression, ProjectErr
         timbre,
         release_velocity,
         custom,
-    })
+    }
+    .sanitized())
 }
 
 /// v5: controller kind tag. CC carries its number; the rest are tag-only.
@@ -991,8 +994,8 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     encode_soundfont_player(w, t.soundfont.as_ref()); // v28
     w.write_bool(t.volume_automation_read); // v32
     encode_solfege_engine(w, t.solfege.as_ref()); // v37
-                                                  // v42: the track's ARA plug-in. Identity only â its edits live in the
-                                                  // project-level document archive keyed by (plug-in, track).
+    // v42: the track's ARA plug-in. Identity only â its edits live in the
+    // project-level document archive keyed by (plug-in, track).
     match &t.ara {
         Some(ara) => {
             w.write_u8(1);
@@ -1016,6 +1019,13 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
         w.write_str(&take.recorded_at);
     }
     w.write_bool(t.takes_expanded);
+    // v46: per-track MPE output settings. Appended so v45 and older track
+    // blocks remain positionally readable.
+    let mpe = t.routing.mpe.sanitized();
+    w.write_u8(mpe.mode.to_tag());
+    w.write_u8(mpe.member_channels);
+    w.write_f32(mpe.member_pitch_range);
+    w.write_f32(mpe.manager_pitch_range);
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1236,7 +1246,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
                 tag => {
                     return Err(ProjectError::Corrupted(format!(
                         "bad lyric syllable mode tag {tag}"
-                    )))
+                    )));
                 }
             };
             let continuation = r.read_bool()?;
@@ -1278,7 +1288,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
                 tag => {
                     return Err(ProjectError::Corrupted(format!(
                         "bad song section type tag {tag}"
-                    )))
+                    )));
                 }
             };
             ProjectSongTextEventKind::Section {
@@ -1290,7 +1300,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
         tag => {
             return Err(ProjectError::Corrupted(format!(
                 "bad song text event kind tag {tag}"
-            )))
+            )));
         }
     };
     Ok(ProjectSongTextEvent { id, beat, kind })
@@ -1677,7 +1687,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
             tag => {
                 return Err(ProjectError::Corrupted(format!(
                     "bad insert role tag {tag}"
-                )))
+                )));
             }
         }
     } else {
@@ -1689,7 +1699,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "bad plugin option tag {t}"
-            )))
+            )));
         }
     };
     Ok(ProjectInsert {
@@ -1818,7 +1828,7 @@ fn decode_controller_kind(r: &mut FbReader) -> Result<MidiControllerKind, Projec
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown controller kind tag {t}"
-            )))
+            )));
         }
     })
 }
@@ -1855,7 +1865,7 @@ fn decode_sysex_event(r: &mut FbReader) -> Result<MidiSysExEvent, ProjectError> 
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown SysEx event kind tag {t}"
-            )))
+            )));
         }
     };
     Ok(MidiSysExEvent {
@@ -2010,7 +2020,7 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown clip source tag {t}"
-            )))
+            )));
         }
     };
     // v16: stretch/pitch block trails the source. Older files have none and
@@ -2062,7 +2072,7 @@ fn decode_input_monitor(r: &mut FbReader) -> Result<InputMonitorMode, ProjectErr
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown input monitor mode {t}"
-            )))
+            )));
         }
     })
 }
@@ -2099,7 +2109,7 @@ fn decode_track_input_routing(r: &mut FbReader) -> Result<V33TrackInputRouting, 
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track input routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2123,7 +2133,7 @@ fn decode_track_output_routing(
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track output routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2135,7 +2145,7 @@ fn decode_track_audio_format(r: &mut FbReader) -> Result<ProjectTrackAudioFormat
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track audio format {t}"
-            )))
+            )));
         }
     })
 }
@@ -2152,7 +2162,7 @@ fn decode_track_midi_input_routing(
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track MIDI input routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2198,6 +2208,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             midi_input,
             midi_channel,
             midi_output_per_note,
+            mpe: MpeTrackConfiguration::default(),
             sends: Vec::new(),
         }
     } else {
@@ -2295,6 +2306,18 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
     } else {
         (Vec::new(), false)
     };
+
+    // v46: MPE output settings. A pre-v46 project uses the shared default
+    // (Auto) so existing note expression still plays through the lower zone.
+    if version >= 46 {
+        routing.mpe = MpeTrackConfiguration {
+            mode: MpeOutputMode::from_tag(r.read_u8()?),
+            member_channels: r.read_u8()?,
+            member_pitch_range: r.read_f32()?,
+            manager_pitch_range: r.read_f32()?,
+        }
+        .sanitized();
+    }
 
     Ok(ProjectTrack {
         id,
@@ -2894,10 +2917,12 @@ mod tests {
         encode_midi_note(&mut w, &note(60, false));
         let bytes = w.into_bytes();
         let mut r = FbReader::new(&bytes);
-        assert!(decode_midi_note(&mut r, PROJECT_VERSION)
-            .unwrap()
-            .accent
-            .is_none());
+        assert!(
+            decode_midi_note(&mut r, PROJECT_VERSION)
+                .unwrap()
+                .accent
+                .is_none()
+        );
     }
 
     /// A v38 file has no accent bytes at all. Reading it as v39 would consume

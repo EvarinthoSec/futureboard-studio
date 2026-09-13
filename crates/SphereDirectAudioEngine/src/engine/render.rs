@@ -4239,6 +4239,7 @@ mod soundfont_instrument_tests {
                     },
                 ],
                 controllers: Vec::new(),
+                mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
             }],
             pdc_enabled: true,
             latency_graph_version: 1,

@@ -90,6 +90,10 @@ impl MpeChannelAllocator {
             order: self.next_order,
             held: true,
         });
+        // A release marker belongs to the old voice. Clear it as soon as the
+        // channel is claimed so a later active-voice steal does not keep
+        // reporting a stale release forever.
+        self.released_channels[channel as usize] = false;
         Some(MpeChannelAllocation {
             channel,
             stolen_note: previous.map(|slot| slot.note_id),

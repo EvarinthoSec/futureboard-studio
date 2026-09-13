@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sphere_midi_service::mpe::MpeTrackConfiguration;
 use sphere_midi_service::NoteExpression;
 use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
 use SphereAudioProcessor::StretchParams;
@@ -307,6 +308,10 @@ pub struct EngineMidiClipSnapshot {
     /// MIDI controller (CC / pitch-bend / aftertouch) lanes for this clip.
     #[serde(default)]
     pub controllers: Vec<EngineMidiControllerLane>,
+    /// Track-level MPE routing copied into the clip snapshot so realtime and
+    /// offline MIDI scheduling use the same zone policy.
+    #[serde(default)]
+    pub mpe: MpeTrackConfiguration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

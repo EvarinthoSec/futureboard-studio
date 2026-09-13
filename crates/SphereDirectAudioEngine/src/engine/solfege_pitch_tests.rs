@@ -95,6 +95,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
             length_beats: 8.0,
             notes,
             controllers: Vec::new(),
+            mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
         }],
         pdc_enabled: false,
         latency_graph_version: 1,

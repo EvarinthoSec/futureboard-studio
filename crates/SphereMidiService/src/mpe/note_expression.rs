@@ -1,6 +1,6 @@
 use super::{MpeDecoder, MpeDecoderEvent};
-use crate::expression::{ExpressionSimplificationTolerances, NoteExpression, NoteId, Tick};
 use crate::MidiInputEvent;
+use crate::expression::{ExpressionSimplificationTolerances, NoteExpression, NoteId, Tick};
 use std::collections::HashMap;
 
 /// A completed note produced by the MPE recording path.  The source channel

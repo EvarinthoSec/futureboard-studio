@@ -81,6 +81,34 @@ impl ExpressionCurve {
         self.points.is_empty()
     }
 
+    /// Return a playback-safe copy of a curve. Raw recording points are
+    /// intentionally permissive, while project files and realtime snapshots
+    /// need finite, note-local positions and bounded controller values.
+    pub fn sanitized(&self, min_value: f32, max_value: f32) -> Self {
+        let fallback = min_value.clamp(min_value, max_value);
+        Self::from_points(
+            self.points
+                .iter()
+                .filter_map(|point| {
+                    let position = point
+                        .position
+                        .is_finite()
+                        .then_some(point.position.max(0.0))?;
+                    let value = if point.value.is_finite() {
+                        point.value.clamp(min_value, max_value)
+                    } else {
+                        fallback
+                    };
+                    Some(ExpressionPoint {
+                        position,
+                        value,
+                        interpolation: point.interpolation,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Evaluate a curve without allocating.  The caller should use
     /// [`ExpressionCursor`] for repeated forward playback lookups.
     pub fn value_at(&self, position: Tick) -> Option<f32> {
@@ -204,23 +232,28 @@ fn interpolate(a: ExpressionPoint, b: ExpressionPoint, position: Tick) -> f32 {
 /// Endpoints are always retained and interpolation metadata is retained from
 /// the corresponding source points.
 pub fn simplify_expression_curve(curve: &ExpressionCurve, tolerance: f32) -> ExpressionCurve {
-    if curve.points.len() <= 2 || tolerance <= 0.0 {
-        return curve.clone();
+    // Recording deliberately appends raw points without sorting. Normalize
+    // their order at this boundary so the early-return path for one/two points
+    // is safe too; otherwise a delayed MIDI event could make value_at/split_at
+    // read the curve backwards forever after the take is committed.
+    let ordered = ExpressionCurve::from_points(curve.points.clone());
+    if ordered.points.len() <= 2 || tolerance <= 0.0 {
+        return ordered;
     }
     let tolerance = tolerance.abs();
-    let mut keep = vec![false; curve.points.len()];
+    let mut keep = vec![false; ordered.points.len()];
     keep[0] = true;
     let last = keep.len() - 1;
     keep[last] = true;
     simplify_range(
-        &curve.points,
+        &ordered.points,
         0,
-        curve.points.len() - 1,
+        ordered.points.len() - 1,
         tolerance,
         &mut keep,
     );
     ExpressionCurve::from_points(
-        curve
+        ordered
             .points
             .iter()
             .zip(keep)
@@ -305,6 +338,30 @@ impl NoteExpression {
             && self.timbre.is_empty()
             && self.release_velocity.is_none()
             && self.custom.iter().all(|lane| lane.curve.is_empty())
+    }
+
+    /// Sanitize all lanes at a trust boundary such as project decode or an
+    /// engine snapshot. Pitch is bipolar; pressure, timbre and custom lanes
+    /// are unipolar. Invalid release velocity means "unset".
+    pub fn sanitized(&self) -> Self {
+        Self {
+            pitch: self.pitch.sanitized(-1.0, 1.0),
+            pressure: self.pressure.sanitized(0.0, 1.0),
+            timbre: self.timbre.sanitized(0.0, 1.0),
+            release_velocity: self
+                .release_velocity
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 1.0)),
+            custom: self
+                .custom
+                .iter()
+                .map(|lane| CustomExpressionLane {
+                    controller: lane.controller,
+                    name: lane.name.clone(),
+                    curve: lane.curve.sanitized(0.0, 1.0),
+                })
+                .collect(),
+        }
     }
 
     pub fn simplify(&self, tolerances: ExpressionSimplificationTolerances) -> Self {
@@ -472,6 +529,44 @@ mod tests {
         ]);
         assert_eq!(curve.simplify(0.1).points.len(), 3);
         assert_eq!(curve.simplify(2.0).points.len(), 2);
+    }
+
+    #[test]
+    fn simplifying_raw_points_restores_note_local_order() {
+        let mut curve = ExpressionCurve::default();
+        curve.push_raw(ExpressionPoint::new(1.0, 1.0));
+        curve.push_raw(ExpressionPoint::new(0.0, 0.0));
+        let ordered = curve.simplify(0.0);
+        assert_eq!(ordered.points[0].position, 0.0);
+        assert_eq!(ordered.points[1].position, 1.0);
+    }
+
+    #[test]
+    fn sanitizing_expression_drops_invalid_positions_and_bounds_values() {
+        let expression = NoteExpression {
+            pitch: ExpressionCurve::from_points(vec![
+                ExpressionPoint::new(-1.0, -2.0),
+                ExpressionPoint::new(f32::NAN, 0.0),
+                ExpressionPoint::new(1.0, 2.0),
+            ]),
+            pressure: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, f32::NAN)]),
+            release_velocity: Some(f32::INFINITY),
+            custom: vec![CustomExpressionLane {
+                controller: 74,
+                name: "timbre".into(),
+                curve: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, 2.0)]),
+            }],
+            ..NoteExpression::default()
+        };
+
+        let safe = expression.sanitized();
+        assert_eq!(safe.pitch.points.len(), 2);
+        assert_eq!(safe.pitch.points[0].position, 0.0);
+        assert_eq!(safe.pitch.points[0].value, -1.0);
+        assert_eq!(safe.pitch.points[1].value, 1.0);
+        assert_eq!(safe.pressure.points[0].value, 0.0);
+        assert_eq!(safe.release_velocity, None);
+        assert_eq!(safe.custom[0].curve.points[0].value, 1.0);
     }
 
     #[test]

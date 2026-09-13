@@ -367,7 +367,13 @@ pub(crate) fn build_and_warm_audio_engine(
         engine.config().sample_rate,
         engine.config().buffer_size
     );
+    // On macOS, CoreAudio's supported-config query can block in the system HAL
+    // while another process owns an audio session. Device discovery is a
+    // settings concern and must not prevent a new workspace from mounting.
+    #[cfg(not(target_os = "macos"))]
     let devices = engine.list_output_devices();
+    #[cfg(target_os = "macos")]
+    let devices: Vec<DirectAudio::EngineDeviceInfo> = Vec::new();
     eprintln!("[audio] {} output device(s) discovered", devices.len());
     for d in devices.iter().take(8) {
         eprintln!(
@@ -391,8 +397,11 @@ pub(crate) fn build_and_warm_audio_engine(
     // warm-up retry re-runs the same device-less `start()`, it failed forever.
     // The only way back was Settings, whose own sync does resolve the device
     // and reopen, which is exactly what this now does up front.
+    #[cfg(not(target_os = "macos"))]
     let desired_output =
         resolve_output_device_for_backend(&engine, backend, &schema.hardware.audio.device_out);
+    #[cfg(target_os = "macos")]
+    let desired_output = None;
     let open_result = match desired_output {
         Some(device) => {
             eprintln!(
@@ -439,6 +448,7 @@ pub(crate) fn build_and_warm_audio_engine(
     // Audio Connections must see the same backend-scoped inventory as Audio
     // Device Setup. The generic registry scan cannot enumerate Professional
     // Edition ASIO drivers or their active-session channel counts.
+    #[cfg(not(target_os = "macos"))]
     crate::device_registry::scan_audio_for_engine(&engine);
     Ok((engine, stats))
 }

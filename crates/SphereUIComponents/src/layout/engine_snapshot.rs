@@ -1,9 +1,9 @@
 use crate::components::plugin_picker::STUB_PLUGIN_ID;
 use crate::components::timeline::timeline_state::{
-    self, vsti_output_bus_flat_range, vsti_output_bus_strip_indices,
-    vsti_output_child_channels_for_bus_layout, vsti_output_child_track_id, ClipState, ClipType,
-    InsertSlotState, MidiControllerKind, StretchMode, TimelineState, TrackState, TrackType,
-    MASTER_TRACK_ID,
+    self, ClipState, ClipType, InsertSlotState, MASTER_TRACK_ID, MidiControllerKind, StretchMode,
+    TimelineState, TrackState, TrackType, vsti_output_bus_flat_range,
+    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
+    vsti_output_child_track_id,
 };
 
 use DirectAudio::types::{
@@ -742,11 +742,7 @@ fn vsti_output_children_json(slot: &InsertSlotState) -> serde_json::Value {
                 let (channel_l, channel_r) =
                     vsti_output_child_channels_for_bus_layout(bus_counts, bus_index)?;
                 let channel_count = if bus_counts.len() == 1 && bus_counts[0] > 2 {
-                    if channel_l == channel_r {
-                        1
-                    } else {
-                        2
-                    }
+                    if channel_l == channel_r { 1 } else { 2 }
                 } else if bus_counts.is_empty() {
                     2
                 } else {
@@ -1187,7 +1183,7 @@ fn build_engine_project_snapshot_inner(
                                 length_beats: length_beats.max(0.0) as f64,
                                 velocity,
                                 channel,
-                                expression: n.expression.clone(),
+                                expression: n.expression.sanitized(),
                                 // Resolved the same way playback resolves it,
                                 // so a note with no marking of its own still
                                 // follows the clip's direction lane.
@@ -1226,6 +1222,7 @@ fn build_engine_project_snapshot_inner(
                             })
                         })
                         .collect(),
+                    mpe: track.routing.mpe,
                 })
             })
         })
@@ -1944,7 +1941,7 @@ mod tests {
     #[test]
     fn vsti_multiout_children_are_stable_tracks_and_engine_routes() {
         use crate::components::timeline::timeline_state::{
-            vsti_output_child_track_id, InsertPluginFormat,
+            InsertPluginFormat, vsti_output_child_track_id,
         };
 
         let mut state = TimelineState::default();
@@ -2025,7 +2022,7 @@ mod tests {
     #[test]
     fn substrip_fx_insert_serializes_into_engine_snapshot() {
         use crate::components::timeline::timeline_state::{
-            vsti_output_child_track_id, InsertPluginFormat,
+            InsertPluginFormat, vsti_output_child_track_id,
         };
 
         let mut state = TimelineState::default();
@@ -2098,7 +2095,7 @@ mod tests {
     #[test]
     fn single_multichannel_vsti_bus_exports_flat_pair_children() {
         use crate::components::timeline::timeline_state::{
-            vsti_output_child_track_id, InsertPluginFormat,
+            InsertPluginFormat, vsti_output_child_track_id,
         };
 
         let mut state = TimelineState::default();
