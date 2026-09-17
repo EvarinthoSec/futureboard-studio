@@ -163,9 +163,10 @@ fundsp = { version = "0.23", default-features = false, features = ["std"] }
 # revision that declares workspace version 150.1.0+150.0.11.
 cef = { git = "https://github.com/tauri-apps/cef-rs.git", rev = "8c8af8cb5a6b4cce994d5745d031b0196959c22f", default-features = false }
 download-cef = "2.3.2"
-# Prebuilt Crashpad bindings and handler. The native app bundles the handler
-# beside its executable through `crashpad-handler-bundler`.
-crashpad-rs = { git = "https://github.com/bahamoth/crashpad-rs", tag = "v0.2.7", version = "0.2.7", features = ["prebuilt"] }
+# Crashpad bindings and handler. The Studio manifest selects `prebuilt` only
+# for targets that have a published archive; other targets use the vendored
+# source strategy instead of failing on a release-asset 404.
+crashpad-rs = { git = "https://github.com/bahamoth/crashpad-rs", tag = "v0.2.7", version = "0.2.7" }
 crashpad-handler-bundler = { git = "https://github.com/bahamoth/crashpad-rs", tag = "v0.2.7", version = "0.2.7" }
 ureq = "3"
 

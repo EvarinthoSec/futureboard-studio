@@ -80,6 +80,22 @@ gpui = { workspace = true, features = ["wayland", "x11"] }
 # falls through to `unreachable!()`. Re-add the features explicitly here.
 gpui_linux = { workspace = true, features = ["wayland", "x11"] }
 
+# Crashpad v0.2.7 publishes prebuilt archives only for macOS arm64, Linux
+# x86_64, and Windows x86_64. Keep the fast path for those exact targets and
+# build from the checked-out Crashpad sources everywhere else. These target
+# tables intentionally refine the featureless workspace dependency above.
+[target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"), all(target_os = "windows", target_arch = "x86_64")))'.dependencies]
+crashpad-rs = { workspace = true, features = ["prebuilt"] }
+
+[target.'cfg(any(all(target_os = "macos", target_arch = "x86_64"), all(target_os = "linux", target_arch = "aarch64"), all(target_os = "ios"), all(target_os = "android")))'.dependencies]
+crashpad-rs = { workspace = true, features = ["vendored"] }
+
+# Windows ARM64 has no published prebuilt archive. The Crashpad crate's depot
+# strategy is the supported Windows source-build path and lets the native
+# toolchain select the right target architecture.
+[target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
+crashpad-rs = { workspace = true, features = ["vendored-depot"] }
+
 [features]
 default = ["gpu-renderer", "stem-onnx", "builtin-plugin-editor"]
 gpu-renderer = ["sphere_ui_components/gpu-renderer"]

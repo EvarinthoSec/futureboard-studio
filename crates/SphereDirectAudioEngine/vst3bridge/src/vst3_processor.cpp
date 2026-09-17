@@ -998,6 +998,11 @@ sphere_daux_editor_can_resize(SphereDauxVst3Processor *proc) {
              : 0;
 }
 
+extern "C" int
+sphere_daux_editor_is_attached(SphereDauxVst3Processor *proc) {
+  return (proc && proc->editor_attached) ? 1 : 0;
+}
+
 extern "C" int sphere_daux_editor_constrain_view_size(
     SphereDauxVst3Processor *proc, int *io_width, int *io_height) {
   if (!proc || !proc->editor_view || !io_width || !io_height ||
@@ -1103,6 +1108,11 @@ extern "C" unsigned long long
 sphere_daux_editor_get_handle(SphereDauxVst3Processor *p) {
   return p ? p->editor_handle : 0;
 }
+extern "C" void sphere_daux_editor_set_handle(
+    SphereDauxVst3Processor *p, unsigned long long handle) {
+  if (p)
+    p->editor_handle = handle;
+}
 extern "C" const char *
 sphere_daux_editor_get_window_id(SphereDauxVst3Processor *p) {
   return p ? p->editor_window_id.c_str() : "";
@@ -1119,6 +1129,26 @@ extern "C" int
 sphere_daux_editor_get_requested_height(SphereDauxVst3Processor *p) {
   return p ? p->editor_requested_height : 0;
 }
+
+#if defined(__APPLE__)
+extern "C" int
+sphere_daux_editor_is_embedded(SphereDauxVst3Processor *proc) {
+  return (proc && proc->editor_embed_mode) ? 1 : 0;
+}
+
+extern "C" void *
+sphere_daux_editor_get_embed_parent(SphereDauxVst3Processor *proc) {
+  return proc ? proc->editor_embed_parent : nullptr;
+}
+
+extern "C" void sphere_daux_editor_set_embedded(
+    SphereDauxVst3Processor *proc, void *parent, int embedded) {
+  if (!proc)
+    return;
+  proc->editor_embed_parent = parent;
+  proc->editor_embed_mode = embedded != 0;
+}
+#endif
 
 #endif // __APPLE__ || __linux__
 

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
-    crashpad_handler_bundler::bundle().expect("failed to bundle crashpad_handler");
+    bundle_crashpad_handler();
 
     println!("cargo:rerun-if-changed=../../../packages/shared/app/windows/app.rc");
     println!("cargo:rerun-if-changed=../../../packages/shared/app/windows/app.manifest");
@@ -47,6 +47,32 @@ fn main() {
         )
         .manifest_required()
         .unwrap();
+    }
+}
+
+/// Keep mobile/unknown targets buildable while requiring a handler for the
+/// desktop targets that actually launch one. The bundled Crashpad crate uses
+/// an in-process handler on iOS and does not have an external executable to
+/// copy there.
+fn bundle_crashpad_handler() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let uses_external_handler = matches!(
+        target_os.as_str(),
+        "android" | "linux" | "macos" | "windows"
+    );
+    if !uses_external_handler {
+        println!(
+            "cargo:warning=Crashpad external handler bundling skipped for target OS `{target_os}`"
+        );
+        return;
+    }
+
+    if let Err(error) = crashpad_handler_bundler::bundle() {
+        panic!(
+            "failed to bundle Crashpad handler for `{target_os}`: {error}. \
+             Set CRASHPAD_HANDLER to a target-native handler or use the matching \
+             Crashpad build strategy."
+        );
     }
 }
 

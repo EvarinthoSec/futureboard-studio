@@ -52,8 +52,9 @@ test-ce = [
 # Cargo unifies features within one build graph, so each edition must use
 # a separate target directory to avoid overwriting or reusing app artifacts.
 # Aliases cannot chain commands, so cross-edition combos live in the xtask:
-#   cargo xtask build-all [--release]   → build-ce, then build-professional-win
-#   cargo xtask check-all               → check-ce, then check-professional-win
+#   cargo xtask build-all [--release]   → build-ce, then Professional on Windows
+#   cargo xtask check-all               → check-ce, then Professional on Windows
+#   cargo xtask build-all --target x86_64-pc-windows-msvc → include Windows
 xtask = ["run", "--package", "xtask", "--"]
 
 # Binary packaging / staging into `out/` (see xtask/README.md). These build the

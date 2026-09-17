@@ -4,7 +4,8 @@
 
 - **`build-all` / `check-all`** — chain the per-edition cargo aliases
   (`build-ce`, `build-professional-win`, …) from `.cargo/config.toml`, because
-  Cargo aliases cannot chain commands.
+  Cargo aliases cannot chain commands. The Windows-only Professional alias is
+  skipped automatically on non-Windows hosts unless a Windows target is passed.
 - **`package`** — build `FutureboardNative` and stage a clean, runnable
   application tree into `out/`, kept separate from the Cargo `target/` cache.
 

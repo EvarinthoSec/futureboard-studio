@@ -349,6 +349,11 @@ void shutdown_editor_mac(SphereDauxVst3Processor *);
 /// `vst3_processor.cpp` stays free of Cocoa.
 void resize_editor_mac(SphereDauxVst3Processor *, int width, int height,
                        const char *reason);
+unsigned long long embed_editor_mac(SphereDauxVst3Processor *, void *, int,
+                                    int);
+void embed_resize_mac(SphereDauxVst3Processor *, int, int);
+void embed_detach_mac(SphereDauxVst3Processor *);
+int embed_is_attached_mac(SphereDauxVst3Processor *);
 #elif defined(__linux__)
 unsigned long long open_editor_linux(SphereDauxVst3Processor *, const char *,
                                      const char *, int, int);

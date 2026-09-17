@@ -74,6 +74,10 @@ int sphere_daux_editor_get_view_size(
 /// Return whether the current view supports host/user resizing.
 int sphere_daux_editor_can_resize(SphereDauxVst3Processor* proc);
 
+/// Query the platform-neutral editor lifecycle state while keeping the
+/// processor opaque to platform translation units.
+int sphere_daux_editor_is_attached(SphereDauxVst3Processor* proc);
+
 /// Apply the VST3 size contract to a proposed content size. Fixed-size views
 /// snap to getSize(); resizable views run checkSizeConstraint().
 int sphere_daux_editor_constrain_view_size(
@@ -141,10 +145,19 @@ void*              sphere_daux_editor_get_native_window(SphereDauxVst3Processor*
 void*              sphere_daux_editor_get_native_embed(SphereDauxVst3Processor* proc);
 void*              sphere_daux_editor_get_native_delegate(SphereDauxVst3Processor* proc);
 unsigned long long sphere_daux_editor_get_handle(SphereDauxVst3Processor* proc);
+void               sphere_daux_editor_set_handle(
+    SphereDauxVst3Processor* proc, unsigned long long handle);
 const char*        sphere_daux_editor_get_window_id(SphereDauxVst3Processor* proc);
 const char*        sphere_daux_editor_get_title(SphereDauxVst3Processor* proc);
 int                sphere_daux_editor_get_requested_width(SphereDauxVst3Processor* proc);
 int                sphere_daux_editor_get_requested_height(SphereDauxVst3Processor* proc);
+
+#if defined(__APPLE__)
+int   sphere_daux_editor_is_embedded(SphereDauxVst3Processor* proc);
+void* sphere_daux_editor_get_embed_parent(SphereDauxVst3Processor* proc);
+void  sphere_daux_editor_set_embedded(
+    SphereDauxVst3Processor* proc, void* parent, int embedded);
+#endif
 
 #ifdef __cplusplus
 } // extern "C"

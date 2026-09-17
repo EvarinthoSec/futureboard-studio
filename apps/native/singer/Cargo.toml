@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
-gpui_windows.workspace = true
 cpal.workspace = true
 crossbeam-channel.workspace = true
 pollster.workspace = true
@@ -22,6 +21,16 @@ solfege-core.workspace = true
 solfege-engine.workspace = true
 solfege-event.workspace = true
 sphere_ui_components = { workspace = true, default-features = false, features = ["gpu-renderer"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, features = ["wayland", "x11"] }
+gpui_linux = { workspace = true, features = ["wayland", "x11"] }
 
 [lints]
 workspace = true

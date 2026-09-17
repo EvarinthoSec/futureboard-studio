@@ -4,7 +4,9 @@
 //!
 //! * `build-all` / `check-all` — chain the per-edition cargo aliases from
 //!   `.cargo/config.toml` (Cargo aliases cannot chain commands, and the two
-//!   editions must build into separate target directories).
+//!   editions must build into separate target directories). The Windows-only
+//!   Professional alias is skipped unless the host or an explicit target is
+//!   Windows.
 //! * `package` — build `FutureboardNative` and stage a clean, runnable
 //!   application tree into `out/`, separate from the Cargo `target/` cache.
 //! * `jam` — the same for `FutureboardJam`, the standalone Audio Jam client.
@@ -54,13 +56,15 @@ enum XtaskCommand {
     /// Build and stage a runnable application into `out/`.
     Package(PackageArgs),
 
-    /// Run `build-ce`, then `build-professional-win` (extra args forwarded).
+    /// Run `build-ce`, then the Windows Professional build when applicable
+    /// (extra args forwarded).
     BuildAll {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
-    /// Run `check-ce`, then `check-professional-win` (extra args forwarded).
+    /// Run `check-ce`, then the Windows Professional check when applicable
+    /// (extra args forwarded).
     CheckAll {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -198,11 +202,37 @@ fn run_package(args: PackageArgs) -> ExitCode {
 
 fn run_aliases(aliases: &[&str], forwarded: &[String]) -> ExitCode {
     for alias in aliases {
+        if !should_run_alias(alias, forwarded) {
+            eprintln!(
+                "[xtask] skipping {alias}: this alias is Windows-only and no Windows target was requested"
+            );
+            continue;
+        }
         if let Err(code) = run_cargo_alias(alias, forwarded) {
             return code;
         }
     }
     ExitCode::SUCCESS
+}
+
+fn should_run_alias(alias: &str, forwarded: &[String]) -> bool {
+    if !matches!(alias, "build-professional-win" | "check-professional-win") {
+        return true;
+    }
+
+    requested_target(forwarded)
+        .map(|target| target.contains("windows"))
+        .unwrap_or(cfg!(target_os = "windows"))
+}
+
+fn requested_target(args: &[String]) -> Option<&str> {
+    args.iter().enumerate().find_map(|(index, argument)| {
+        if argument == "--target" {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            argument.strip_prefix("--target=")
+        }
+    })
 }
 
 fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
@@ -213,6 +243,18 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
     eprintln!("[xtask] cargo {} {}", alias, forwarded.join(" "));
     let mut command = Command::new(&cargo);
     command.arg(alias).args(forwarded).current_dir(root);
+
+    // Cargo does not expose an alias' `--target-dir` as CARGO_TARGET_DIR to
+    // build scripts. Crashpad uses that variable when it places its handler,
+    // so mirror the alias' target directory explicitly or the handler lands in
+    // the app crate's fallback target tree instead of the tree being built.
+    if let Some(target_dir) = match alias {
+        "build-ce" | "check-ce" => Some("target/community"),
+        "build-professional-win" | "check-professional-win" => Some("target/professional"),
+        _ => None,
+    } {
+        command.env("CARGO_TARGET_DIR", Path::new(root).join(target_dir));
+    }
 
     // The professional aliases compile `asio-sys`, so they need the same SDK and
     // libclang the packaging path resolves. Without this, `cargo xtask
@@ -242,5 +284,37 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
             eprintln!("[xtask] failed to spawn `{cargo} {alias}`: {error}");
             Err(ExitCode::FAILURE)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{requested_target, should_run_alias};
+
+    #[test]
+    fn community_aliases_are_always_run() {
+        assert!(should_run_alias("build-ce", &[]));
+    }
+
+    #[test]
+    fn professional_windows_alias_uses_host_by_default() {
+        assert_eq!(
+            should_run_alias("build-professional-win", &[]),
+            cfg!(target_os = "windows")
+        );
+    }
+
+    #[test]
+    fn explicit_windows_target_enables_professional_alias() {
+        let args = vec!["--target".to_owned(), "x86_64-pc-windows-msvc".to_owned()];
+        assert_eq!(requested_target(&args), Some("x86_64-pc-windows-msvc"));
+        assert!(should_run_alias("check-professional-win", &args));
+    }
+
+    #[test]
+    fn explicit_non_windows_target_skips_professional_alias() {
+        let args = vec!["--target=aarch64-apple-darwin".to_owned()];
+        assert_eq!(requested_target(&args), Some("aarch64-apple-darwin"));
+        assert!(!should_run_alias("build-professional-win", &args));
     }
 }

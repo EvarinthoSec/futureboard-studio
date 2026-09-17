@@ -7785,6 +7785,8 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "gpui",
+ "gpui_linux",
+ "gpui_macos",
  "gpui_windows",
  "pollster 0.4.0",
  "serde",

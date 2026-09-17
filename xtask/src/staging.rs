@@ -140,6 +140,23 @@ pub fn stage_runtime_siblings(staging_dir: &Path, executable: &Path) -> Result<V
     Ok(staged)
 }
 
+/// Return the Crashpad handler filename for a target that uses an external
+/// handler. iOS uses an in-process handler; unknown targets are left alone so
+/// a non-desktop package is not forced to invent a desktop executable name.
+pub fn crashpad_handler_name(target: &str) -> Option<&'static str> {
+    if target.contains("ios") {
+        None
+    } else if target.contains("android") {
+        Some("libcrashpad_handler.so")
+    } else if target.contains("windows") {
+        Some("crashpad_handler.exe")
+    } else if target.contains("linux") || target.contains("darwin") {
+        Some("crashpad_handler")
+    } else {
+        None
+    }
+}
+
 /// Copy the Crashpad handler next to the application binary.
 ///
 /// Crashpad is part of every desktop Studio package, so a missing handler is a
@@ -151,11 +168,9 @@ pub fn stage_crashpad_handler(
     executable: &Path,
     target: &str,
 ) -> Result<String> {
-    let handler_name = if target.contains("windows") {
-        "crashpad_handler.exe"
-    } else {
-        "crashpad_handler"
-    };
+    let handler_name = crashpad_handler_name(target).with_context(|| {
+        format!("Crashpad external handler is not supported for target `{target}`")
+    })?;
     let source_dir = executable
         .parent()
         .context("executable has no parent directory")?;
@@ -407,6 +422,23 @@ mod tests {
             stage_crashpad_handler(&staging_dir, &source, "x86_64-unknown-linux-gnu").unwrap_err();
 
         assert!(error.to_string().contains("Crashpad handler"));
+    }
+
+    #[test]
+    fn crashpad_handler_name_matches_target_platform() {
+        assert_eq!(
+            crashpad_handler_name("x86_64-pc-windows-msvc"),
+            Some("crashpad_handler.exe")
+        );
+        assert_eq!(
+            crashpad_handler_name("aarch64-linux-android"),
+            Some("libcrashpad_handler.so")
+        );
+        assert_eq!(crashpad_handler_name("aarch64-apple-ios"), None);
+        assert_eq!(
+            crashpad_handler_name("aarch64-unknown-linux-gnu"),
+            Some("crashpad_handler")
+        );
     }
 
     #[test]

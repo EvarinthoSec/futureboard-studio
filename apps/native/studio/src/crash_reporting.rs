@@ -32,8 +32,12 @@ pub fn install() {
 
     let paths = sphere_ui_components::paths::FutureboardPaths::resolve();
     let crashpad_dir = paths.app_data.join("Crashpad");
+    let Some(handler_path) = handler_path() else {
+        eprintln!("[crashpad] disabled: target uses an in-process handler");
+        return;
+    };
     let config = CrashpadConfig::builder()
-        .handler_path(handler_path())
+        .handler_path(handler_path)
         .database_path(crashpad_dir.join("database"))
         .metrics_path(crashpad_dir.join("metrics"))
         .url(upload_url)
@@ -86,12 +90,22 @@ fn acceptable_endpoint(url: &str) -> bool {
             && (url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost")))
 }
 
-fn handler_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CRASHPAD_HANDLER").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
+fn handler_path() -> Option<PathBuf> {
+    if cfg!(any(
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )) {
+        return None;
     }
 
-    let name = if cfg!(windows) {
+    if let Some(path) = std::env::var_os("CRASHPAD_HANDLER").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+
+    let name = if cfg!(target_os = "android") {
+        "libcrashpad_handler.so"
+    } else if cfg!(windows) {
         "crashpad_handler.exe"
     } else {
         "crashpad_handler"
@@ -100,14 +114,16 @@ fn handler_path() -> PathBuf {
         if let Some(parent) = executable.parent() {
             let beside_executable = parent.join(name);
             if beside_executable.is_file() {
-                return beside_executable;
+                return Some(beside_executable);
             }
         }
     }
 
-    option_env!("CRASHPAD_HANDLER_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(name))
+    Some(
+        option_env!("CRASHPAD_HANDLER_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(name)),
+    )
 }
 
 fn edition_name() -> &'static str {

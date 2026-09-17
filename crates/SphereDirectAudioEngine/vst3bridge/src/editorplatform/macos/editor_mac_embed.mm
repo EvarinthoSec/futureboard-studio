@@ -69,8 +69,9 @@ unsigned long long embed_editor_mac(SphereDauxVst3Processor *proc,
   // Already embedded for this instance? Re-attaching would call attached() on a
   // live view, which most editors do not survive. Hand back the same handle and
   // let the host re-sync geometry through embed_resize_mac.
-  if (proc->editor_embed_mode && proc->editor_attached &&
-      proc->editor_embed_parent == host_view) {
+  if (sphere_daux_editor_is_embedded(proc) &&
+      sphere_daux_editor_is_attached(proc) &&
+      sphere_daux_editor_get_embed_parent(proc) == host_view) {
     return sphere_daux_editor_get_handle(proc);
   }
 
@@ -78,7 +79,7 @@ unsigned long long embed_editor_mac(SphereDauxVst3Processor *proc,
   // rebuilt its region. Take the view out of the old one first — leaving it
   // attached to a view that is about to be released is a use-after-free with
   // extra steps.
-  if (proc->editor_attached)
+  if (sphere_daux_editor_is_attached(proc))
     embed_detach_mac(proc);
 
   int editor_width = daux_embed_dimensions_sane(width, height) ? width : 820;
@@ -110,9 +111,8 @@ unsigned long long embed_editor_mac(SphereDauxVst3Processor *proc,
   // Recorded so detach and geometry updates can find the same container, and
   // so a second open of the same editor is a no-op rather than a re-attach.
   // Stored as a bare pointer on purpose: this file does not own it.
-  proc->editor_embed_parent = host_view;
-  proc->editor_embed_mode = true;
-  proc->editor_handle = handle;
+  sphere_daux_editor_set_embedded(proc, host_view, 1);
+  sphere_daux_editor_set_handle(proc, handle);
 
   // Some editors settle on their real size only inside attached(); ask again so
   // the shell reserves what the plug-in actually took rather than what it asked
@@ -135,7 +135,8 @@ unsigned long long embed_editor_mac(SphereDauxVst3Processor *proc,
 }
 
 void embed_resize_mac(SphereDauxVst3Processor *proc, int width, int height) {
-  if (!proc || !proc->editor_embed_mode || !proc->editor_attached)
+  if (!sphere_daux_editor_is_embedded(proc) ||
+      !sphere_daux_editor_is_attached(proc))
     return;
   if (!daux_embed_dimensions_sane(width, height))
     return;
@@ -175,12 +176,14 @@ void embed_detach_mac(SphereDauxVst3Processor *proc) {
   // the host's and is left exactly as it was found — still mounted, still
   // sized, ready for the next open.
   sphere_daux_editor_detach_view(proc);
-  proc->editor_embed_parent = nullptr;
-  proc->editor_embed_mode = false;
+  sphere_daux_editor_set_embedded(proc, nullptr, 0);
   if (handle)
     std::fprintf(stderr, "[MacPluginEditor] detached handle=%llu\n", handle);
 }
 
 int embed_is_attached_mac(SphereDauxVst3Processor *proc) {
-  return (proc && proc->editor_embed_mode && proc->editor_attached) ? 1 : 0;
+  return (sphere_daux_editor_is_embedded(proc) &&
+          sphere_daux_editor_is_attached(proc))
+             ? 1
+             : 0;
 }
