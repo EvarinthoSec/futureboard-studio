@@ -10,6 +10,8 @@
 //! present on every clip but only meaningful for audio clips — MIDI clips carry a
 //! default (`StretchMode::Off`) instance that is ignored.
 
+use sphere_audio_editor::ClipEnvelope;
+
 /// How an audio clip's playback timing is transformed.
 ///
 /// See the per-variant docs and `tasks` spec §2 for behaviour. Tags are stable
@@ -28,8 +30,9 @@ pub enum StretchMode {
     TempoSync,
     /// User sets duration / ratio / percent directly; the three stay in sync.
     Manual,
-    /// Warp-marker mode. Marker data is stored and rendered now; per-segment
-    /// warp DSP is pending and playback falls back to Manual-style stretch.
+    /// Warp-marker mode. Marker data is stored on the clip and exposed to the
+    /// engine; playback currently uses the global stretch ratio until the
+    /// per-segment warp processor is enabled.
     Warp,
 }
 
@@ -134,8 +137,10 @@ impl StretchAlgorithm {
 
 /// A warp marker pinning a source sample position to a timeline beat.
 ///
-/// Stored and rendered now; per-segment warp playback is pending (see
-/// [`StretchMode::Warp`]).
+/// Marker positions are validated before they reach the engine. `timeline_beat`
+/// is an absolute project beat, while `source_sample` is in the source file's
+/// native sample-rate domain. The stored map is ready for the per-segment DSP
+/// path and does not alter playback while that path is unavailable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WarpMarker {
     pub id: u64,
@@ -943,6 +948,15 @@ pub struct AudioClipStretchState {
 
     /// Warp markers (spec §2 Warp). Stored and rendered; warp DSP pending.
     pub warp_markers: Vec<WarpMarker>,
+
+    /// Non-destructive clip gain envelope. The source file is never rewritten;
+    /// the editor and future render path evaluate these points relative to the
+    /// clip gain.
+    pub gain_envelope: ClipEnvelope,
+
+    /// Adaptive de-noise amount. `0` is bypass; higher values apply stronger
+    /// reduction to steady low-level noise during playback and bounce.
+    pub denoise_amount: f32,
 }
 
 impl Default for AudioClipStretchState {
@@ -975,6 +989,8 @@ impl Default for AudioClipStretchState {
             pan: 0.0,
             dirty: false,
             warp_markers: Vec::new(),
+            gain_envelope: ClipEnvelope::default(),
+            denoise_amount: 0.0,
         }
     }
 }
@@ -983,6 +999,76 @@ impl AudioClipStretchState {
     /// Clamp bounds for a sane, non-zero, finite stretch ratio.
     pub const MIN_RATIO: f64 = 0.05;
     pub const MAX_RATIO: f64 = 20.0;
+    /// Hard ceiling for project-file and runtime marker lists.
+    pub const MAX_WARP_MARKERS: usize = 2048;
+
+    /// Normalize persisted or bridged values before they are used by the
+    /// timeline or audio engine. This is deliberately idempotent so callers can
+    /// apply it at every state boundary without changing valid projects.
+    pub fn sanitize_in_place(&mut self) {
+        self.stretch_ratio = if self.stretch_ratio.is_finite() {
+            self.stretch_ratio.clamp(Self::MIN_RATIO, Self::MAX_RATIO)
+        } else {
+            1.0
+        };
+        self.bpm_source = self
+            .bpm_source
+            .filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+            .map(|bpm| bpm.clamp(1.0, 999.0));
+        self.bpm_target = self
+            .bpm_target
+            .filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+            .map(|bpm| bpm.clamp(1.0, 999.0));
+        self.pitch_shift_semitones = if self.pitch_shift_semitones.is_finite() {
+            self.pitch_shift_semitones.clamp(-48.0, 48.0)
+        } else {
+            0.0
+        };
+        self.transient_sensitivity = if self.transient_sensitivity.is_finite() {
+            self.transient_sensitivity.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.fade_in_ms = if self.fade_in_ms.is_finite() {
+            self.fade_in_ms.max(0.0)
+        } else {
+            0.0
+        };
+        self.fade_out_ms = if self.fade_out_ms.is_finite() {
+            self.fade_out_ms.max(0.0)
+        } else {
+            0.0
+        };
+        self.gain_db = if self.gain_db.is_finite() {
+            self.gain_db.clamp(-120.0, 24.0)
+        } else {
+            0.0
+        };
+        self.denoise_amount = if self.denoise_amount.is_finite() {
+            self.denoise_amount.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.pan = if self.pan.is_finite() {
+            self.pan.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.warp_markers
+            .retain(|marker| marker.timeline_beat.is_finite() && marker.timeline_beat >= 0.0);
+        self.warp_markers.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| a.timeline_beat.total_cmp(&b.timeline_beat))
+        });
+        self.warp_markers.dedup_by(|a, b| a.id == b.id);
+        self.warp_markers.sort_by(|a, b| {
+            a.timeline_beat
+                .total_cmp(&b.timeline_beat)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        self.warp_markers.truncate(Self::MAX_WARP_MARKERS);
+        self.gain_envelope.sanitize_in_place();
+    }
 
     // ── Pure math helpers (no clamping — exact for tests/spec §18) ──────────
 
@@ -1602,6 +1688,36 @@ mod tests {
         approx(s.stretch_ratio, AudioClipStretchState::MIN_RATIO);
         s.set_stretch_ratio(f64::NAN);
         approx(s.stretch_ratio, 1.0);
+    }
+
+    #[test]
+    fn sanitize_in_place_discards_invalid_marker_positions() {
+        let mut s = AudioClipStretchState {
+            stretch_ratio: f64::NAN,
+            pitch_shift_semitones: f32::NAN,
+            warp_markers: vec![
+                WarpMarker {
+                    id: 2,
+                    source_sample: 200,
+                    timeline_beat: 4.0,
+                    locked: false,
+                },
+                WarpMarker {
+                    id: 1,
+                    source_sample: 100,
+                    timeline_beat: f64::NAN,
+                    locked: false,
+                },
+            ],
+            ..AudioClipStretchState::default()
+        };
+
+        s.sanitize_in_place();
+
+        approx(s.stretch_ratio, 1.0);
+        assert_eq!(s.pitch_shift_semitones, 0.0);
+        assert_eq!(s.warp_markers.len(), 1);
+        assert_eq!(s.warp_markers[0].id, 2);
     }
 
     #[test]

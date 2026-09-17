@@ -22,6 +22,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::solfege::SolfegeTrackState;
+use sphere_midi_service::mpe::MpeTrackConfiguration;
+use sphere_midi_service::NoteExpression;
 pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
 
 // ── Identifiers ───────────────────────────────────────────────────────────────
@@ -148,6 +150,9 @@ pub struct MidiNote {
     /// notated pitch. Points are cent deviations keyed by beats from the note
     /// start, so they survive transposition and moves.
     pub pitch_curve: Vec<MidiPitchPoint>,
+    /// Protocol-neutral per-note expression.  MPE/MIDI 2.0 are transport
+    /// adapters; their channels are never part of this project data.
+    pub expression: NoteExpression,
     /// Musical accent (v39+). `None` when the note has never been analysed or
     /// drawn, which is how a pre-v39 project and a freshly drawn note both
     /// load — an absent accent and a neutral one are different states and the
@@ -370,6 +375,9 @@ pub struct TrackRouting {
     /// per-note MIDI channels; missing/old data defaults to `false`, matching
     /// the pre-existing single-channel-per-track behavior.
     pub midi_output_per_note: bool,
+    /// v46: per-track MPE output policy. Older projects default to Auto so
+    /// existing expression curves keep their backwards-compatible playback.
+    pub mpe: MpeTrackConfiguration,
     pub sends: Vec<ProjectSend>,
 }
 
@@ -383,6 +391,7 @@ impl Default for TrackRouting {
             midi_input: ProjectTrackMidiInputRouting::None,
             midi_channel: None,
             midi_output_per_note: false,
+            mpe: MpeTrackConfiguration::default(),
             sends: Vec::new(),
         }
     }
@@ -1186,6 +1195,7 @@ impl From<&TimelineState> for FutureboardProject {
                                                     .collect()
                                             })
                                             .unwrap_or_default(),
+                                        expression: n.expression.clone(),
                                         accent: n.accent.map(|accent| MidiAccent {
                                             prominence: accent.prominence,
                                             attack: accent.attack,
@@ -1309,6 +1319,7 @@ impl From<&TimelineState> for FutureboardProject {
                         midi_input: timeline_midi_input_to_project(&t.routing.midi_input),
                         midi_channel: t.routing.midi_channel.map(|ch| ch.clamp(1, 16)),
                         midi_output_per_note: t.routing.midi_output_per_note,
+                        mpe: t.routing.mpe.sanitized(),
                         sends: t
                             .sends
                             .iter()
@@ -1841,6 +1852,7 @@ pub fn apply_to_timeline(
                                                 .collect(),
                                         )
                                     });
+                                    note.expression = n.expression.clone();
                                     note.accent = n.accent.map(|accent| {
                                         TlAccentState {
                                             prominence: accent.prominence,
@@ -2573,6 +2585,7 @@ fn project_routing_to_timeline(
     };
     state.midi_channel = routing.midi_channel.map(|ch| ch.clamp(1, 16));
     state.midi_output_per_note = routing.midi_output_per_note;
+    state.mpe = routing.mpe.sanitized();
     state
 }
 
@@ -2951,10 +2964,10 @@ mod v33_routing_adapter_tests {
 
     #[test]
     fn the_encoder_writes_the_current_format_version() {
-        let bytes = crate::project::format::encode_project(&FutureboardProject::new("v44"));
+        let bytes = crate::project::format::encode_project(&FutureboardProject::new("v46"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        assert_eq!(version, 44);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 44);
+        assert_eq!(version, 46);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 46);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
@@ -3497,6 +3510,7 @@ mod project_settings_persistence_tests {
     use crate::components::timeline::timeline_state::{
         CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
     };
+    use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 
     #[test]
     fn project_sample_rate_survives_save_decode_and_timeline_restore() {
@@ -3527,6 +3541,29 @@ mod project_settings_persistence_tests {
 
         assert_eq!(restored.time_display_format, TimeDisplayFormat::Timecode);
         assert_eq!(restored.timecode_rate, TimecodeRate::Fps25);
+    }
+
+    #[test]
+    fn mpe_track_configuration_survives_save_decode_and_timeline_restore() {
+        let mut timeline = TimelineState::default();
+        let track_id = timeline.create_midi_track();
+        let expected = MpeTrackConfiguration {
+            mode: MpeOutputMode::Upper,
+            member_channels: 4,
+            member_pitch_range: 12.0,
+            manager_pitch_range: 24.0,
+        };
+        assert!(timeline.set_track_mpe_configuration(&track_id, expected));
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        assert_eq!(decoded.tracks[0].routing.mpe, expected);
+
+        let restored = project_routing_to_timeline(
+            &decoded.tracks[0].routing,
+            crate::components::timeline::timeline_state::TrackType::Midi,
+        );
+        assert_eq!(restored.mpe, expected);
     }
 
     #[test]

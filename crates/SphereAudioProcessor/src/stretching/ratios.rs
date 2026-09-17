@@ -1,11 +1,20 @@
-use super::params::{StretchMode, StretchParams};
+use super::params::{
+    MAX_PITCH_RATIO, MAX_TIME_RATIO, MIN_PITCH_RATIO, MIN_TIME_RATIO, StretchMode, StretchParams,
+};
 
-const MIN_RATIO: f32 = 0.01;
-const MAX_RATIO: f32 = 100.0;
+const MIN_READ_RATE: f32 = MIN_PITCH_RATIO;
+const MAX_READ_RATE: f32 = MAX_PITCH_RATIO;
 
 /// Pitch multiplier from semitones and fine cents: `2^((semi + cents/100) / 12)`.
 pub fn semitone_to_pitch_ratio(semitones: f32, cents: f32) -> f32 {
-    2.0_f32.powf((semitones + cents / 100.0) / 12.0)
+    let semitones = if semitones.is_finite() {
+        semitones
+    } else {
+        0.0
+    };
+    let cents = if cents.is_finite() { cents } else { 0.0 };
+    let total = (semitones + cents / 100.0).clamp(-48.0, 48.0);
+    2.0_f32.powf(total / 12.0)
 }
 
 /// Split a pitch multiplier into whole semitones and residual cents.
@@ -23,7 +32,7 @@ pub fn effective_time_ratio(params: &StretchParams, project_bpm: Option<f32>) ->
 
     match params.mode {
         StretchMode::Off => 1.0,
-        StretchMode::Manual | StretchMode::Warp => sanitize_ratio(params.time_ratio),
+        StretchMode::Manual | StretchMode::Warp => sanitize_time_ratio(params.time_ratio),
         StretchMode::TempoSync => {
             let Some(source_bpm) = params.source_bpm.filter(|v| valid_positive(*v)) else {
                 return 1.0;
@@ -33,18 +42,21 @@ pub fn effective_time_ratio(params: &StretchParams, project_bpm: Option<f32>) ->
                 .or(project_bpm)
                 .filter(|v| valid_positive(*v))
                 .unwrap_or(source_bpm);
-            sanitize_ratio(source_bpm / target_bpm)
+            sanitize_time_ratio(source_bpm / target_bpm)
         }
     }
 }
 
 pub fn effective_pitch_ratio(params: &StretchParams) -> f32 {
-    sanitize_ratio(params.pitch_ratio)
+    sanitize_pitch_ratio(params.pitch_ratio)
 }
 
 pub fn source_read_rate_for_repitch(params: &StretchParams, project_bpm: Option<f32>) -> f32 {
+    if params.mode == StretchMode::Off {
+        return 1.0;
+    }
     let time_ratio = effective_time_ratio(params, project_bpm);
-    sanitize_ratio(effective_pitch_ratio(params) / time_ratio)
+    sanitize_read_rate(effective_pitch_ratio(params) / time_ratio)
 }
 
 pub fn stretched_duration_samples(
@@ -64,9 +76,25 @@ fn valid_positive(value: f32) -> bool {
     value.is_finite() && value > 0.0
 }
 
-fn sanitize_ratio(value: f32) -> f32 {
+fn sanitize_time_ratio(value: f32) -> f32 {
     if valid_positive(value) {
-        value.clamp(MIN_RATIO, MAX_RATIO)
+        value.clamp(MIN_TIME_RATIO, MAX_TIME_RATIO)
+    } else {
+        1.0
+    }
+}
+
+fn sanitize_pitch_ratio(value: f32) -> f32 {
+    if valid_positive(value) {
+        value.clamp(MIN_PITCH_RATIO, MAX_PITCH_RATIO)
+    } else {
+        1.0
+    }
+}
+
+fn sanitize_read_rate(value: f32) -> f32 {
+    if valid_positive(value) {
+        value.clamp(MIN_READ_RATE, MAX_READ_RATE)
     } else {
         1.0
     }

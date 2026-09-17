@@ -509,17 +509,30 @@ fn bridge_hosted_insert_slots(state: &TimelineState) -> Vec<(String, String)> {
 }
 
 fn default_output_channels(engine: &DirectAudio::AudioEngine, wanted_device: &str) -> u32 {
-    let wanted = wanted_device.trim();
-    let devices = engine.list_output_devices();
-    if !wanted.is_empty() {
-        if let Some(device) = devices.iter().find(|d| d.name == wanted || d.id == wanted) {
-            return device.channels;
-        }
+    // CoreAudio's device capability query can block in the HAL on macOS when
+    // a remote session or another DAW owns the audio session. A new workspace
+    // can safely use the conventional stereo master layout and let an
+    // explicit Settings refresh discover the actual endpoint later.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (engine, wanted_device);
+        return 2;
     }
-    devices
-        .iter()
-        .find(|d| d.is_default)
-        .or_else(|| devices.first())
-        .map(|d| d.channels)
-        .unwrap_or(2)
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let wanted = wanted_device.trim();
+        let devices = engine.list_output_devices();
+        if !wanted.is_empty() {
+            if let Some(device) = devices.iter().find(|d| d.name == wanted || d.id == wanted) {
+                return device.channels;
+            }
+        }
+        devices
+            .iter()
+            .find(|d| d.is_default)
+            .or_else(|| devices.first())
+            .map(|d| d.channels)
+            .unwrap_or(2)
+    }
 }

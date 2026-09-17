@@ -39,6 +39,10 @@ pub struct BottomPanelShell {
     /// `notify_bottom_panel_shell` calls stay: this is the backstop for the
     /// paths that only notify the studio.
     _owner_observer: gpui::Subscription,
+    /// The Editor surface has its own ARA/Audio Editor sub-tabs. Observe it so
+    /// the shell can update the ARA pop-out affordance when that sub-tab
+    /// changes, even though the shell itself is not the tab state owner.
+    _clip_editor_observer: gpui::Subscription,
 }
 
 impl BottomPanelShell {
@@ -50,6 +54,7 @@ impl BottomPanelShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let _owner_observer = cx.observe(&owner, |_, _, cx| cx.notify());
+        let _clip_editor_observer = cx.observe(&clip_editor, |_, _, cx| cx.notify());
         Self {
             owner,
             mixer_panel,
@@ -57,6 +62,7 @@ impl BottomPanelShell {
             effect_editor,
             last_shell_key: u64::MAX,
             _owner_observer,
+            _clip_editor_observer,
         }
     }
 
@@ -116,7 +122,9 @@ impl Render for BottomPanelShell {
         // ARA is the only editor whose body is a native plug-in window, so it is
         // the only one that can be moved out of the dock into a window of its own.
         let ara_popped_out = owner.ara_editor_is_popped_out();
+        let ara_tab_active = self.clip_editor.read(cx).ara_tab_active();
         let show_ara_pop = matches!(active_tab, BottomTab::Editor)
+            && ara_tab_active
             && (ara_popped_out || owner.ara_editor_panel_active(cx));
         let pop_owner = owner_entity.clone();
         let on_toggle_ara_pop: Arc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static> =

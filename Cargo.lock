@@ -7871,6 +7871,7 @@ name = "sphere-audio-editor"
 version = "2026.9.10-beta1.3"
 dependencies = [
  "gpui",
+ "rustfft",
 ]
 
 [[package]]
@@ -7982,6 +7983,7 @@ dependencies = [
 name = "sphere_directaudioengine"
 version = "2026.9.10-beta1.3"
 dependencies = [
+ "SphereMidiService",
  "SphereSoundfontPlayer",
  "cc",
  "cpal",

@@ -34,14 +34,19 @@ pub fn build_waveform_view_model(
     let (label, is_error, show_progress) = import_status_label(&clip.audio_import);
 
     let ClipType::Audio {
-        source_path: Some(path),
+        source_path: Some(source_path),
         ..
     } = &clip.clip_type
     else {
         return WaveformViewModel::loading("No source file");
     };
+    // The source path is mutable (project copy/relink), while file_id is the
+    // stable asset identity used by the import worker and disk cache.
+    let Some(asset_key) = clip.audio_asset_key() else {
+        return WaveformViewModel::loading("No source asset");
+    };
 
-    waveform_cache::with_file_entry(path, |entry| {
+    waveform_cache::with_file_entry(asset_key, |entry| {
         let Some(entry) = entry else {
             return WaveformViewModel {
                 columns: Vec::new(),
@@ -55,6 +60,8 @@ pub fn build_waveform_view_model(
         match waveform_cache::display_status_from_entry(entry) {
             WaveformDisplayStatus::Ready { meta } | WaveformDisplayStatus::Partial { meta, .. } => {
                 let columns = build_peak_columns(
+                    asset_key,
+                    source_path,
                     entry,
                     meta.as_ref(),
                     clip,
@@ -85,6 +92,8 @@ pub fn build_waveform_view_model(
 }
 
 fn build_peak_columns(
+    asset_key: &str,
+    source_path: &str,
     entry: &waveform_cache::FileEntry,
     meta: &waveform_cache::WaveformFileMeta,
     clip: &ClipState,
@@ -121,8 +130,27 @@ fn build_peak_columns(
     .max(1) as f64;
 
     let pixels_per_second = pixels_per_beat / seconds_per_beat.max(1e-6);
-    let desired_spp =
-        waveform_cache::pick_best_samples_per_peak(pixels_per_second, meta.sample_rate);
+    let desired_spp = match crate::components::timeline::waveform_detail::detail_level_for_zoom(
+        pixels_per_second * effective_time_ratio.max(1.0e-6) as f32,
+        meta.sample_rate,
+    ) {
+        Some(detail_spp) => {
+            // The Audio Editor is a second consumer of the same bounded,
+            // on-demand detail cache as the arrangement. Without this request
+            // path the editor stayed on the 256-frame LOD even when the user
+            // zoomed in, which made transients look like soft stair-steps.
+            crate::components::timeline::waveform_detail::note_needed(
+                asset_key,
+                source_path,
+                detail_spp,
+                source_start,
+                source_end,
+                meta.total_frames,
+            );
+            detail_spp
+        }
+        None => waveform_cache::pick_best_samples_per_peak(pixels_per_second, meta.sample_rate),
+    };
     let spp = waveform_cache::best_available_samples_per_peak_in_entry(entry, desired_spp);
 
     (0..num_cols)

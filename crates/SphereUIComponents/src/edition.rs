@@ -128,6 +128,19 @@ pub fn current_edition_info() -> Option<EditionInfo> {
     Some(provider())
 }
 
+/// Whether the running process is the Professional Edition surface.
+///
+/// The public Community build deliberately has no provider, while the private
+/// `crates/ExclusiveEdition` startup path installs one before the first UI is
+/// shown. This is a build/edition capability, not a license entitlement: an
+/// unlicensed Professional process still owns the Professional feature
+/// surface, and the licensing UI can explain what activation is required.
+/// Shared data handling must not use this gate — Community still loads,
+/// visualizes, plays back, and saves Note Expression data.
+pub fn professional_features_available() -> bool {
+    current_edition_info().is_some()
+}
+
 fn app_version_slot() -> &'static RwLock<Option<String>> {
     static SLOT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
     SLOT.get_or_init(|| RwLock::new(None))
@@ -215,6 +228,7 @@ mod tests {
         // nothing rather than fabricate an edition or offer a dead action.
         assert!(current_edition_info().is_none());
         assert!(!license_action_available());
+        assert!(!professional_features_available());
 
         set_license_action_handler(Arc::new(|_window, _cx| {}));
         assert!(license_action_available());
@@ -231,6 +245,7 @@ mod tests {
             audio_engine: None,
         }));
         let info = current_edition_info().expect("provider was installed");
+        assert!(professional_features_available());
         assert_eq!(info.edition, "Test");
         assert_eq!(info.app_version, "9.9.9");
         assert!(matches!(

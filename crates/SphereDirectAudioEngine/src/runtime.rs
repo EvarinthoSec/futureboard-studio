@@ -17,6 +17,7 @@ use solfege_engine::sfm::SfmMode;
 use solfege_engine::{EngineConfig as SolfegeEngineConfig, SamplerEngine, SharedMetrics};
 use solfege_event::Event as SolfegeEvent;
 use solfege_model::SfmFile;
+use sphere_midi_service::mpe::{MpeChannelAllocator, MpeZone};
 
 use crate::audio_graph::{plan_runtime_audio_graph, GraphValidationError, RuntimeAudioGraph};
 use crate::audio_source::{open_clip_audio_source, ClipAudioSource};
@@ -31,8 +32,8 @@ use sphere_soundfont_player::{
 };
 use SphereAudioProcessor::{
     create_stretch_processor, effective_pitch_ratio, effective_time_ratio, resolve_backend,
-    source_read_rate_for_repitch, stretched_duration_samples, StretchAlgorithm, StretchBackend,
-    StretchMode, StretchParams, StretchProcessor,
+    source_read_rate_for_repitch, stretched_duration_samples, DenoiseProcessor, StretchAlgorithm,
+    StretchBackend, StretchMode, StretchParams, StretchProcessor,
 };
 
 use crate::tempo_map::{RuntimeTempoMapSnapshot, TempoMap, TempoPoint};
@@ -1631,6 +1632,9 @@ pub struct RuntimeClip {
     /// `audio_process.reverse`). The render maps output → source from the clip
     /// end instead of the start; `speed_ratio` is unchanged.
     pub reverse: bool,
+    /// Per-clip adaptive de-noise state. It is prepared with the runtime graph
+    /// and only mutated by the render thread, so the callback never allocates.
+    pub denoise: DenoiseProcessor,
     /// Clip-level mute — a muted clip is skipped entirely during render.
     pub muted: bool,
     /// An ARA plug-in owns this clip's playback.
@@ -1715,6 +1719,7 @@ impl Clone for RuntimeClip {
             warp_markers: self.warp_markers.clone(),
             processor: self.processor,
             reverse: self.reverse,
+            denoise: DenoiseProcessor::new(self.denoise.sample_rate(), self.denoise.amount()),
             muted: self.muted,
             ara_rendered: self.ara_rendered,
             fade_in_samples: self.fade_in_samples,
@@ -1727,8 +1732,8 @@ impl Clone for RuntimeClip {
                 self.source.sample_rate(),
                 &self.stretch,
             ),
-            stretch_input_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
-            stretch_input_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
+            stretch_input_l: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
+            stretch_input_r: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
             stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_prime_l: vec![0.0; self.stretch_prime_l.len()],
@@ -1736,6 +1741,23 @@ impl Clone for RuntimeClip {
             stretch_next_project_sample: None,
         }
     }
+}
+
+/// Capacity required for the largest source span a stretcher can consume for
+/// one engine block. The reciprocal is intentionally bounded by the same
+/// policy as SphereAudioProcessor, so an invalid project value cannot trigger
+/// an unbounded allocation here.
+fn stretch_input_capacity(time_ratio: f32) -> usize {
+    let ratio = if time_ratio.is_finite() && time_ratio > 0.0 {
+        time_ratio.clamp(0.05, 20.0) as f64
+    } else {
+        1.0
+    };
+    let source_frames = (DEFAULT_AUDIO_BLOCK_CAPACITY as f64 / ratio).ceil();
+    source_frames
+        .min((DEFAULT_AUDIO_BLOCK_CAPACITY * 20) as f64)
+        .max(1.0) as usize
+        + 2
 }
 
 pub type AudioClip = EngineClipSnapshot;
@@ -1800,6 +1822,28 @@ pub struct RuntimeMidiClip {
     pub start_beat: f64,
     pub end_beat: f64,
     pub events: Vec<RuntimeMidiEvent>,
+}
+
+/// Build-time MPE transport state shared by every MIDI clip that resolves to
+/// the same output track. MPE member channels are a track-wide resource: a
+/// fresh allocator per clip lets overlapping clips reuse the same channel and
+/// cross-wire their note expression.
+struct MpeBuildState {
+    allocator: MpeChannelAllocator,
+    active: Vec<(u64, f64)>,
+    member_channel_start: u8,
+    member_channel_end: u8,
+}
+
+impl MpeBuildState {
+    fn new(zone: MpeZone) -> Self {
+        Self {
+            allocator: MpeChannelAllocator::new(zone.member_channel_start, zone.member_channel_end),
+            active: Vec::new(),
+            member_channel_start: zone.member_channel_start,
+            member_channel_end: zone.member_channel_end,
+        }
+    }
 }
 
 /// Per-track merged + sorted event list with a playback cursor and active-note
@@ -2665,11 +2709,19 @@ impl RuntimeProject {
                             "[SphereAudio] native VST3 insert track='{}' insert='{}' pluginInstanceId='{}' reused={} ready={} processorHandle=0x{:x} path='{}'",
                             t.id,
                             insert.id,
-                            insert.params.get("pluginInstanceId").and_then(Value::as_str).unwrap_or(&insert.id),
+                            insert
+                                .params
+                                .get("pluginInstanceId")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&insert.id),
                             reused_flag,
                             processor.as_ref().map(|p| p.is_ready()).unwrap_or(false),
                             processor_handle,
-                            insert.params.get("path").and_then(Value::as_str).unwrap_or(""),
+                            insert
+                                .params
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
                         );
                     }
                     processor
@@ -3351,7 +3403,7 @@ impl RuntimeProject {
                                 Vst3MidiEvent::note_on(offset, ev.channel, ev.pitch, vel)
                             }
                             RuntimeMidiEventKind::NoteOff => {
-                                Vst3MidiEvent::note_off(offset, ev.channel, ev.pitch, 0.0)
+                                Vst3MidiEvent::note_off(offset, ev.channel, ev.pitch, vel)
                             }
                             RuntimeMidiEventKind::ControlChange => Vst3MidiEvent::control_change(
                                 offset,
@@ -3377,15 +3429,11 @@ impl RuntimeProject {
                                 match ev.kind {
                                     RuntimeMidiEventKind::NoteOn => eprintln!(
                                         "[midi-schedule] sample_rate={} event_ppq={:.6} event_sample={abs} offset={offset} note_on pitch={} instance={instance_id}",
-                                        self.sample_rate,
-                                        ev.beat,
-                                        ev.pitch
+                                        self.sample_rate, ev.beat, ev.pitch
                                     ),
                                     RuntimeMidiEventKind::NoteOff => eprintln!(
                                         "[midi-schedule] sample_rate={} event_ppq={:.6} event_sample={abs} offset={offset} note_off pitch={} instance={instance_id}",
-                                        self.sample_rate,
-                                        ev.beat,
-                                        ev.pitch
+                                        self.sample_rate, ev.beat, ev.pitch
                                     ),
                                     _ => {}
                                 }
@@ -4225,7 +4273,8 @@ pub fn push_vst3_midi_event_to_sink(
             }
         }
         0 => {
-            sink.push_midi(0x80 | channel, ev.pitch, 0, ev.sample_offset);
+            let vel = (ev.velocity.clamp(0.0, 1.0) * 127.0).round() as u8;
+            sink.push_midi(0x80 | channel, ev.pitch, vel, ev.sample_offset);
             if verbose {
                 eprintln!("[plugin-dsp-midi-write] seq={seq} instance={instance_id} events=1");
                 eprintln!(
@@ -4236,11 +4285,32 @@ pub fn push_vst3_midi_event_to_sink(
         }
         2 => {
             let val = (ev.velocity.clamp(0.0, 1.0) * 127.0).round() as u8;
-            sink.push_midi(0xB0 | channel, ev.pitch, val, ev.sample_offset);
+            // The shared event ABI uses VST3 controller numbers 128/129 for
+            // channel pressure/pitch bend, but a bridge sink carries raw MIDI
+            // bytes. Do not emit an impossible CC number (128/129): translate
+            // these two out-of-band values back to their MIDI status bytes.
+            if ev.pitch == 128 {
+                sink.push_midi(0xD0 | channel, val, 0, ev.sample_offset);
+            } else if ev.pitch == 129 {
+                let bend = (ev.velocity.clamp(0.0, 1.0) * 16_383.0).round() as u16;
+                sink.push_midi(
+                    0xE0 | channel,
+                    (bend & 0x7F) as u8,
+                    (bend >> 7) as u8,
+                    ev.sample_offset,
+                );
+            } else {
+                sink.push_midi(0xB0 | channel, ev.pitch.min(127), val, ev.sample_offset);
+            }
             if verbose {
+                let kind = match ev.pitch {
+                    128 => "channel_pressure",
+                    129 => "pitch_bend",
+                    _ => "cc",
+                };
                 eprintln!(
-                    "[plugin-dsp-midi-write] seq={seq} instance={instance_id} events=1 cc={} val={val}",
-                    ev.pitch
+                    "[plugin-dsp-midi-write] seq={seq} instance={instance_id} events=1 {kind}={} val={val}",
+                    ev.pitch,
                 );
             }
         }
@@ -4447,12 +4517,119 @@ pub fn build_project_tempo_map(snapshot: &EngineProjectSnapshot) -> RuntimeTempo
     build_tempo_map_from_points(snapshot.bpm, &snapshot.tempo_points)
 }
 
+/// Emit the MIDI 1.0 RPN setup that corresponds to the track's selected MPE
+/// zone. The values are stored as normalized VST3 controller values in the
+/// runtime event, then converted by the bridge at dispatch time. Sending this
+/// at the clip boundary makes the selected pitch ranges effective for both
+/// realtime playback and offline rendering.
+fn push_mpe_configuration_events(
+    events: &mut Vec<RuntimeMidiEvent>,
+    zone: MpeZone,
+    beat: f64,
+    sample: u64,
+) {
+    fn push_cc(
+        events: &mut Vec<RuntimeMidiEvent>,
+        channel: u8,
+        controller: u16,
+        value: f32,
+        beat: f64,
+        sample: u64,
+    ) {
+        events.push(RuntimeMidiEvent {
+            sample,
+            beat,
+            kind: RuntimeMidiEventKind::ControlChange,
+            pitch: 0,
+            velocity: 0,
+            channel,
+            note_id: 0,
+            cc_number: controller,
+            cc_value: value.clamp(0.0, 1.0),
+            pitch_hz: 0.0,
+        });
+    }
+
+    fn push_rpn_range(
+        events: &mut Vec<RuntimeMidiEvent>,
+        channel: u8,
+        range: f32,
+        beat: f64,
+        sample: u64,
+    ) {
+        let range = if range.is_finite() {
+            range.clamp(0.01, 127.99)
+        } else {
+            2.0
+        };
+        let msb = range.floor().clamp(0.0, 127.0) as u8;
+        let lsb = ((range.fract() * 100.0).round() as u8).min(99);
+        push_cc(events, channel, 101, 0.0, beat, sample);
+        push_cc(events, channel, 100, 0.0, beat, sample);
+        push_cc(events, channel, 6, f32::from(msb) / 127.0, beat, sample);
+        push_cc(events, channel, 38, f32::from(lsb) / 127.0, beat, sample);
+    }
+
+    push_rpn_range(
+        events,
+        zone.manager_channel,
+        zone.manager_pitch_range,
+        beat,
+        sample,
+    );
+    for channel in zone.member_channels() {
+        push_rpn_range(events, channel, zone.member_pitch_range, beat, sample);
+    }
+    // RPN 0,6 on the manager channel selects the zone's member count. The
+    // manager channel itself identifies the zone (channel 1 = Lower, channel
+    // 16 = Upper); the RPN LSB is always 6. Sending 0/1 here would select
+    // unrelated RPNs and causes hardware/plugins to ignore the member count.
+    push_cc(events, zone.manager_channel, 101, 0.0, beat, sample);
+    push_cc(events, zone.manager_channel, 100, 6.0 / 127.0, beat, sample);
+    push_cc(
+        events,
+        zone.manager_channel,
+        6,
+        zone.member_channels().len().min(15) as f32 / 127.0,
+        beat,
+        sample,
+    );
+}
+
 fn sort_midi_events(events: &mut [RuntimeMidiEvent]) {
     events.sort_by(|a, b| {
         a.sample
             .cmp(&b.sample)
-            .then((a.kind as u8).cmp(&(b.kind as u8)))
+            .then(midi_event_priority(a.kind).cmp(&midi_event_priority(b.kind)))
     });
+}
+
+/// Ordering at one sample is part of the transport contract. Expression reset
+/// messages must precede a replacement NoteOn, while an old NoteOff must land
+/// before both. This also keeps articulation selection ahead of its note.
+fn midi_event_priority(kind: RuntimeMidiEventKind) -> u8 {
+    match kind {
+        RuntimeMidiEventKind::NoteOff => 0,
+        RuntimeMidiEventKind::ControlChange => 1,
+        RuntimeMidiEventKind::Articulation => 2,
+        RuntimeMidiEventKind::NoteOn => 3,
+        RuntimeMidiEventKind::Pitch => 4,
+    }
+}
+
+fn mpe_voice_release_beat(note_end: f64, clip_end: f64, sustain_changes: &[(f64, bool)]) -> f64 {
+    let sustain_down = sustain_changes
+        .iter()
+        .filter(|(beat, _)| *beat <= note_end)
+        .last()
+        .is_some_and(|(_, down)| *down);
+    if !sustain_down {
+        return note_end;
+    }
+    sustain_changes
+        .iter()
+        .find(|(beat, down)| *beat > note_end && !*down)
+        .map_or(clip_end, |(beat, _)| *beat)
 }
 
 /// Apply a note event to the active-note set (NoteOn inserts, NoteOff removes).
@@ -4489,20 +4666,226 @@ fn build_midi_runtime(
     let sr = sample_rate.max(1) as f64;
     let mut clips: Vec<RuntimeMidiClip> = Vec::with_capacity(snapshot_clips.len());
     let mut by_track: HashMap<String, Vec<RuntimeMidiEvent>> = HashMap::new();
+    let mut mpe_states: HashMap<String, MpeBuildState> = HashMap::new();
+    let mut configured_mpe_zones: HashMap<String, MpeZone> = HashMap::new();
+    let mut mpe_track_end_beats: HashMap<String, f64> = HashMap::new();
+    let mut sustain_changes_by_track: HashMap<String, Vec<(f64, bool)>> = HashMap::new();
+    let mut stolen_note_cutoffs: HashMap<u64, u64> = HashMap::new();
+    let mut next_runtime_note_id = 1_u64;
 
+    // Sustain is a track-wide controller state. Build one absolute timeline
+    // before allocating voices so a pedal change in a neighboring/overlapping
+    // clip cannot make an MPE member channel look reusable too early.
     for clip in snapshot_clips {
-        let mut events: Vec<RuntimeMidiEvent> = Vec::with_capacity(clip.notes.len() * 2);
-        for note in &clip.notes {
-            if note.length_beats <= 0.0 {
-                continue; // skip zero/negative-length notes
+        let clip_end = clip.start_beat + clip.length_beats.max(0.0);
+        mpe_track_end_beats
+            .entry(clip.track_id.clone())
+            .and_modify(|end| *end = end.max(clip_end))
+            .or_insert(clip_end);
+        let changes = sustain_changes_by_track
+            .entry(clip.track_id.clone())
+            .or_default();
+        for lane in clip.controllers.iter().filter(|lane| lane.controller == 64) {
+            changes.extend(
+                lane.points
+                    .iter()
+                    .map(|point| (clip.start_beat + point.beat.max(0.0), point.value >= 0.5)),
+            );
+        }
+    }
+    for changes in sustain_changes_by_track.values_mut() {
+        changes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+
+    // Allocation is a track-wide transport concern. Process clips in musical
+    // order so a note in an earlier overlapping clip occupies a member
+    // channel before a later clip asks for one, independent of file order.
+    let mut clip_order: Vec<usize> = (0..snapshot_clips.len()).collect();
+    clip_order.sort_by(|a, b| {
+        snapshot_clips[*a]
+            .track_id
+            .cmp(&snapshot_clips[*b].track_id)
+            .then_with(|| {
+                snapshot_clips[*a]
+                    .start_beat
+                    .total_cmp(&snapshot_clips[*b].start_beat)
+            })
+            .then_with(|| snapshot_clips[*a].id.cmp(&snapshot_clips[*b].id))
+    });
+
+    for clip_index in clip_order {
+        let clip = &snapshot_clips[clip_index];
+        let has_expression = clip
+            .notes
+            .iter()
+            .any(|note| !note.expression.sanitized().is_empty());
+        let mpe_enabled = clip.mpe.should_use_mpe(has_expression);
+        let mut events: Vec<RuntimeMidiEvent> =
+            Vec::with_capacity(clip.notes.len() * if mpe_enabled { 5 } else { 2 });
+        let clip_end_beat = clip.start_beat + clip.length_beats.max(0.0);
+        let sustain_changes = sustain_changes_by_track
+            .get(&clip.track_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let release_horizon = mpe_track_end_beats
+            .get(&clip.track_id)
+            .copied()
+            .unwrap_or(clip_end_beat);
+        let mut note_indices: Vec<usize> = clip
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| note.length_beats > 0.0)
+            .map(|(index, _)| index)
+            .collect();
+        // Allocation is a transport concern, so assign member channels in
+        // musical order rather than depending on the serialized note order.
+        note_indices.sort_by(|a, b| {
+            clip.notes[*a]
+                .start_beat
+                .total_cmp(&clip.notes[*b].start_beat)
+                .then_with(|| clip.notes[*a].id.cmp(&clip.notes[*b].id))
+        });
+        if mpe_enabled {
+            if let Some(zone) = clip.mpe.zone() {
+                let state = mpe_states
+                    .entry(clip.track_id.clone())
+                    .or_insert_with(|| MpeBuildState::new(zone));
+                // Track-level settings normally make every clip agree. If a
+                // hand-authored snapshot violates that invariant, reset the
+                // allocator at the new zone boundary rather than assigning a
+                // channel outside the selected zone.
+                if state.member_channel_start != zone.member_channel_start
+                    || state.member_channel_end != zone.member_channel_end
+                {
+                    *state = MpeBuildState::new(zone);
+                }
+                // Configuration is track-wide. Repeating the RPN burst at
+                // every clip boundary can retune a live device mid-note and
+                // creates needless controller traffic; resend only when the
+                // effective zone actually changes.
+                if configured_mpe_zones
+                    .get(&clip.track_id)
+                    .is_none_or(|configured| *configured != zone)
+                {
+                    push_mpe_configuration_events(
+                        &mut events,
+                        zone,
+                        clip.start_beat,
+                        tempo_map.samples_at_beat(clip.start_beat, sr),
+                    );
+                    configured_mpe_zones.insert(clip.track_id.clone(), zone);
+                }
             }
+        }
+        let mut deferred_mpe_note_offs = Vec::new();
+        for note_index in note_indices {
+            let note = &clip.notes[note_index];
+            let expression = note.expression.sanitized();
+            let runtime_note_id = next_runtime_note_id;
+            next_runtime_note_id = next_runtime_note_id.wrapping_add(1).max(1);
             let pitch = note.pitch.min(127);
             let velocity = note.velocity.clamp(1, 127);
-            let channel = note.channel.min(15);
             let abs_start = clip.start_beat + note.start_beat.max(0.0);
             let abs_end = abs_start + note.length_beats;
             let on_sample = tempo_map.samples_at_beat(abs_start, sr);
             let off_sample = tempo_map.samples_at_beat(abs_end, sr);
+            let release_velocity = expression
+                .release_velocity
+                .map(|value| (value.clamp(0.0, 1.0) * 127.0).round() as u8)
+                .unwrap_or(0);
+            let channel = if mpe_enabled {
+                let state = mpe_states
+                    .get_mut(&clip.track_id)
+                    .expect("MPE build state is initialized before note scheduling");
+                // Ended voices are reusable before allocation. This is done
+                // at graph-build time, never in the audio callback.
+                for (note_id, end) in &state.active {
+                    if *end <= abs_start {
+                        state.allocator.release(*note_id);
+                    }
+                }
+                state.active.retain(|(_, end)| *end > abs_start);
+                let allocation = state
+                    .allocator
+                    .allocate(runtime_note_id, pitch, velocity)
+                    .expect("MPE allocator has at least one member channel");
+                if let Some(stolen_note) = allocation.stolen_note {
+                    stolen_note_cutoffs.insert(stolen_note, on_sample);
+                    state.active.retain(|(note_id, _)| *note_id != stolen_note);
+                    let stolen_pitch = allocation.stolen_pitch.unwrap_or(pitch);
+                    events.push(RuntimeMidiEvent {
+                        sample: on_sample,
+                        beat: abs_start,
+                        kind: RuntimeMidiEventKind::NoteOff,
+                        pitch: stolen_pitch,
+                        velocity: 0,
+                        channel: allocation.channel,
+                        note_id: stolen_note,
+                        cc_number: 0,
+                        cc_value: 0.0,
+                        pitch_hz: 0.0,
+                    });
+                }
+                if allocation.reset_required {
+                    // Reset all channel-wide MPE state before the replacement
+                    // NoteOn so the previous voice cannot leak its gesture.
+                    for (cc_number, cc_value) in [(129_u16, 0.5_f32), (128, 0.0), (74, 0.0)] {
+                        events.push(RuntimeMidiEvent {
+                            sample: on_sample,
+                            beat: abs_start,
+                            kind: RuntimeMidiEventKind::ControlChange,
+                            pitch: 0,
+                            velocity: 0,
+                            channel: allocation.channel,
+                            note_id: runtime_note_id,
+                            cc_number,
+                            cc_value,
+                            pitch_hz: 0.0,
+                        });
+                    }
+                }
+                for (cc_number, curve) in [
+                    (129_u16, &expression.pitch),
+                    (128_u16, &expression.pressure),
+                    (74_u16, &expression.timbre),
+                ] {
+                    for point in &curve.points {
+                        if !point.position.is_finite()
+                            || point.position < 0.0
+                            || point.position >= note.length_beats as f32
+                        {
+                            continue;
+                        }
+                        let beat = abs_start + point.position as f64;
+                        events.push(RuntimeMidiEvent {
+                            sample: tempo_map.samples_at_beat(beat, sr),
+                            beat,
+                            kind: RuntimeMidiEventKind::ControlChange,
+                            pitch: 0,
+                            velocity: 0,
+                            channel: allocation.channel,
+                            note_id: runtime_note_id,
+                            cc_number,
+                            cc_value: if cc_number == 129 {
+                                (point.value.clamp(-1.0, 1.0) + 1.0) * 0.5
+                            } else {
+                                point.value.clamp(0.0, 1.0)
+                            },
+                            pitch_hz: 0.0,
+                        });
+                    }
+                }
+                // A key release during sustain does not free the member
+                // channel. Keep it reserved until the next pedal-up event so
+                // a later note cannot inherit its pitch/pressure/timbre state.
+                let voice_release =
+                    mpe_voice_release_beat(abs_end, release_horizon, sustain_changes);
+                state.active.push((runtime_note_id, voice_release));
+                allocation.channel
+            } else {
+                note.channel.min(15)
+            };
             if let Some(articulation) = note.articulation {
                 events.push(RuntimeMidiEvent {
                     sample: on_sample,
@@ -4511,7 +4894,11 @@ fn build_midi_runtime(
                     pitch,
                     velocity: 0,
                     channel,
-                    note_id: note.id,
+                    note_id: if mpe_enabled {
+                        runtime_note_id
+                    } else {
+                        note.id
+                    },
                     cc_number: articulation,
                     cc_value: 0.0,
                     pitch_hz: 0.0,
@@ -4524,23 +4911,36 @@ fn build_midi_runtime(
                 pitch,
                 velocity,
                 channel,
-                note_id: note.id,
+                note_id: if mpe_enabled {
+                    runtime_note_id
+                } else {
+                    note.id
+                },
                 cc_number: 0,
                 cc_value: 0.0,
                 pitch_hz: 0.0,
             });
-            events.push(RuntimeMidiEvent {
+            let note_off = RuntimeMidiEvent {
                 sample: off_sample,
                 beat: abs_end,
                 kind: RuntimeMidiEventKind::NoteOff,
                 pitch,
-                velocity: 0,
+                velocity: release_velocity,
                 channel,
-                note_id: note.id,
+                note_id: if mpe_enabled {
+                    runtime_note_id
+                } else {
+                    note.id
+                },
                 cc_number: 0,
                 cc_value: 0.0,
                 pitch_hz: 0.0,
-            });
+            };
+            if mpe_enabled {
+                deferred_mpe_note_offs.push((runtime_note_id, note_off));
+            } else {
+                events.push(note_off);
+            }
             // The note's drawn/derived pitch trajectory. Scheduled on the same
             // timeline as its own note events so a seek, a loop or a tempo
             // change moves the curve with the note it belongs to. Points
@@ -4562,12 +4962,19 @@ fn build_midi_runtime(
                     pitch,
                     velocity: 0,
                     channel,
-                    note_id: note.id,
+                    note_id: if mpe_enabled {
+                        runtime_note_id
+                    } else {
+                        note.id
+                    },
                     cc_number: 0,
                     cc_value: 0.0,
                     pitch_hz: point.hz,
                 });
             }
+        }
+        for (_note_id, note_off) in deferred_mpe_note_offs {
+            events.push(note_off);
         }
         // Controller points → ControlChange events (block-level value).
         for lane in &clip.controllers {
@@ -4591,11 +4998,7 @@ fn build_midi_runtime(
         }
         // Sort by sample; NoteOff before NoteOn at the same sample.
         sort_midi_events(&mut events);
-        let end_beat = clip.start_beat + clip.length_beats.max(0.0);
-        by_track
-            .entry(clip.track_id.clone())
-            .or_default()
-            .extend(events.iter().cloned());
+        let end_beat = clip_end_beat;
         clips.push(RuntimeMidiClip {
             id: clip.id.clone(),
             track_id: clip.track_id.clone(),
@@ -4603,6 +5006,24 @@ fn build_midi_runtime(
             end_beat,
             events,
         });
+    }
+
+    // A stolen note may belong to an earlier clip. Apply cutoffs after every
+    // clip has been built so its future expression and note-off events are
+    // removed from both the structural clip and the merged output schedule.
+    for clip in &mut clips {
+        clip.events.retain(|event| {
+            stolen_note_cutoffs
+                .get(&event.note_id)
+                .is_none_or(|cutoff| {
+                    event.sample < *cutoff
+                        || (event.sample == *cutoff && event.kind == RuntimeMidiEventKind::NoteOff)
+                })
+        });
+        by_track
+            .entry(clip.track_id.clone())
+            .or_default()
+            .extend(clip.events.iter().cloned());
     }
 
     let mut midi_tracks: Vec<RuntimeMidiTrack> = by_track
@@ -4664,14 +5085,15 @@ pub fn resolve_clip_processor(mode: &str, preserve_pitch: bool) -> ClipDspProces
 }
 
 fn resolved_clip_stretch_params(clip: &EngineClipSnapshot) -> StretchParams {
-    if clip.stretch != StretchParams::default() {
-        return clip.stretch.clone();
-    }
-
-    clip.audio_process
-        .as_ref()
-        .map(legacy_process_stretch_params)
-        .unwrap_or_default()
+    let params = if clip.stretch != StretchParams::default() {
+        clip.stretch.clone()
+    } else {
+        clip.audio_process
+            .as_ref()
+            .map(legacy_process_stretch_params)
+            .unwrap_or_default()
+    };
+    params.sanitized()
 }
 
 fn legacy_process_stretch_params(process: &EngineClipAudioProcess) -> StretchParams {
@@ -4839,6 +5261,7 @@ mod stretch_runtime_tests {
             source_end_samples: 48_000,
             warp_markers: Vec::new(),
             reverse: false,
+            denoise_amount: 0.0,
         });
         let migrated = resolved_clip_stretch_params(&clip);
         assert_eq!(migrated.mode, StretchMode::Manual);
@@ -4891,6 +5314,7 @@ mod stretch_runtime_tests {
                         length_beats: 0.25,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
@@ -4901,11 +5325,13 @@ mod stretch_runtime_tests {
                         length_beats: 0.25,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
                 ],
                 controllers: Vec::new(),
+                mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
             };
             let (_clips, tracks) = build_midi_runtime(&[midi_clip], &tempo_map, sample_rate);
             let note_on_samples: Vec<u64> = tracks[0]
@@ -5248,6 +5674,12 @@ fn build_clip_runtime(
         .as_ref()
         .map(|p| p.reverse)
         .unwrap_or(false);
+    let denoise_amount = clip
+        .audio_process
+        .as_ref()
+        .map(|p| p.denoise_amount)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
     let source_start_samples = clip
         .audio_process
         .as_ref()
@@ -5355,6 +5787,7 @@ fn build_clip_runtime(
         warp_markers,
         processor,
         reverse,
+        denoise: DenoiseProcessor::new(output_sample_rate, denoise_amount),
         muted: clip.muted,
         fade_in_samples,
         fade_out_samples,
@@ -5370,8 +5803,8 @@ fn build_clip_runtime(
             .unwrap_or_default(),
         source,
         stretch_processor,
-        stretch_input_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
-        stretch_input_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
+        stretch_input_l: vec![0.0; stretch_input_capacity(effective_time_ratio)],
+        stretch_input_r: vec![0.0; stretch_input_capacity(effective_time_ratio)],
         stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_prime_l: vec![0.0; stretch_prime_len],
@@ -5504,10 +5937,12 @@ mod midi_tests {
                 length_beats: 1.0,
                 velocity: 100,
                 channel: 0,
+                expression: sphere_midi_service::NoteExpression::default(),
                 pitch_points: Vec::new(),
                 articulation: None,
             }],
             controllers: Vec::new(),
+            mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
         }
     }
 
@@ -5541,6 +5976,298 @@ mod midi_tests {
         assert_eq!(off.sample, 120_000);
         assert_eq!(on.pitch, 60);
         assert_eq!(on.velocity, 100);
+    }
+
+    #[test]
+    fn note_expression_is_scheduled_on_an_allocated_mpe_member_channel() {
+        let mut clip = clip_with_one_note();
+        clip.notes[0].expression = sphere_midi_service::NoteExpression {
+            pitch: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.0),
+                sphere_midi_service::ExpressionPoint::new(0.5, 0.5),
+            ]),
+            pressure: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.75),
+            ]),
+            timbre: sphere_midi_service::ExpressionCurve::from_points(vec![
+                sphere_midi_service::ExpressionPoint::new(0.0, 0.25),
+            ]),
+            ..Default::default()
+        };
+        let p = project_with(vec![clip]);
+        let evs = &p.midi_tracks[0].events;
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.cc_number == 129
+                && event.channel == 1
+                && (event.cc_value - 0.5).abs() < 0.001
+        }));
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.cc_number == 128
+                && event.channel == 1
+                && (event.cc_value - 0.75).abs() < 0.001
+        }));
+        let note_on = evs
+            .iter()
+            .find(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .unwrap();
+        assert_eq!(note_on.channel, 1);
+    }
+
+    #[test]
+    fn release_velocity_reaches_the_runtime_note_off_event() {
+        let mut clip = clip_with_one_note();
+        clip.notes[0].expression.release_velocity = Some(0.5);
+        let p = project_with(vec![clip]);
+        let note_off = p.midi_tracks[0]
+            .events
+            .iter()
+            .find(|event| event.kind == RuntimeMidiEventKind::NoteOff)
+            .unwrap();
+        assert_eq!(note_off.velocity, 64);
+    }
+
+    #[test]
+    fn explicit_upper_zone_routes_notes_and_emits_zone_configuration() {
+        let mut clip = clip_with_one_note();
+        clip.mpe = sphere_midi_service::mpe::MpeTrackConfiguration {
+            mode: sphere_midi_service::mpe::MpeOutputMode::Upper,
+            member_channels: 2,
+            member_pitch_range: 12.0,
+            manager_pitch_range: 24.0,
+        };
+        let p = project_with(vec![clip]);
+        let evs = &p.midi_tracks[0].events;
+        let note_on = evs
+            .iter()
+            .find(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .unwrap();
+        assert_eq!(note_on.channel, 13);
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.channel == 15
+                && event.cc_number == 100
+                && (event.cc_value - 6.0 / 127.0).abs() < 0.001
+        }));
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.channel == 15
+                && event.cc_number == 6
+                && (event.cc_value - 2.0 / 127.0).abs() < 0.001
+        }));
+        assert!(evs.iter().any(|event| {
+            event.kind == RuntimeMidiEventKind::ControlChange
+                && event.channel == 13
+                && event.cc_number == 6
+                && (event.cc_value - 12.0 / 127.0).abs() < 0.001
+        }));
+    }
+
+    #[test]
+    fn overlapping_mpe_clips_share_member_channels_per_output_track() {
+        let mut first = clip_with_one_note();
+        first.mpe = sphere_midi_service::mpe::MpeTrackConfiguration {
+            mode: sphere_midi_service::mpe::MpeOutputMode::Lower,
+            member_channels: 2,
+            member_pitch_range: 2.0,
+            manager_pitch_range: 2.0,
+        };
+        first.notes[0].length_beats = 2.0;
+
+        let mut second = clip_with_one_note();
+        second.id = "mc2".into();
+        second.start_beat = 4.5;
+        second.mpe = first.mpe;
+
+        // Reverse the input order to prove allocation follows musical order,
+        // not serialization order.
+        let p = project_with(vec![second, first]);
+        let note_ons = p.midi_tracks[0]
+            .events
+            .iter()
+            .filter(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .collect::<Vec<_>>();
+        assert_eq!(note_ons.len(), 2);
+        assert_eq!(note_ons[0].channel, 1);
+        assert_eq!(note_ons[1].channel, 2);
+    }
+
+    #[test]
+    fn stolen_mpe_note_cuts_events_from_an_earlier_clip() {
+        let mut first = clip_with_one_note();
+        first.mpe = sphere_midi_service::mpe::MpeTrackConfiguration {
+            mode: sphere_midi_service::mpe::MpeOutputMode::Lower,
+            member_channels: 1,
+            member_pitch_range: 2.0,
+            manager_pitch_range: 2.0,
+        };
+        first.notes[0].length_beats = 3.0;
+        first.notes[0].expression.pitch = sphere_midi_service::ExpressionCurve::from_points(vec![
+            sphere_midi_service::ExpressionPoint::new(1.5, 0.75),
+        ]);
+
+        let mut second = clip_with_one_note();
+        second.id = "mc2".into();
+        second.start_beat = 4.5;
+        second.mpe = first.mpe;
+
+        let p = project_with(vec![first, second]);
+        let steal_sample = 108_000; // beat 4.5 at 120 BPM
+        assert!(p.midi_tracks[0]
+            .events
+            .iter()
+            .all(|event| { event.note_id != 1 || event.sample <= steal_sample }));
+        assert!(p.midi_tracks[0].events.iter().any(|event| {
+            event.note_id == 1
+                && event.kind == RuntimeMidiEventKind::NoteOff
+                && event.sample == steal_sample
+        }));
+    }
+
+    #[test]
+    fn same_time_mpe_voice_steal_does_not_emit_the_displaced_note_on() {
+        let mut first = clip_with_one_note();
+        first.mpe = sphere_midi_service::mpe::MpeTrackConfiguration {
+            mode: sphere_midi_service::mpe::MpeOutputMode::Lower,
+            member_channels: 1,
+            member_pitch_range: 2.0,
+            manager_pitch_range: 2.0,
+        };
+        first.notes[0].pitch = 60;
+        first.notes[0].length_beats = 1.0;
+
+        let mut second = clip_with_one_note();
+        second.id = "mc2".into();
+        second.notes[0].pitch = 64;
+        second.mpe = first.mpe;
+
+        let p = project_with(vec![first, second]);
+        let note_ons = p.midi_tracks[0]
+            .events
+            .iter()
+            .filter(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .collect::<Vec<_>>();
+        assert_eq!(note_ons.len(), 1);
+        assert_eq!(note_ons[0].note_id, 2);
+        assert_eq!(note_ons[0].pitch, 64);
+    }
+
+    #[test]
+    fn reused_mpe_channel_gets_expression_reset_before_the_next_note() {
+        let mut clip = clip_with_one_note();
+        clip.notes.push(EngineMidiNoteSnapshot {
+            id: 2,
+            pitch: 64,
+            start_beat: 2.0,
+            length_beats: 1.0,
+            velocity: 100,
+            channel: 0,
+            expression: Default::default(),
+            pitch_points: Vec::new(),
+            articulation: None,
+        });
+        clip.notes[0].expression.pitch = sphere_midi_service::ExpressionCurve::from_points(vec![
+            sphere_midi_service::ExpressionPoint::new(0.0, 0.8),
+        ]);
+        let p = project_with(vec![clip]);
+        let evs = &p.midi_tracks[0].events;
+        let second_start = 144_000; // clip beat 2 at 120 BPM
+        let reset = evs
+            .iter()
+            .filter(|event| {
+                event.sample == second_start
+                    && event.channel == 1
+                    && event.kind == RuntimeMidiEventKind::ControlChange
+            })
+            .collect::<Vec<_>>();
+        assert!(reset
+            .iter()
+            .any(|event| { event.cc_number == 129 && (event.cc_value - 0.5).abs() < 0.001 }));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 128 && event.cc_value == 0.0));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 74 && event.cc_value == 0.0));
+    }
+
+    #[test]
+    fn mpe_channel_stays_reserved_until_sustain_pedal_up() {
+        let mut clip = clip_with_one_note();
+        clip.notes[0].expression.pitch = sphere_midi_service::ExpressionCurve::from_points(vec![
+            sphere_midi_service::ExpressionPoint::new(0.0, 0.25),
+        ]);
+        clip.notes.push(EngineMidiNoteSnapshot {
+            id: 2,
+            pitch: 64,
+            start_beat: 1.5,
+            length_beats: 1.0,
+            velocity: 100,
+            channel: 0,
+            expression: Default::default(),
+            pitch_points: Vec::new(),
+            articulation: None,
+        });
+        clip.controllers.push(EngineMidiControllerLane {
+            controller: 64,
+            channel: 0,
+            points: vec![
+                EngineMidiControllerPoint {
+                    beat: 0.5,
+                    value: 1.0,
+                },
+                EngineMidiControllerPoint {
+                    beat: 2.0,
+                    value: 0.0,
+                },
+            ],
+        });
+        let p = project_with(vec![clip]);
+        let note_ons = p.midi_tracks[0]
+            .events
+            .iter()
+            .filter(|event| event.kind == RuntimeMidiEventKind::NoteOn)
+            .collect::<Vec<_>>();
+        assert_eq!(note_ons.len(), 2);
+        assert_eq!(note_ons[0].channel, 1);
+        assert_eq!(note_ons[1].channel, 2);
+    }
+
+    #[test]
+    fn sustain_state_is_shared_across_overlapping_mpe_clips() {
+        let mut first = clip_with_one_note();
+        first.mpe = sphere_midi_service::mpe::MpeTrackConfiguration {
+            mode: sphere_midi_service::mpe::MpeOutputMode::Lower,
+            member_channels: 1,
+            member_pitch_range: 2.0,
+            manager_pitch_range: 2.0,
+        };
+        first.start_beat = 0.0;
+        first.length_beats = 1.0;
+        first.notes[0].length_beats = 1.0;
+        first.controllers = vec![EngineMidiControllerLane {
+            controller: 64,
+            channel: 0,
+            points: vec![EngineMidiControllerPoint {
+                beat: 0.0,
+                value: 1.0,
+            }],
+        }];
+
+        let mut second = clip_with_one_note();
+        second.id = "mc2".into();
+        second.start_beat = 1.5;
+        second.length_beats = 1.0;
+        second.mpe = first.mpe;
+
+        let p = project_with(vec![first, second]);
+        let steal_sample = 36_000; // beat 1.5 at 120 BPM
+        assert!(p.midi_tracks[0].events.iter().any(|event| {
+            event.note_id == 1
+                && event.kind == RuntimeMidiEventKind::NoteOff
+                && event.sample == steal_sample
+        }));
     }
 
     #[test]
@@ -6262,6 +6989,27 @@ mod midi_tests {
         // NoteOff at 120_000 inside block 119_900..120_412.
         p.schedule_midi_block(119_900, 512);
         assert_eq!(sink.take(), vec![(0x80, 60, 0, 100)]);
+    }
+
+    #[test]
+    fn bridge_encodes_mpe_pressure_and_pitch_as_midi_status_bytes() {
+        let sink = RecordingSink::default();
+        push_vst3_midi_event_to_sink(
+            &sink,
+            &Vst3MidiEvent::control_change(7, 2, 128, 0.75),
+            "insert-1",
+            false,
+        );
+        push_vst3_midi_event_to_sink(
+            &sink,
+            &Vst3MidiEvent::control_change(8, 2, 129, 0.5),
+            "insert-1",
+            false,
+        );
+        assert_eq!(
+            sink.take(),
+            vec![(0xD0 | 2, 95, 0, 7), (0xE0 | 2, 0, 64, 8)]
+        );
     }
 
     #[test]

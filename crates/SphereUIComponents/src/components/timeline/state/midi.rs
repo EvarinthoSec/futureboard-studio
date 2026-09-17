@@ -1,4 +1,5 @@
 use super::*;
+use sphere_midi_service::NoteExpression;
 
 /// Smallest allowed note length, in beats (1/32 note). Mirrors the WebUI
 /// `MIN_DUR` guard so a note can never collapse to zero width.
@@ -51,6 +52,9 @@ pub struct MidiNoteState {
     /// transposing or moving it preserves the expressive shape exactly. See
     /// [`PitchCurve`].
     pub pitch_curve: Option<PitchCurve>,
+    /// Protocol-neutral note-owned expression. MIDI channel is only used by
+    /// the transport adapter and is not used to identify these curves.
+    pub expression: NoteExpression,
     /// Musical accent for this note: how prominent it should feel and by what
     /// means. `None` means the note has never been analysed or drawn and is to
     /// be played as written — the same "absence means unmodified" convention
@@ -75,6 +79,7 @@ impl MidiNoteState {
             channel: MidiChannel::default(),
             articulation: None,
             pitch_curve: None,
+            expression: NoteExpression::default(),
             accent: None,
         }
     }
@@ -106,6 +111,7 @@ impl MidiNoteState {
             channel: MidiChannel::default(),
             articulation: None,
             pitch_curve: None,
+            expression: NoteExpression::default(),
             accent: None,
         }
     }
@@ -588,6 +594,10 @@ impl TimelineState {
                     // `EditMidiNotes` entry undoes/redoes it with everything
                     // else the same gesture touched.
                     note.pitch_curve = s.pitch_curve.clone();
+                    // Protocol-neutral note expression travels with the
+                    // snapshot too, so expression drawing and transforms are
+                    // one undoable note edit just like pitch performance.
+                    note.expression = s.expression.clone();
                     // So is accent, and for the same reason. Without this line
                     // Analyze Accent would apply and never come back: the
                     // command records a before/after note snapshot and undo

@@ -21,6 +21,7 @@ use crate::components::timeline::timeline_state::{
     TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, WarpMarker,
 };
 use crate::overlay::OverlayAnchor;
+use sphere_midi_service::mpe::MpeTrackConfiguration;
 
 use super::engine_snapshot::{apply_engine_track_input_state, volume_norm_to_linear};
 use super::StudioLayout;
@@ -49,6 +50,8 @@ type OutputRoutingCb = Arc<dyn Fn(&(String, TrackOutputRouting), &mut Window, &m
 type AudioFormatCb = Arc<dyn Fn(&(String, TrackAudioFormat), &mut Window, &mut App) + 'static>;
 type MidiInputCb = Arc<dyn Fn(&(String, TrackMidiInputRouting), &mut Window, &mut App) + 'static>;
 type MidiChannelCb = Arc<dyn Fn(&(String, Option<u8>), &mut Window, &mut App) + 'static>;
+type MpeConfigurationCb =
+    Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertMoveCb = Arc<dyn Fn(&(String, String, bool), &mut Window, &mut App) + 'static>;
@@ -387,6 +390,7 @@ impl StudioLayout {
         let on_set_audio_format = self.audio_format_cb(owner.clone());
         let on_set_midi_input = self.midi_input_cb(owner.clone());
         let on_set_midi_channel = self.midi_channel_cb(owner.clone());
+        let on_set_mpe_configuration = self.mpe_configuration_cb(owner.clone());
         let on_open_insert_picker = self.insert_picker_cb(owner.clone());
         let on_remove_insert = self.remove_insert_cb(owner.clone());
         let on_toggle_insert_bypass = self.toggle_insert_bypass_cb(owner.clone());
@@ -500,6 +504,7 @@ impl StudioLayout {
             on_set_audio_format,
             on_set_midi_input,
             on_set_midi_channel,
+            on_set_mpe_configuration,
             on_open_insert_picker,
             on_remove_insert,
             on_toggle_insert_bypass,
@@ -1527,6 +1532,45 @@ impl StudioLayout {
                 });
             }
         })
+    }
+
+    fn mpe_configuration_cb(&self, owner: Entity<Self>) -> MpeConfigurationCb {
+        let timeline = self.timeline.clone();
+        Arc::new(
+            move |(id, configuration): &(String, MpeTrackConfiguration), _w, cx| {
+                let id = id.clone();
+                let next = configuration.sanitized();
+                let changed = timeline.update(cx, |timeline, cx| {
+                    let Some(prev) = timeline
+                        .state
+                        .find_track(&id)
+                        .map(|track| track.routing.mpe)
+                    else {
+                        return false;
+                    };
+                    if prev == next {
+                        return false;
+                    }
+                    timeline.run_edit_command(
+                        EditCommand::SetTrackMpeConfiguration {
+                            track_id: id.clone(),
+                            prev,
+                            next,
+                        },
+                        cx,
+                    );
+                    true
+                });
+                if changed {
+                    inspector_debug(&format!("routing mpe track={id} mode={:?}", next.mode));
+                    StudioLayout::defer_update(&owner, cx, |this, cx| {
+                        this.mark_dirty();
+                        this.schedule_audio_project_sync(cx, true, "inspector_mpe_configuration");
+                        this.push_mixer_snapshot_to_window(cx);
+                    });
+                }
+            },
+        )
     }
 
     /// Build one of the four M/S/R/I toggle callbacks. Every toggle is persisted

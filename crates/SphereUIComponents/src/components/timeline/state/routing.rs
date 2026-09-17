@@ -1,5 +1,6 @@
 use super::*;
 use crate::audio_connections::{AudioConnectionId, AudioConnectionReference};
+use sphere_midi_service::mpe::MpeTrackConfiguration;
 
 pub use crate::project::InputMonitorMode;
 
@@ -120,7 +121,7 @@ impl TrackMidiInputRouting {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrackRoutingState {
     /// Logical audio input bus from the project Audio Connections registry.
     /// `None` is No Input. Never a raw device id or channel index — the
@@ -142,6 +143,9 @@ pub struct TrackRoutingState {
     /// `false` (default) forces every note onto `midi_channel` (or channel 1),
     /// matching the pre-existing single-channel-per-track behavior.
     pub midi_output_per_note: bool,
+    /// Per-track MPE output policy. Community builds retain and play this
+    /// state, while the Professional UI exposes its editing controls.
+    pub mpe: MpeTrackConfiguration,
 }
 
 impl TrackRoutingState {
@@ -174,6 +178,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
             TrackType::Instrument => Self {
                 audio_input_connection_id: None,
@@ -183,6 +188,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
             TrackType::Midi => Self {
                 audio_input_connection_id: None,
@@ -192,6 +198,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
             TrackType::Bus | TrackType::Return | TrackType::Group => Self {
                 audio_input_connection_id: None,
@@ -201,6 +208,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
             TrackType::Master => Self {
                 audio_input_connection_id: None,
@@ -210,6 +218,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
             // A Video track is picture-only: no input, no output, no MIDI.
             TrackType::Video => Self {
@@ -220,6 +229,7 @@ impl TrackRoutingState {
                 midi_channel: None,
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
+                mpe: MpeTrackConfiguration::default(),
             },
         }
     }
@@ -480,6 +490,30 @@ impl TimelineState {
                     );
                 }
                 t.routing.midi_output_per_note = per_note;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set the complete MPE output policy as one state mutation. Keeping the
+    /// settings together makes changing a zone/range atomic for undo, project
+    /// serialization, and engine snapshot rebuilds.
+    pub fn set_track_mpe_configuration(
+        &mut self,
+        track_id: &str,
+        configuration: MpeTrackConfiguration,
+    ) -> bool {
+        let configuration = configuration.sanitized();
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            if t.routing.mpe != configuration {
+                if routing_debug_enabled() {
+                    eprintln!(
+                        "[routing] mpe track={} old={:?} new={:?}",
+                        track_id, t.routing.mpe, configuration
+                    );
+                }
+                t.routing.mpe = configuration;
                 return true;
             }
         }

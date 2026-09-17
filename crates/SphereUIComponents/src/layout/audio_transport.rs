@@ -3698,6 +3698,13 @@ impl StudioLayout {
         self.engine_sync.synced_at = Instant::now();
         let _ = self.timeline.update(cx, move |timeline, cx| {
             timeline.state.transport.playhead_beats = beat;
+            // A seek is also a playhead change.  Playback ticks run the
+            // follow/auto-scroll policy, but a stopped seek used to update
+            // only the transport readout.  Returning to the start could
+            // therefore leave the timeline viewport parked several bars
+            // away from the playhead.  Apply the same policy here so the
+            // visual surface and transport state stay in sync.
+            timeline.state.update_auto_scroll_for_playhead(beat);
             // Preview Track Volume automation at the new playhead so a stopped
             // seek updates the fader/inspector to the value under the cursor.
             timeline.state.recompute_effective_volumes(beat, "seek");

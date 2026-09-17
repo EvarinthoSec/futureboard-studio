@@ -530,6 +530,8 @@ impl TimelineState {
     /// Replace a clip's stretch/pitch state. Returns `true` when it changed.
     /// UI-mutating only — the caller marks the project dirty / records undo.
     pub fn set_clip_stretch(&mut self, clip_id: &str, stretch: AudioClipStretchState) -> bool {
+        let mut stretch = stretch;
+        stretch.sanitize_in_place();
         for track in &mut self.tracks {
             if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
                 if clip.stretch != stretch {
@@ -649,6 +651,7 @@ impl TimelineState {
                             .pitch_curve
                             .as_ref()
                             .map(super::PitchCurve::cloned_with_new_ids);
+                        cloned.expression = note.expression.clone();
                         cloned
                     })
                     .collect(),

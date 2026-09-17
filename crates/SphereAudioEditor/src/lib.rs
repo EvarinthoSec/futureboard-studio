@@ -3,13 +3,28 @@
 mod audio_editor;
 mod audio_editor_state;
 mod audio_ruler;
+mod editing;
 mod editor_kind;
+mod spectrogram;
+mod viewport;
 mod waveform_view;
 
 pub use audio_editor::{
+    AudioEditorCallbacks, AudioEditorCanvasDrag, AudioEditorDropdown, AudioEditorEvent,
     AudioEditorTheme, AudioEditorViewModel, audio_editor_panel, default_wheel_handler,
-    empty_audio_editor,
+    default_wheel_handler_at, empty_audio_editor,
 };
 pub use audio_editor_state::AudioEditorState;
+pub use editing::{
+    AudioChannelMode, AudioEditorDrag, AudioEditorSnap, AudioEditorTool, AudioFadeCurve,
+    AudioFadeEdge, AudioRangeSelection, ClipEnvelope, EnvelopeCurve, EnvelopePoint,
+    SpectralSelection,
+};
 pub use editor_kind::{ClipEditorKind, ClipTypeHint, editor_kind_for_clip};
+pub use spectrogram::{
+    AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramAnalysis,
+    SpectrogramAnalysisError, SpectrogramSettings, SpectrogramTile, SpectrogramTileView,
+    SpectrogramViewModel, analyze_spectrogram,
+};
+pub use viewport::AudioEditorViewport;
 pub use waveform_view::{WaveformColumn, WaveformViewModel};

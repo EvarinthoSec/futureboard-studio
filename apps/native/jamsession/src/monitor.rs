@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-use DirectAudio::engine::{f32_load, SharedState};
+use DirectAudio::engine::{SharedState, f32_load};
 use DirectAudio::types::{
     EngineProjectSnapshot, EngineRoutingSnapshot, EngineTrackInputSourceSnapshot,
     EngineTrackSnapshot,
@@ -441,7 +441,7 @@ pub fn channels_for(stream_channels: usize) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{channels_for, listener_track, room_project, self_monitor_track, Listener};
+    use super::{Listener, channels_for, listener_track, room_project, self_monitor_track};
 
     fn listener() -> Listener {
         Listener {

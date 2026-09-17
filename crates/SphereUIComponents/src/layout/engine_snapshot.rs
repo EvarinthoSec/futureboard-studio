@@ -1109,6 +1109,7 @@ fn build_engine_project_snapshot_inner(
                             markers
                         },
                         reverse: stretch.reverse,
+                        denoise_amount: stretch.denoise_amount.clamp(0.0, 1.0),
                     }),
                 })
             })
@@ -1187,6 +1188,7 @@ fn build_engine_project_snapshot_inner(
                                 length_beats: length_beats.max(0.0) as f64,
                                 velocity,
                                 channel,
+                                expression: n.expression.sanitized(),
                                 // Resolved the same way playback resolves it,
                                 // so a note with no marking of its own still
                                 // follows the clip's direction lane.
@@ -1225,6 +1227,7 @@ fn build_engine_project_snapshot_inner(
                             })
                         })
                         .collect(),
+                    mpe: track.routing.mpe,
                 })
             })
         })

@@ -3,6 +3,7 @@
 //! piano-roll vocabulary (struct fields via the type, consts, free fns).
 
 use super::*;
+use gpui::{PathBuilder, PathStyle, StrokeOptions};
 
 impl PianoRoll {
     pub(super) fn display_note(&self, n: &MidiNoteState) -> DisplayNote {
@@ -2029,6 +2030,100 @@ impl PianoRoll {
         note_button_row(buttons).into_any_element()
     }
 
+    fn render_note_expression_inspector(
+        &self,
+        note: &MidiNoteState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        fn range(curve: &sphere_midi_service::ExpressionCurve) -> Option<(f32, f32)> {
+            let mut values = curve.points.iter().map(|point| point.value);
+            let first = values.next()?;
+            let (mut min, mut max) = (first, first);
+            for value in values {
+                min = min.min(value);
+                max = max.max(value);
+            }
+            Some((min, max))
+        }
+
+        fn row(
+            label: &str,
+            curve: &sphere_midi_service::ExpressionCurve,
+            percent: bool,
+        ) -> gpui::AnyElement {
+            let value = range(curve)
+                .map(|(min, max)| {
+                    if percent {
+                        format!(
+                            "{} pts · {:.0}–{:.0}%",
+                            curve.points.len(),
+                            min * 100.0,
+                            max * 100.0
+                        )
+                    } else {
+                        format!("{} pts · {:.2}–{:.2}", curve.points.len(), min, max)
+                    }
+                })
+                .unwrap_or_else(|| "None".to_string());
+            note_value_row(label, value).into_any_element()
+        }
+
+        div()
+            .mt(px(3.0))
+            .pt(px(5.0))
+            .border_t(px(1.0))
+            .border_color(Colors::divider())
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .child(note_inspector_label("NOTE EXPRESSION"))
+            .child(row("Pitch", &note.expression.pitch, false))
+            .child(row("Pressure", &note.expression.pressure, true))
+            .child(row("Timbre", &note.expression.timbre, true))
+            .child(note_value_row(
+                "Release",
+                note.expression
+                    .release_velocity
+                    .map(|value| format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0))
+                    .unwrap_or_else(|| "Default".to_string()),
+            ))
+            .child(
+                note_button_row(vec![
+                    note_action_button(
+                        "pr-expression-reset-pitch",
+                        "Reset Pitch",
+                        cx.listener(|this, _, _w, cx| {
+                            this.reset_selected_expression(Some(NoteExpressionLane::Pitch), cx)
+                        }),
+                    )
+                    .into_any_element(),
+                    note_action_button(
+                        "pr-expression-reset-pressure",
+                        "Reset Pressure",
+                        cx.listener(|this, _, _w, cx| {
+                            this.reset_selected_expression(Some(NoteExpressionLane::Pressure), cx)
+                        }),
+                    )
+                    .into_any_element(),
+                    note_action_button(
+                        "pr-expression-reset-timbre",
+                        "Reset Timbre",
+                        cx.listener(|this, _, _w, cx| {
+                            this.reset_selected_expression(Some(NoteExpressionLane::Timbre), cx)
+                        }),
+                    )
+                    .into_any_element(),
+                ])
+                .into_any_element(),
+            )
+            .child(note_action_button(
+                "pr-expression-reset-all",
+                "Reset All Expression",
+                cx.listener(|this, _, _w, cx| this.reset_selected_expression(None, cx)),
+            ))
+            .into_any_element()
+    }
+
     pub(super) fn render_note_inspector(
         &self,
         cx: &mut Context<Self>,
@@ -2063,6 +2158,12 @@ impl PianoRoll {
             content.push(note_value_row("Channel", note.channel.label()).into_any_element());
             content
                 .push(note_value_row("Artic.", snapshot.articulation_label()).into_any_element());
+            // Community keeps expression in the project and shows the inline
+            // curve below, but the mutating inspector is a Professional-only
+            // editing surface.
+            if crate::edition::professional_features_available() {
+                content.push(self.render_note_expression_inspector(note, cx));
+            }
             content.push(self.articulation_assign_row(cx));
             content.push(
                 note_button_row(vec![
@@ -2804,6 +2905,7 @@ impl PianoRoll {
             bool,
             bool,
             Option<&'static str>,
+            Option<Vec<(f32, f32)>>,
         )> = {
             let tl = self.timeline.read(cx);
             let Some(notes) = tl.state.midi_clip_notes(clip_id) else {
@@ -2834,6 +2936,24 @@ impl PianoRoll {
                         self.erase_preview_ids.contains(&d.id),
                         n.muted,
                         n.articulation.map(|a| a.short_name()),
+                        if self.selection.contains(&n.id) && n.expression.pitch.points.len() >= 2 {
+                            Some(
+                                n.expression
+                                    .pitch
+                                    .points
+                                    .iter()
+                                    .map(|point| {
+                                        let x =
+                                            (point.position.max(0.0) * self.ppb).min(w.max(0.0));
+                                        let normalized = (point.value.clamp(-1.0, 1.0) + 1.0) * 0.5;
+                                        let y = (row_h - 2.0) * (1.0 - normalized);
+                                        (x, y)
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        },
                     ))
                 })
                 .collect()
@@ -2854,6 +2974,7 @@ impl PianoRoll {
                     erase_target,
                     muted,
                     articulation,
+                    inline_pitch,
                 )| {
                     let mut fill = track_color;
                     fill.a = if erase_target {
@@ -2927,6 +3048,35 @@ impl PianoRoll {
                                 this.note_right_down(id, lx, ly, window, cx);
                             }),
                         );
+                    if let Some(points) = inline_pitch {
+                        note = note.child(
+                            canvas(
+                                |_bounds, _window, _cx| {},
+                                move |bounds, _scene, window, _cx| {
+                                    if points.len() < 2 {
+                                        return;
+                                    }
+                                    let origin = bounds.origin;
+                                    let mut path =
+                                        PathBuilder::stroke(px(1.1)).with_style(PathStyle::Stroke(
+                                            StrokeOptions::default().with_miter_limit(2.0),
+                                        ));
+                                    path.move_to(origin + point(px(points[0].0), px(points[0].1)));
+                                    for (x, y) in points.iter().copied().skip(1) {
+                                        path.line_to(origin + point(px(x), px(y)));
+                                    }
+                                    if let Ok(path) = path.build() {
+                                        window.paint_path(
+                                            path,
+                                            Colors::with_alpha(Colors::text_primary(), 0.82),
+                                        );
+                                    }
+                                },
+                            )
+                            .absolute()
+                            .inset_0(),
+                        );
+                    }
                     // Note-name label, shown only when the block is large enough to
                     // read so dense clips stay clean.
                     if w >= 22.0 && row_h >= 11.0 {

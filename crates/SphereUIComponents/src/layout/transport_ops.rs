@@ -184,25 +184,11 @@ impl StudioLayout {
                     self.stop_native_playback(cx);
                     return;
                 }
-                // Space starts the take when a track is armed and the transport
-                // is parked — count-in and all. Arming a track is the statement
-                // that the next roll is a take, and having to reach for a second
-                // control to say it again is how a first pass gets lost.
-                //
-                // Only from a standstill: space while playing is Stop, which is
-                // the one thing about a transport nobody should have to think
-                // about. Nothing armed and it plays, as it always did.
-                let stopped = !self
-                    .audio_bridge
-                    .stats
-                    .as_ref()
-                    .map(|stats| stats.transport_playing)
-                    .unwrap_or(false);
-                if stopped && self.any_track_record_armed(cx) {
-                    self.log_transport_debug("Spacebar", "start_recording_armed", cx);
-                    self.start_native_recording(cx);
-                    return;
-                }
+                // Space controls playback only. Record is deliberately an
+                // explicit action: an armed track must not turn an ordinary
+                // Play press into a new take after the previous recording has
+                // finished. This keeps the lifecycle one-shot until the user
+                // presses R again.
                 let playing = self
                     .audio_bridge
                     .stats

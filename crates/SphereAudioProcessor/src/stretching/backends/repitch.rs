@@ -48,7 +48,7 @@ impl StretchProcessor for RePitchProcessor {
     fn reset(&mut self) {}
 
     fn set_params(&mut self, params: StretchParams) {
-        self.params = params;
+        self.params = params.sanitized();
     }
 
     fn latency_samples(&self) -> usize {
@@ -76,6 +76,7 @@ impl StretchProcessor for RePitchProcessor {
             for i in 0..frames {
                 let source_pos = i as f32 * read_rate;
                 let sample = Self::linear_interp(input_l, source_pos);
+                let sample = if sample.is_finite() { sample } else { 0.0 };
                 output_l[i] = sample;
                 output_r[i] = sample;
             }
@@ -84,8 +85,10 @@ impl StretchProcessor for RePitchProcessor {
 
         for i in 0..frames {
             let source_pos = i as f32 * read_rate;
-            output_l[i] = Self::linear_interp(input_l, source_pos);
-            output_r[i] = Self::linear_interp(input_r, source_pos);
+            let left = Self::linear_interp(input_l, source_pos);
+            let right = Self::linear_interp(input_r, source_pos);
+            output_l[i] = if left.is_finite() { left } else { 0.0 };
+            output_r[i] = if right.is_finite() { right } else { 0.0 };
         }
 
         Ok(())

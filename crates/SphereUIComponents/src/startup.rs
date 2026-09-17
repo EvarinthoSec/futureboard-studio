@@ -182,19 +182,28 @@ pub async fn run_lightweight_boot(cx: &mut AsyncApp) -> StartupPlan {
     let plan = StartupPlan::resolve();
     executor.timer(Duration::from_millis(40)).await;
 
-    crate::boot::log("[Startup] phase=ScanAudio");
-    executor
-        .spawn(async {
-            crate::device_registry::scan_audio();
-        })
-        .await;
+    // CoreAudio device enumeration can block inside Apple's HAL while another
+    // application owns an audio session (common during remote desktop or DAW
+    // use). It is not needed to choose the first Studio surface, and a blocked
+    // background worker can otherwise starve the pre-studio engine install.
+    // Keep the eager scan on platforms where the native enumeration is
+    // reliable; macOS refreshes the cache when audio settings are opened.
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::boot::log("[Startup] phase=ScanAudio");
+        executor
+            .spawn(async {
+                crate::device_registry::scan_audio();
+            })
+            .detach();
+    }
 
     crate::boot::log("[Startup] phase=ScanMidi");
     executor
         .spawn(async {
             crate::device_registry::scan_midi_resilient();
         })
-        .await;
+        .detach();
     if crate::device_registry::cached_midi_devices().is_empty() {
         // USB class drivers and platform MIDI services can appear after the
         // splash scan has completed. Retry once after startup without delaying

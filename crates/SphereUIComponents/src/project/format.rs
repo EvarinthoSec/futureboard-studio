@@ -15,6 +15,11 @@ use super::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, StretchAlgorithm, StretchMode, WarpMarker,
 };
+use sphere_audio_editor::{ClipEnvelope, EnvelopeCurve, EnvelopePoint};
+use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
+use sphere_midi_service::{
+    CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint, NoteExpression,
+};
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
 
@@ -106,7 +111,13 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v44 adds per-track recorded takes. A take names one of the track's own
 /// clips, so the audio is not duplicated — only the record of which pass made
 /// it and whether it is the one heard.
-pub const PROJECT_VERSION: u32 = 44;
+/// v45 appends protocol-neutral per-note expression curves. v46 appends
+/// per-track MPE output settings at the tail of each track block.
+/// v47 appends the non-destructive clip gain envelope to each audio stretch
+/// block. Pre-v47 clips load with an empty envelope.
+/// v48 appends the clip de-noise amount. Pre-v48 clips load with de-noise
+/// bypassed.
+pub const PROJECT_VERSION: u32 = 48;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -593,6 +604,102 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
         }
         None => w.write_bool(false),
     }
+    // v45: protocol-neutral note-owned expression.  This is appended so every
+    // pre-v45 positional body remains readable.
+    encode_note_expression(w, &n.expression);
+}
+
+fn encode_expression_interpolation(w: &mut FbWriter, interpolation: ExpressionInterpolation) {
+    w.write_u8(match interpolation {
+        ExpressionInterpolation::Linear => 0,
+        ExpressionInterpolation::Step => 1,
+        ExpressionInterpolation::Smooth => 2,
+        ExpressionInterpolation::Bezier => 3,
+    });
+}
+
+fn decode_expression_interpolation(
+    r: &mut FbReader,
+) -> Result<ExpressionInterpolation, ProjectError> {
+    match r.read_u8()? {
+        0 => Ok(ExpressionInterpolation::Linear),
+        1 => Ok(ExpressionInterpolation::Step),
+        2 => Ok(ExpressionInterpolation::Smooth),
+        3 => Ok(ExpressionInterpolation::Bezier),
+        tag => Err(ProjectError::Corrupted(format!(
+            "bad expression interpolation tag {tag}"
+        ))),
+    }
+}
+
+fn encode_expression_curve(w: &mut FbWriter, curve: &ExpressionCurve) {
+    w.write_u32(curve.points.len() as u32);
+    for point in &curve.points {
+        w.write_f32(point.position);
+        w.write_f32(point.value);
+        encode_expression_interpolation(w, point.interpolation);
+    }
+}
+
+fn decode_expression_curve(r: &mut FbReader) -> Result<ExpressionCurve, ProjectError> {
+    let count = r.read_u32()? as usize;
+    if count > 1_000_000 {
+        return Err(ProjectError::Corrupted(
+            "invalid note expression point count".to_string(),
+        ));
+    }
+    let mut points = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        points.push(ExpressionPoint {
+            position: r.read_f32()?,
+            value: r.read_f32()?,
+            interpolation: decode_expression_interpolation(r)?,
+        });
+    }
+    Ok(ExpressionCurve::from_points(points))
+}
+
+fn encode_note_expression(w: &mut FbWriter, expression: &NoteExpression) {
+    let expression = expression.sanitized();
+    encode_expression_curve(w, &expression.pitch);
+    encode_expression_curve(w, &expression.pressure);
+    encode_expression_curve(w, &expression.timbre);
+    w.write_opt_f32(&expression.release_velocity);
+    w.write_u32(expression.custom.len() as u32);
+    for lane in &expression.custom {
+        w.write_u32(lane.controller as u32);
+        w.write_str(&lane.name);
+        encode_expression_curve(w, &lane.curve);
+    }
+}
+
+fn decode_note_expression(r: &mut FbReader) -> Result<NoteExpression, ProjectError> {
+    let pitch = decode_expression_curve(r)?;
+    let pressure = decode_expression_curve(r)?;
+    let timbre = decode_expression_curve(r)?;
+    let release_velocity = r.read_opt_f32()?;
+    let count = r.read_u32()? as usize;
+    if count > 65_536 {
+        return Err(ProjectError::Corrupted(
+            "invalid custom expression lane count".to_string(),
+        ));
+    }
+    let mut custom = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        custom.push(CustomExpressionLane {
+            controller: r.read_u32()?.min(u16::MAX as u32) as u16,
+            name: r.read_str()?,
+            curve: decode_expression_curve(r)?,
+        });
+    }
+    Ok(NoteExpression {
+        pitch,
+        pressure,
+        timbre,
+        release_velocity,
+        custom,
+    }
+    .sanitized())
 }
 
 /// v5: controller kind tag. CC carries its number; the rest are tag-only.
@@ -658,13 +765,28 @@ fn encode_stretch(w: &mut FbWriter, s: &AudioClipStretchState) {
     w.write_f32(s.fade_out_ms);
     w.write_f32(s.gain_db);
     w.write_f32(s.pan);
-    w.write_u32(s.warp_markers.len() as u32);
-    for m in &s.warp_markers {
+    let marker_count = s
+        .warp_markers
+        .len()
+        .min(AudioClipStretchState::MAX_WARP_MARKERS);
+    w.write_u32(marker_count as u32);
+    for m in s.warp_markers.iter().take(marker_count) {
         w.write_u64(m.id);
         w.write_u64(m.source_sample);
         w.write_f64(m.timeline_beat);
         w.write_bool(m.locked);
     }
+    let point_count = s.gain_envelope.points.len().min(ClipEnvelope::MAX_POINTS);
+    w.write_u32(point_count as u32);
+    for point in s.gain_envelope.points.iter().take(point_count) {
+        w.write_u64(point.id);
+        w.write_f32(point.time);
+        w.write_f32(point.value_db);
+        w.write_u8(point.curve.to_tag());
+    }
+    // v48: adaptive clip de-noise amount. It is appended so all earlier
+    // stretch fields retain their byte offsets for backwards compatibility.
+    w.write_f32(s.denoise_amount.clamp(0.0, 1.0));
 }
 
 fn encode_clip(w: &mut FbWriter, c: &ProjectClip) {
@@ -917,6 +1039,13 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
         w.write_str(&take.recorded_at);
     }
     w.write_bool(t.takes_expanded);
+    // v46: per-track MPE output settings. Appended so v45 and older track
+    // blocks remain positionally readable.
+    let mpe = t.routing.mpe.sanitized();
+    w.write_u8(mpe.mode.to_tag());
+    w.write_u8(mpe.member_channels);
+    w.write_f32(mpe.member_pitch_range);
+    w.write_f32(mpe.manager_pitch_range);
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1137,7 +1266,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
                 tag => {
                     return Err(ProjectError::Corrupted(format!(
                         "bad lyric syllable mode tag {tag}"
-                    )))
+                    )));
                 }
             };
             let continuation = r.read_bool()?;
@@ -1179,7 +1308,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
                 tag => {
                     return Err(ProjectError::Corrupted(format!(
                         "bad song section type tag {tag}"
-                    )))
+                    )));
                 }
             };
             ProjectSongTextEventKind::Section {
@@ -1191,7 +1320,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
         tag => {
             return Err(ProjectError::Corrupted(format!(
                 "bad song text event kind tag {tag}"
-            )))
+            )));
         }
     };
     Ok(ProjectSongTextEvent { id, beat, kind })
@@ -1578,7 +1707,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
             tag => {
                 return Err(ProjectError::Corrupted(format!(
                     "bad insert role tag {tag}"
-                )))
+                )));
             }
         }
     } else {
@@ -1590,7 +1719,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "bad plugin option tag {t}"
-            )))
+            )));
         }
     };
     Ok(ProjectInsert {
@@ -1700,6 +1829,13 @@ fn decode_midi_note(r: &mut FbReader, version: u32) -> Result<MidiNote, ProjectE
         } else {
             None
         },
+        // v45 adds note-owned expression curves; older files restore with no
+        // expression and remain binary-compatible.
+        expression: if version >= 45 {
+            decode_note_expression(r)?
+        } else {
+            NoteExpression::default()
+        },
     })
 }
 
@@ -1712,7 +1848,7 @@ fn decode_controller_kind(r: &mut FbReader) -> Result<MidiControllerKind, Projec
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown controller kind tag {t}"
-            )))
+            )));
         }
     })
 }
@@ -1749,7 +1885,7 @@ fn decode_sysex_event(r: &mut FbReader) -> Result<MidiSysExEvent, ProjectError> 
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown SysEx event kind tag {t}"
-            )))
+            )));
         }
     };
     Ok(MidiSysExEvent {
@@ -1761,7 +1897,7 @@ fn decode_sysex_event(r: &mut FbReader) -> Result<MidiSysExEvent, ProjectError> 
 }
 
 /// v16: per-clip stretch/pitch block. See [`encode_stretch`].
-fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectError> {
+fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchState, ProjectError> {
     let mode = StretchMode::from_tag(r.read_u8()?);
     let algorithm = StretchAlgorithm::from_tag(r.read_u8()?);
     let original_sample_rate = r.read_u32()?;
@@ -1786,16 +1922,44 @@ fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectErro
     let gain_db = r.read_f32()?;
     let pan = r.read_f32()?;
     let marker_count = r.read_u32()? as usize;
-    let mut warp_markers = Vec::with_capacity(marker_count);
-    for _ in 0..marker_count {
-        warp_markers.push(WarpMarker {
+    let retained_marker_count = marker_count.min(AudioClipStretchState::MAX_WARP_MARKERS);
+    let mut warp_markers = Vec::with_capacity(retained_marker_count);
+    for marker_index in 0..marker_count {
+        let marker = WarpMarker {
             id: r.read_u64()?,
             source_sample: r.read_u64()?,
             timeline_beat: r.read_f64()?,
             locked: r.read_bool()?,
-        });
+        };
+        if marker_index < retained_marker_count {
+            warp_markers.push(marker);
+        }
     }
-    Ok(AudioClipStretchState {
+    let gain_envelope = if version >= 47 {
+        let point_count = r.read_u32()? as usize;
+        let retained_point_count = point_count.min(ClipEnvelope::MAX_POINTS);
+        let mut points = Vec::with_capacity(retained_point_count);
+        for point_index in 0..point_count {
+            let point = EnvelopePoint {
+                id: r.read_u64()?,
+                time: r.read_f32()?,
+                value_db: r.read_f32()?,
+                curve: EnvelopeCurve::from_tag(r.read_u8()?),
+            };
+            if point_index < retained_point_count {
+                points.push(point);
+            }
+        }
+        ClipEnvelope { points }
+    } else {
+        ClipEnvelope::default()
+    };
+    let denoise_amount = if version >= 48 {
+        r.read_f32()?.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut stretch = AudioClipStretchState {
         mode,
         algorithm,
         original_sample_rate,
@@ -1822,7 +1986,11 @@ fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectErro
         // Transient: a freshly loaded clip is not pending re-process.
         dirty: false,
         warp_markers,
-    })
+        gain_envelope,
+        denoise_amount,
+    };
+    stretch.sanitize_in_place();
+    Ok(stretch)
 }
 
 fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectError> {
@@ -1904,13 +2072,13 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown clip source tag {t}"
-            )))
+            )));
         }
     };
     // v16: stretch/pitch block trails the source. Older files have none and
     // default to an un-stretched clip.
     let stretch = if version >= 16 {
-        decode_stretch(r)?
+        decode_stretch(r, version)?
     } else {
         AudioClipStretchState::default()
     };
@@ -1956,7 +2124,7 @@ fn decode_input_monitor(r: &mut FbReader) -> Result<InputMonitorMode, ProjectErr
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown input monitor mode {t}"
-            )))
+            )));
         }
     })
 }
@@ -1993,7 +2161,7 @@ fn decode_track_input_routing(r: &mut FbReader) -> Result<V33TrackInputRouting, 
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track input routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2017,7 +2185,7 @@ fn decode_track_output_routing(
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track output routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2029,7 +2197,7 @@ fn decode_track_audio_format(r: &mut FbReader) -> Result<ProjectTrackAudioFormat
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track audio format {t}"
-            )))
+            )));
         }
     })
 }
@@ -2046,7 +2214,7 @@ fn decode_track_midi_input_routing(
         t => {
             return Err(ProjectError::Corrupted(format!(
                 "unknown track MIDI input routing {t}"
-            )))
+            )));
         }
     })
 }
@@ -2092,6 +2260,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             midi_input,
             midi_channel,
             midi_output_per_note,
+            mpe: MpeTrackConfiguration::default(),
             sends: Vec::new(),
         }
     } else {
@@ -2189,6 +2358,18 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
     } else {
         (Vec::new(), false)
     };
+
+    // v46: MPE output settings. A pre-v46 project uses the shared default
+    // (Auto) so existing note expression still plays through the lower zone.
+    if version >= 46 {
+        routing.mpe = MpeTrackConfiguration {
+            mode: MpeOutputMode::from_tag(r.read_u8()?),
+            member_channels: r.read_u8()?,
+            member_pitch_range: r.read_f32()?,
+            manager_pitch_range: r.read_f32()?,
+        }
+        .sanitized();
+    }
 
     Ok(ProjectTrack {
         id,
@@ -2681,6 +2862,7 @@ mod tests {
             channel: 1,
             articulation: 0,
             pitch_curve: Vec::new(),
+            expression: NoteExpression::default(),
             accent: None,
         }
     }
@@ -2717,6 +2899,49 @@ mod tests {
             }),
             ..note(pitch, false)
         }
+    }
+
+    fn note_with_note_expression(pitch: u8) -> MidiNote {
+        MidiNote {
+            expression: NoteExpression {
+                pitch: ExpressionCurve::from_points(vec![
+                    ExpressionPoint {
+                        position: 0.0,
+                        value: 0.0,
+                        interpolation: ExpressionInterpolation::Step,
+                    },
+                    ExpressionPoint::new(0.5, 0.25),
+                ]),
+                pressure: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, 0.2)]),
+                timbre: ExpressionCurve::from_points(vec![ExpressionPoint::new(1.0, 0.8)]),
+                release_velocity: Some(0.65),
+                custom: vec![CustomExpressionLane {
+                    controller: 12_345,
+                    name: "breath".to_string(),
+                    curve: ExpressionCurve::from_points(vec![ExpressionPoint::new(0.0, 0.5)]),
+                }],
+            },
+            ..note(pitch, false)
+        }
+    }
+
+    #[test]
+    fn v45_note_expression_round_trips_without_a_channel_identity() {
+        let mut w = FbWriter::new();
+        encode_midi_note(&mut w, &note_with_note_expression(60));
+        let bytes = w.into_bytes();
+        let mut r = FbReader::new(&bytes);
+        let decoded = decode_midi_note(&mut r, PROJECT_VERSION).unwrap();
+        assert_eq!(decoded.expression.pitch.points.len(), 2);
+        assert_eq!(
+            decoded.expression.pitch.points[0].interpolation,
+            ExpressionInterpolation::Step
+        );
+        assert_eq!(decoded.expression.pressure.points[0].value, 0.2);
+        assert_eq!(decoded.expression.timbre.points[0].value, 0.8);
+        assert_eq!(decoded.expression.release_velocity, Some(0.65));
+        assert_eq!(decoded.expression.custom[0].controller, 12_345);
+        assert_eq!(decoded.expression.custom[0].name, "breath");
     }
 
     #[test]
@@ -3447,6 +3672,7 @@ mod tests {
             transient_preserve: false,
             transient_sensitivity: 0.65,
             reverse: true,
+            denoise_amount: 0.55,
             normalize_gain: true,
             fade_in_ms: 5.0,
             fade_out_ms: 12.5,
@@ -3467,6 +3693,22 @@ mod tests {
                     locked: false,
                 },
             ],
+            gain_envelope: ClipEnvelope {
+                points: vec![
+                    EnvelopePoint {
+                        id: 11,
+                        time: 0.0,
+                        value_db: -6.0,
+                        curve: EnvelopeCurve::Linear,
+                    },
+                    EnvelopePoint {
+                        id: 12,
+                        time: 0.75,
+                        value_db: 3.0,
+                        curve: EnvelopeCurve::SCurve,
+                    },
+                ],
+            },
         }
     }
 
@@ -3525,11 +3767,19 @@ mod tests {
         // v41 wrote an ARA presence byte per clip. v42 no longer writes it, but
         // the reader must still consume it or every field after the clip in a
         // v41 body would be read at the wrong offset.
-        let clip = empty_clip_with_stretch(sample_stretch());
+        let mut clip = empty_clip_with_stretch(sample_stretch());
+        // v41 predates the envelope block, so construct the legacy payload
+        // explicitly instead of appending v47 bytes to a v41 fixture.
+        clip.stretch.gain_envelope = ClipEnvelope::default();
+        // v47 added the envelope block and v48 appends de-noise after it;
+        // remove both trailers so the fixture really ends at the v41 boundary.
+        clip.stretch.denoise_amount = 0.0;
         let mut w = FbWriter::new();
         encode_clip(&mut w, &clip);
-        // Re-create a v41 clip body: the v42 encoding plus the old trailing byte.
+        // Re-create a v41 clip body: the current encoding without its v48
+        // trailer plus the old trailing byte.
         let mut v41 = w.into_bytes();
+        v41.truncate(v41.len().saturating_sub(2 * std::mem::size_of::<u32>()));
         v41.push(0);
         // A sentinel standing in for whatever followed the clip in a real body.
         v41.extend_from_slice(&7u32.to_le_bytes());

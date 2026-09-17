@@ -412,3 +412,19 @@ impl TimelineState {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn following_view_recenters_when_a_seek_moves_behind_it() {
+        let mut state = TimelineState::default();
+        state.update_viewport_size(1000.0, 400.0);
+        state.set_scroll_immediate(1000.0, 0.0, 5000.0, 0.0);
+
+        assert!(state.update_auto_scroll_for_playhead(0.0));
+        assert_eq!(state.viewport.scroll_x, 0.0);
+        assert_eq!(state.viewport.target_scroll_x, 0.0);
+    }
+}

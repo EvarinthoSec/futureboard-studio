@@ -38,12 +38,40 @@ pub fn render_project_sample(
     let beat = sample_to_beat(runtime, project_sample);
 
     for clip_index in 0..runtime.clips.len() {
-        let clip = &runtime.clips[clip_index];
-        if clip.muted {
+        let (
+            clip_muted,
+            clip_start_sample,
+            clip_duration_samples,
+            rel_params,
+            source,
+            track_index,
+            processor,
+            effective_time_ratio,
+        ) = {
+            let clip = &runtime.clips[clip_index];
+            (
+                clip.muted,
+                clip.start_sample,
+                clip.duration_samples,
+                (
+                    clip.offset_seconds,
+                    clip.source_read_rate,
+                    clip.reverse,
+                    clip.gain,
+                    clip.fade_in_samples,
+                    clip.fade_out_samples,
+                    clip.fade_in_curve,
+                    clip.fade_out_curve,
+                ),
+                Arc::clone(&clip.source),
+                clip.track_index,
+                clip.processor,
+                clip.effective_time_ratio,
+            )
+        };
+        if clip_muted {
             continue;
         }
-        let clip_start_sample = clip.start_sample;
-        let clip_duration_samples = clip.duration_samples;
         if project_sample < clip_start_sample {
             continue;
         }
@@ -52,18 +80,19 @@ pub fn render_project_sample(
             continue;
         }
 
-        let clip_offset_seconds = clip.offset_seconds;
-        let clip_source_read_rate = clip.source_read_rate;
-        let clip_reverse = clip.reverse;
-        let clip_gain = clip.gain;
-        let clip_fade_in = clip.fade_in_samples;
-        let clip_fade_out = clip.fade_out_samples;
-        let clip_fade_in_curve = clip.fade_in_curve;
-        let clip_fade_out_curve = clip.fade_out_curve;
-        let source = Arc::clone(&clip.source);
+        let (
+            clip_offset_seconds,
+            clip_source_read_rate,
+            clip_reverse,
+            clip_gain,
+            clip_fade_in,
+            clip_fade_out,
+            clip_fade_in_curve,
+            clip_fade_out_curve,
+        ) = rel_params;
 
         // Resolved at build time — no id lookup or String clone per sample.
-        let Some(track_index) = clip.track_index.filter(|&ti| ti < runtime.tracks.len()) else {
+        let Some(track_index) = track_index.filter(|&ti| ti < runtime.tracks.len()) else {
             continue;
         };
         if Some(track_index) == master_index {
@@ -83,8 +112,8 @@ pub fn render_project_sample(
             rel,
             clip_duration_samples,
             runtime.sample_rate,
-            if matches!(clip.processor, ClipDspProcessor::PhaseVocoderBasic) {
-                1.0 / clip.effective_time_ratio.max(0.01)
+            if matches!(processor, ClipDspProcessor::PhaseVocoderBasic) {
+                1.0 / effective_time_ratio.max(0.01)
             } else {
                 clip_source_read_rate
             },
@@ -104,9 +133,13 @@ pub fn render_project_sample(
             &source,
             source_pos,
             dry_source_pos,
-            clip.effective_time_ratio,
-            clip.processor,
+            effective_time_ratio,
+            processor,
         );
+        if rel == 0 {
+            runtime.clips[clip_index].denoise.reset();
+        }
+        (l, r) = runtime.clips[clip_index].denoise.process_stereo(l, r);
         if l == 0.0 && r == 0.0 {
             continue;
         }
@@ -823,6 +856,19 @@ fn render_signalsmith_clip_segment(
         return false;
     };
 
+    // All scratch storage is sized while the runtime graph is built. A device
+    // callback must never grow a Vec; if a future host presents a block larger
+    // than the prepared contract, fail closed and use the allocation-free
+    // fallback path for this segment.
+    if input_frames > clip.stretch_input_l.len()
+        || input_frames > clip.stretch_input_r.len()
+        || frames > clip.stretch_output_l.len()
+        || frames > clip.stretch_output_r.len()
+    {
+        clip.stretch_next_project_sample = None;
+        return false;
+    }
+
     // On a (re)start/discontinuity, latency-align the stretcher to this playback
     // position. `output_seek` pre-roll priming makes the *next* `process` output
     // line up with the timeline, so a high-latency preserve-pitch backend
@@ -832,9 +878,9 @@ fn render_signalsmith_clip_segment(
         let playback_rate = (1.0 / time_ratio.max(0.05)) as f32;
         let seek_len = processor.seek_input_len(playback_rate);
         if seek_len > 0 {
-            if clip.stretch_prime_l.len() < seek_len {
-                clip.stretch_prime_l.resize(seek_len, 0.0);
-                clip.stretch_prime_r.resize(seek_len, 0.0);
+            if seek_len > clip.stretch_prime_l.len() || seek_len > clip.stretch_prime_r.len() {
+                clip.stretch_next_project_sample = None;
+                return false;
             }
             // Pre-roll = the `seek_len` source frames ending just before `in_start`
             // (clamped/silent before the clip's source window).
@@ -851,15 +897,6 @@ fn render_signalsmith_clip_segment(
         } else {
             processor.reset();
         }
-    }
-
-    if clip.stretch_input_l.len() < input_frames {
-        clip.stretch_input_l.resize(input_frames, 0.0);
-        clip.stretch_input_r.resize(input_frames, 0.0);
-    }
-    if clip.stretch_output_l.len() < frames {
-        clip.stretch_output_l.resize(frames, 0.0);
-        clip.stretch_output_r.resize(frames, 0.0);
     }
 
     for k in 0..input_frames {
@@ -4222,6 +4259,7 @@ mod soundfont_instrument_tests {
                         length_beats: 0.5,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
@@ -4232,11 +4270,13 @@ mod soundfont_instrument_tests {
                         length_beats: 0.5,
                         velocity: 100,
                         channel: 0,
+                        expression: sphere_midi_service::NoteExpression::default(),
                         pitch_points: Vec::new(),
                         articulation: None,
                     },
                 ],
                 controllers: Vec::new(),
+                mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
             }],
             pdc_enabled: true,
             latency_graph_version: 1,

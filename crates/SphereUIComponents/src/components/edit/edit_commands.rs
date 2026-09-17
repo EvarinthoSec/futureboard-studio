@@ -8,6 +8,7 @@ use crate::components::timeline::timeline_state::{
     TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState, TimelineState,
     TrackState,
 };
+use sphere_midi_service::mpe::MpeTrackConfiguration;
 
 /// How a command's effect has to be propagated after execute / undo / redo.
 ///
@@ -289,6 +290,12 @@ pub enum EditCommand {
         prev: bool,
         next: bool,
     },
+    /// Change a track's MPE output mode, zone size, or pitch-bend ranges.
+    SetTrackMpeConfiguration {
+        track_id: String,
+        prev: MpeTrackConfiguration,
+        next: MpeTrackConfiguration,
+    },
     /// Replace only the affected Song Text events. Empty `previous` creates,
     /// empty `next` deletes, and populated snapshots edit/move atomically.
     SetSongTextEvents {
@@ -419,6 +426,7 @@ impl EditCommand {
             EditCommand::SetTrackVolume { .. } => "Set Volume",
             EditCommand::SetTrackPan { .. } => "Set Pan",
             EditCommand::SetTrackVolumeAutomationRead { .. } => "Set Volume Automation Read",
+            EditCommand::SetTrackMpeConfiguration { .. } => "Set MPE Configuration",
             EditCommand::SetSongTextEvents { label, .. } => label,
             EditCommand::SetTempoState { label, .. } => label,
             EditCommand::SetTimeSignatureState { label, .. } => label,
@@ -591,6 +599,9 @@ impl EditCommand {
                 state.set_track_volume_automation_read(track_id, *next);
                 state.recompute_effective_volumes(beat, "automation_read_edit");
             }
+            EditCommand::SetTrackMpeConfiguration { track_id, next, .. } => {
+                state.set_track_mpe_configuration(track_id, *next);
+            }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, previous, next);
             }
@@ -743,6 +754,9 @@ impl EditCommand {
                 let beat = state.transport.playhead_beats;
                 state.set_track_volume_automation_read(track_id, *prev);
                 state.recompute_effective_volumes(beat, "automation_read_edit");
+            }
+            EditCommand::SetTrackMpeConfiguration { track_id, prev, .. } => {
+                state.set_track_mpe_configuration(track_id, *prev);
             }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, next, previous);

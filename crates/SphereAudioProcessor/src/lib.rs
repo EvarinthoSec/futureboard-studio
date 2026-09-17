@@ -8,6 +8,7 @@
 //! surface from `SphereStemExtractor` for the Stem Extractor dialog and jobs.
 
 pub mod analysis;
+pub mod denoise;
 pub mod ffi;
 pub mod stem;
 pub mod stretching;
@@ -17,6 +18,8 @@ pub use analysis::{
     InstrumentEstimate, KeyEstimate, KeyMode, PitchClass, SpectralFeatures, TempoEstimate,
     analyze_mono, analyze_mono_with, analyze_stereo,
 };
+
+pub use denoise::DenoiseProcessor;
 
 pub use stem::{
     InferBackendKind, InferDevice, STEM_MODELS, StemExtractCancelToken, StemExtractError,

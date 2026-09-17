@@ -25,6 +25,7 @@
 //! its note for free and rides the existing `EditMidiNotes` undo entry.
 
 use super::*;
+use sphere_midi_service::{ExpressionCurve, NoteExpressionLane};
 
 /// Breakpoints used to resample a Smooth segment that a split cuts through.
 /// Enough to keep the eased shape visually identical without turning one split
@@ -558,6 +559,63 @@ impl TimelineState {
         self.midi_note(clip_id, note_id)
             .and_then(|note| note.pitch_curve.clone())
             .unwrap_or_default()
+    }
+
+    /// Clone one protocol-neutral, note-owned expression lane by stable id.
+    pub fn note_expression_curve(
+        &self,
+        clip_id: &str,
+        note_id: u64,
+        lane: NoteExpressionLane,
+    ) -> ExpressionCurve {
+        self.midi_note(clip_id, note_id)
+            .map(|note| match lane {
+                NoteExpressionLane::Pitch => note.expression.pitch.clone(),
+                NoteExpressionLane::Pressure => note.expression.pressure.clone(),
+                NoteExpressionLane::Timbre => note.expression.timbre.clone(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// Replace one note-owned expression lane for a set of note ids. The
+    /// caller can place before/after snapshots in `EditMidiNotes` to make a
+    /// complete expression gesture one undo step.
+    pub fn set_midi_notes_expression_curve(
+        &mut self,
+        clip_id: &str,
+        ids: &[u64],
+        lane: NoteExpressionLane,
+        curve: &ExpressionCurve,
+    ) -> usize {
+        let Some(notes) = self.midi_clip_notes_mut(clip_id) else {
+            return 0;
+        };
+        let mut changed = 0;
+        for note in notes.iter_mut() {
+            if !ids.contains(&note.id) {
+                continue;
+            }
+            let target = match lane {
+                NoteExpressionLane::Pitch => &mut note.expression.pitch,
+                NoteExpressionLane::Pressure => &mut note.expression.pressure,
+                NoteExpressionLane::Timbre => &mut note.expression.timbre,
+            };
+            if target != curve {
+                *target = curve.clone();
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Clear one note-owned expression lane for a set of note ids.
+    pub fn reset_midi_notes_expression_lane(
+        &mut self,
+        clip_id: &str,
+        ids: &[u64],
+        lane: NoteExpressionLane,
+    ) -> usize {
+        self.set_midi_notes_expression_curve(clip_id, ids, lane, &ExpressionCurve::default())
     }
 
     /// Sounding pitch of `note` at `beat` beats from the note start, expressed

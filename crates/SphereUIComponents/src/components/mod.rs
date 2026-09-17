@@ -6,6 +6,7 @@ pub mod audio_connections_panel;
 pub mod audio_connections_window;
 mod audio_editor_adapter;
 mod audio_editor_host;
+mod audio_editor_spectrogram;
 pub mod background_tasks;
 mod bottom_panel;
 mod bottom_panel_shell;
