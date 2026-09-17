@@ -14,6 +14,7 @@
 //! executables are built in one invocation and discovered from Cargo messages.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +22,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
-use crate::platform::Edition;
+use crate::platform::{Edition, host_target};
 use crate::toolchain;
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
@@ -88,12 +89,23 @@ pub fn build(
     cef_path: Option<&Path>,
 ) -> Result<BuildOutput> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let target_is_macos = target
-        .map(|triple| triple.ends_with("apple-darwin"))
-        .unwrap_or(cfg!(target_os = "macos"));
+    let workspace = workspace_root();
+    let target_dir = workspace.join(edition.target_dir());
+    let target_triple = match target {
+        Some(target) => target.to_owned(),
+        None => host_target()?,
+    };
+    let target_is_macos = target_triple.ends_with("apple-darwin");
 
     let mut command = Command::new(&cargo);
     command
+        .current_dir(&workspace)
+        // Build scripts do not receive Cargo's `--target-dir` CLI value in
+        // `CARGO_TARGET_DIR`. Crashpad's prebuilt setup uses that environment
+        // variable when copying crashpad_handler, so keep both paths explicit
+        // and identical or the handler lands under apps/native/target instead
+        // of the edition target used by the package.
+        .env("CARGO_TARGET_DIR", &target_dir)
         .arg("build")
         .arg("--message-format=json-render-diagnostics")
         .args(["--package", APP_PACKAGE])
@@ -101,7 +113,20 @@ pub fn build(
         .args(["--package", APAK_PACKAGE])
         .args(["--bin", APP_BINARY])
         .args(["--profile", profile])
-        .args(["--target-dir", edition.target_dir()]);
+        .arg("--target-dir")
+        .arg(&target_dir);
+
+    if target_triple.contains("windows") && target_triple.contains("msvc") {
+        // The pinned CEF SDK defaults its wrapper to /MT, while the prebuilt
+        // Crashpad libraries use /MD. Give cmake-rs a target-specific toolchain
+        // so the CEF wrapper uses the same CRT and can link into the DAW.
+        let cmake_toolchain = workspace.join("xtask/cef-msvc-dynamic-runtime.cmake");
+        reset_stale_cef_wrapper(&cargo, &workspace, &target_dir, target, profile)?;
+        command.env(
+            format!("CMAKE_TOOLCHAIN_FILE_{}", target_triple.replace('-', "_")),
+            &cmake_toolchain,
+        );
+    }
 
     for bin in SIDECAR_BINARIES {
         command.args(["--bin", bin]);
@@ -215,6 +240,102 @@ pub fn build(
         sidecar_executables,
         cef_helper_executable,
         apak_executables,
+    })
+}
+
+/// Remove only the generated CEF wrapper build when an older CMake cache still
+/// has the static MSVC CRT selected. This makes the new Crashpad/CEF runtime
+/// alignment self-healing for developers upgrading an existing target tree;
+/// clean checkouts simply skip this step.
+fn reset_stale_cef_wrapper(
+    cargo: &str,
+    workspace: &Path,
+    target_dir: &Path,
+    target: Option<&str>,
+    profile: &str,
+) -> Result<()> {
+    let profile_dir = match target {
+        Some(target) => target_dir.join(target).join(profile),
+        None => target_dir.join(profile),
+    };
+    let build_dir = profile_dir.join("build");
+    let entries = match fs::read_dir(&build_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect CEF build cache at {}",
+                    build_dir.display()
+                )
+            });
+        }
+    };
+
+    let mut stale = false;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect CEF build cache at {}",
+                build_dir.display()
+            )
+        })?;
+        if !entry.file_type()?.is_dir()
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cef-dll-sys-")
+        {
+            continue;
+        }
+
+        let cache = entry
+            .path()
+            .join("out")
+            .join("build")
+            .join("CMakeCache.txt");
+        if !cache.is_file() {
+            continue;
+        }
+        let contents = fs::read_to_string(&cache)
+            .with_context(|| format!("failed to read CEF CMake cache {}", cache.display()))?;
+        let crt = cmake_cache_value(&contents, "CMAKE_MSVC_RUNTIME_LIBRARY");
+        let cef_crt = cmake_cache_value(&contents, "CEF_RUNTIME_LIBRARY_FLAG");
+        if crt != Some("MultiThreadedDLL") || cef_crt != Some("/MD") {
+            stale = true;
+            break;
+        }
+    }
+
+    if !stale {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[xtask] resetting stale CEF wrapper cache in {} to align with Crashpad (/MD)",
+        profile_dir.display()
+    );
+    let status = Command::new(cargo)
+        .current_dir(workspace)
+        .args(["clean", "--package", "cef-dll-sys", "--target-dir"])
+        .arg(target_dir)
+        .status()
+        .with_context(|| "failed to reset the stale CEF wrapper build")?;
+    if !status.success() {
+        bail!("cargo clean for the stale CEF wrapper failed with {status}");
+    }
+    Ok(())
+}
+
+fn cmake_cache_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (name, value) = line.split_once('=')?;
+        let name = name.split_once(':')?.0;
+        (name == key).then_some(value.trim())
     })
 }
 

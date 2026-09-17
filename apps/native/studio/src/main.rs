@@ -2,6 +2,7 @@
 
 mod app;
 mod audio_state;
+mod crash_reporting;
 mod updater;
 mod window;
 
@@ -45,6 +46,11 @@ fn main() {
     // Community and Professional Edition both block elevated launches. Developer
     // builds may opt in with `--features allow_elevated_for_testing`.
     platform::abort_if_elevated();
+
+    // Install Crashpad before account, plugin, audio, or window initialization.
+    // CEF helper processes have already exited from the dispatch above, so only
+    // the browser/main process reaches this point.
+    crash_reporting::install();
 
     // A Futureboard account is not an entitlement, so sign-in is installed for
     // every edition. Runs before the Professional install so a licensed build

@@ -2,9 +2,9 @@
 //! atomically into `out/`.
 //!
 //! Nothing here copies the Cargo target tree wholesale — only the executable,
-//! known runtime sibling libraries, generated directories and metadata are
-//! staged. Publishing swaps directories with a rename so a failed package never
-//! leaves the final output half-written.
+//! known runtime files, generated directories and metadata are staged.
+//! Publishing swaps directories with a rename so a failed package never leaves
+//! the final output half-written.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -22,11 +22,11 @@ pub const SYMBOLS_DIR: &str = "symbols";
 /// Metadata filename.
 pub const BUILD_INFO_FILE: &str = "build-info.json";
 
-/// Runtime shared libraries the app loads next to its binary. Staged only when
-/// present beside the built executable (e.g. `onnxruntime.dll` fetched by the
-/// studio build script for the MDX-NET stem backend). Absence is not an error —
-/// the app falls back to its spectral stub.
-const RUNTIME_SIBLING_LIBS: &[&str] = &[
+/// Optional runtime shared libraries the app loads next to its binary. Staged
+/// only when present beside the built executable (e.g. `onnxruntime.dll`
+/// fetched by the studio build script for the MDX-NET stem backend). Absence is
+/// not an error — the app falls back to its spectral stub.
+const RUNTIME_SIBLINGS: &[&str] = &[
     "onnxruntime.dll",
     "libonnxruntime.so",
     "libonnxruntime.dylib",
@@ -123,14 +123,14 @@ fn executable_file_name(executable: &Path) -> Result<String> {
         .map(str::to_string)
 }
 
-/// Copy any known runtime sibling libraries found next to the executable.
+/// Copy optional runtime sibling libraries found next to the executable.
 /// Returns the file names that were staged.
 pub fn stage_runtime_siblings(staging_dir: &Path, executable: &Path) -> Result<Vec<String>> {
     let source_dir = executable
         .parent()
         .context("executable has no parent directory")?;
     let mut staged = Vec::new();
-    for lib in RUNTIME_SIBLING_LIBS {
+    for lib in RUNTIME_SIBLINGS {
         let candidate = source_dir.join(lib);
         if candidate.is_file() {
             copy_into(staging_dir, lib, &candidate)?;
@@ -138,6 +138,37 @@ pub fn stage_runtime_siblings(staging_dir: &Path, executable: &Path) -> Result<V
         }
     }
     Ok(staged)
+}
+
+/// Copy the Crashpad handler next to the application binary.
+///
+/// Crashpad is part of every desktop Studio package, so a missing handler is a
+/// packaging error rather than an optional runtime dependency. The prebuilt
+/// Crashpad build script places this file in the same target/profile directory
+/// as the application when `CARGO_TARGET_DIR` is propagated by `xtask`.
+pub fn stage_crashpad_handler(
+    staging_dir: &Path,
+    executable: &Path,
+    target: &str,
+) -> Result<String> {
+    let handler_name = if target.contains("windows") {
+        "crashpad_handler.exe"
+    } else {
+        "crashpad_handler"
+    };
+    let source_dir = executable
+        .parent()
+        .context("executable has no parent directory")?;
+    let source = source_dir.join(handler_name);
+    if !source.is_file() {
+        bail!(
+            "Crashpad handler `{handler_name}` is missing beside {}: {}",
+            executable.display(),
+            source.display()
+        );
+    }
+    copy_into(staging_dir, handler_name, &source)?;
+    Ok(handler_name.to_string())
 }
 
 /// Create the application directories (`bin/`, `Plugins/`, `Resources/`).
@@ -344,6 +375,38 @@ mod tests {
 
         assert_eq!(relative, "bin/apak.exe");
         assert_eq!(fs::read(staging_dir.join(&relative)).unwrap(), b"MZ");
+    }
+
+    #[test]
+    fn stage_crashpad_handler_copies_target_specific_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("artifacts");
+        let staging_dir = temp.path().join("stage");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+        let source = source_dir.join("FutureboardNative.exe");
+        fs::write(&source, b"MZ").unwrap();
+        fs::write(source_dir.join("crashpad_handler.exe"), b"MZ handler").unwrap();
+
+        let staged =
+            stage_crashpad_handler(&staging_dir, &source, "x86_64-pc-windows-msvc").unwrap();
+
+        assert_eq!(staged, "crashpad_handler.exe");
+        assert_eq!(fs::read(staging_dir.join(staged)).unwrap(), b"MZ handler");
+    }
+
+    #[test]
+    fn stage_crashpad_handler_requires_the_built_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("FutureboardNative");
+        let staging_dir = temp.path().join("stage");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(&source, b"ELF").unwrap();
+
+        let error =
+            stage_crashpad_handler(&staging_dir, &source, "x86_64-unknown-linux-gnu").unwrap_err();
+
+        assert!(error.to_string().contains("Crashpad handler"));
     }
 
     #[test]

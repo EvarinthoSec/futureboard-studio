@@ -46,6 +46,7 @@ out/
 │     ├─ v8_context_snapshot.bin
 │     ├─ locales/                     # the one CEF subdirectory Chromium requires
 │     ├─ onnxruntime.dll              # staged only if present beside the binary
+│     ├─ crashpad_handler.exe         # Crashpad handler bundled with Studio
 │     ├─ Plugins/                     # Built-in Plugin dynamic libraries (with `--plugins`)
 │     │  ├─ c1073.dll                  # each is one cdylib — DSP + (optional) embedded React UI
 │     │  ├─ compresser.dll             # (no CEF, no PluginUI/ — CEF is shared at the app root)
@@ -225,9 +226,13 @@ Runtime files are staged explicitly, not by scraping `target/`:
   them next to its own binary at runtime. They are separate `[[bin]]` targets of
   the `sphere-plugin-host` package, built in the same cargo invocation and
   staged beside the app. Add more via `SIDECAR_BINARIES` in `src/cargo_build.rs`.
-- **Sibling shared libraries** — add names to `RUNTIME_SIBLING_LIBS` in
+- **Sibling shared libraries** — add names to `RUNTIME_SIBLINGS` in
   `src/staging.rs`. They are staged only when found next to the built binary
   (this is how `onnxruntime.dll` is picked up).
+- **Crashpad handler** — `crashpad_handler.exe` on Windows and
+  `crashpad_handler` on Unix are required beside the Studio binary. `xtask`
+  propagates `CARGO_TARGET_DIR` so the prebuilt Crashpad build script places
+  the handler in the same target/profile directory that packaging consumes.
 - **Resource files** — copy them into the `Resources/` directory during staging
   (extend `create_layout_dirs` / add a copy step in `src/package.rs`).
 - **Binary plugins** — Built-in Plugin dynamic libraries are discovered from

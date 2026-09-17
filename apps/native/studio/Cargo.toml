@@ -38,6 +38,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ureq.workspace = true
+crashpad-rs.workspace = true
 # CEF host for built-in plugin editors. Optional: linking it requires the CEF
 # SDK in `build/cef` (populate with SphereWebView's `install_cef` example).
 sphere-webview = { workspace = true, optional = true, features = ["cef-runtime"] }
@@ -122,6 +123,7 @@ professional = [
 
 [build-dependencies]
 embed-resource.workspace = true
+crashpad-handler-bundler.workspace = true
 # Build-time ONNX Runtime download (feature = "stem-onnx"): fetch + extract the
 # platform library next to the built binary.
 ureq.workspace = true

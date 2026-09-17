@@ -177,9 +177,12 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     }
 
     let siblings = staging::stage_runtime_siblings(&plan.staging_dir, executable)?;
-    for lib in &siblings {
-        eprintln!("[xtask] staged runtime library: {lib}");
+    for sibling in &siblings {
+        eprintln!("[xtask] staged runtime library: {sibling}");
     }
+    let crashpad_handler =
+        staging::stage_crashpad_handler(&plan.staging_dir, executable, &target_triple)?;
+    eprintln!("[xtask] staged Crashpad handler: {crashpad_handler}");
 
     // 4. Create expected directories.
     staging::create_layout_dirs(&plan.staging_dir)?;

@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    crashpad_handler_bundler::bundle().expect("failed to bundle crashpad_handler");
+
     println!("cargo:rerun-if-changed=../../../packages/shared/app/windows/app.rc");
     println!("cargo:rerun-if-changed=../../../packages/shared/app/windows/app.manifest");
     println!("cargo:rerun-if-changed=../../../packages/shared/app/icons/icon.ico");
