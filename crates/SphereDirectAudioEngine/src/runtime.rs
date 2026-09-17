@@ -19,21 +19,21 @@ use solfege_event::Event as SolfegeEvent;
 use solfege_model::SfmFile;
 use sphere_midi_service::mpe::{MpeChannelAllocator, MpeZone};
 
-use crate::audio_graph::{GraphValidationError, RuntimeAudioGraph, plan_runtime_audio_graph};
-use crate::audio_source::{ClipAudioSource, open_clip_audio_source};
+use crate::audio_graph::{plan_runtime_audio_graph, GraphValidationError, RuntimeAudioGraph};
+use crate::audio_source::{open_clip_audio_source, ClipAudioSource};
 use crate::latency_graph::{
-    RuntimeLatencyGraph, plan_runtime_latency_graph, recompute_runtime_latency_graph,
-    resolve_latency_routing_indices,
-};
-use SphereAudioProcessor::{
-    StretchAlgorithm, StretchBackend, StretchMode, StretchParams, StretchProcessor,
-    create_stretch_processor, effective_pitch_ratio, effective_time_ratio, resolve_backend,
-    source_read_rate_for_repitch, stretched_duration_samples,
+    plan_runtime_latency_graph, recompute_runtime_latency_graph, resolve_latency_routing_indices,
+    RuntimeLatencyGraph,
 };
 use serde_json::Value;
-use sphere_audio_plugins::{AudioPluginDspState, canonical_plugin_id, should_rebuild_state};
+use sphere_audio_plugins::{canonical_plugin_id, should_rebuild_state, AudioPluginDspState};
 use sphere_soundfont_player::{
     SoundFont, SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerSettings, SoundfontRenderQuality,
+};
+use SphereAudioProcessor::{
+    create_stretch_processor, effective_pitch_ratio, effective_time_ratio, resolve_backend,
+    source_read_rate_for_repitch, stretched_duration_samples, DenoiseProcessor, StretchAlgorithm,
+    StretchBackend, StretchMode, StretchParams, StretchProcessor,
 };
 
 use crate::tempo_map::{RuntimeTempoMapSnapshot, TempoMap, TempoPoint};
@@ -41,7 +41,7 @@ use crate::types::{
     EngineAutomationLaneSnapshot, EngineClipAudioProcess, EngineClipSnapshot,
     EngineMidiClipSnapshot, EngineProjectSnapshot, EngineSolfegeSnapshot, EngineTrackSnapshot,
 };
-use crate::vst3_processor::{Vst3MidiEvent, Vst3RuntimeProcessor, vst3_midi_debug_enabled};
+use crate::vst3_processor::{vst3_midi_debug_enabled, Vst3MidiEvent, Vst3RuntimeProcessor};
 
 /// `FUTUREBOARD_MIDI_ENGINE_DEBUG=1` enables eprintln traces for MIDI runtime
 /// build + per-block scheduling. Cached on first read so the audio callback
@@ -1632,6 +1632,9 @@ pub struct RuntimeClip {
     /// `audio_process.reverse`). The render maps output → source from the clip
     /// end instead of the start; `speed_ratio` is unchanged.
     pub reverse: bool,
+    /// Per-clip adaptive de-noise state. It is prepared with the runtime graph
+    /// and only mutated by the render thread, so the callback never allocates.
+    pub denoise: DenoiseProcessor,
     /// Clip-level mute — a muted clip is skipped entirely during render.
     pub muted: bool,
     /// An ARA plug-in owns this clip's playback.
@@ -1716,6 +1719,7 @@ impl Clone for RuntimeClip {
             warp_markers: self.warp_markers.clone(),
             processor: self.processor,
             reverse: self.reverse,
+            denoise: DenoiseProcessor::new(self.denoise.sample_rate(), self.denoise.amount()),
             muted: self.muted,
             ara_rendered: self.ara_rendered,
             fade_in_samples: self.fade_in_samples,
@@ -1728,8 +1732,8 @@ impl Clone for RuntimeClip {
                 self.source.sample_rate(),
                 &self.stretch,
             ),
-            stretch_input_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
-            stretch_input_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
+            stretch_input_l: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
+            stretch_input_r: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
             stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_prime_l: vec![0.0; self.stretch_prime_l.len()],
@@ -1737,6 +1741,23 @@ impl Clone for RuntimeClip {
             stretch_next_project_sample: None,
         }
     }
+}
+
+/// Capacity required for the largest source span a stretcher can consume for
+/// one engine block. The reciprocal is intentionally bounded by the same
+/// policy as SphereAudioProcessor, so an invalid project value cannot trigger
+/// an unbounded allocation here.
+fn stretch_input_capacity(time_ratio: f32) -> usize {
+    let ratio = if time_ratio.is_finite() && time_ratio > 0.0 {
+        time_ratio.clamp(0.05, 20.0) as f64
+    } else {
+        1.0
+    };
+    let source_frames = (DEFAULT_AUDIO_BLOCK_CAPACITY as f64 / ratio).ceil();
+    source_frames
+        .min((DEFAULT_AUDIO_BLOCK_CAPACITY * 20) as f64)
+        .max(1.0) as usize
+        + 2
 }
 
 pub type AudioClip = EngineClipSnapshot;
@@ -5064,14 +5085,15 @@ pub fn resolve_clip_processor(mode: &str, preserve_pitch: bool) -> ClipDspProces
 }
 
 fn resolved_clip_stretch_params(clip: &EngineClipSnapshot) -> StretchParams {
-    if clip.stretch != StretchParams::default() {
-        return clip.stretch.clone();
-    }
-
-    clip.audio_process
-        .as_ref()
-        .map(legacy_process_stretch_params)
-        .unwrap_or_default()
+    let params = if clip.stretch != StretchParams::default() {
+        clip.stretch.clone()
+    } else {
+        clip.audio_process
+            .as_ref()
+            .map(legacy_process_stretch_params)
+            .unwrap_or_default()
+    };
+    params.sanitized()
 }
 
 fn legacy_process_stretch_params(process: &EngineClipAudioProcess) -> StretchParams {
@@ -5239,6 +5261,7 @@ mod stretch_runtime_tests {
             source_end_samples: 48_000,
             warp_markers: Vec::new(),
             reverse: false,
+            denoise_amount: 0.0,
         });
         let migrated = resolved_clip_stretch_params(&clip);
         assert_eq!(migrated.mode, StretchMode::Manual);
@@ -5651,6 +5674,12 @@ fn build_clip_runtime(
         .as_ref()
         .map(|p| p.reverse)
         .unwrap_or(false);
+    let denoise_amount = clip
+        .audio_process
+        .as_ref()
+        .map(|p| p.denoise_amount)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
     let source_start_samples = clip
         .audio_process
         .as_ref()
@@ -5758,6 +5787,7 @@ fn build_clip_runtime(
         warp_markers,
         processor,
         reverse,
+        denoise: DenoiseProcessor::new(output_sample_rate, denoise_amount),
         muted: clip.muted,
         fade_in_samples,
         fade_out_samples,
@@ -5773,8 +5803,8 @@ fn build_clip_runtime(
             .unwrap_or_default(),
         source,
         stretch_processor,
-        stretch_input_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
-        stretch_input_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
+        stretch_input_l: vec![0.0; stretch_input_capacity(effective_time_ratio)],
+        stretch_input_r: vec![0.0; stretch_input_capacity(effective_time_ratio)],
         stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_prime_l: vec![0.0; stretch_prime_len],
@@ -6084,12 +6114,10 @@ mod midi_tests {
 
         let p = project_with(vec![first, second]);
         let steal_sample = 108_000; // beat 4.5 at 120 BPM
-        assert!(
-            p.midi_tracks[0]
-                .events
-                .iter()
-                .all(|event| { event.note_id != 1 || event.sample <= steal_sample })
-        );
+        assert!(p.midi_tracks[0]
+            .events
+            .iter()
+            .all(|event| { event.note_id != 1 || event.sample <= steal_sample }));
         assert!(p.midi_tracks[0].events.iter().any(|event| {
             event.note_id == 1
                 && event.kind == RuntimeMidiEventKind::NoteOff
@@ -6153,21 +6181,15 @@ mod midi_tests {
                     && event.kind == RuntimeMidiEventKind::ControlChange
             })
             .collect::<Vec<_>>();
-        assert!(
-            reset
-                .iter()
-                .any(|event| { event.cc_number == 129 && (event.cc_value - 0.5).abs() < 0.001 })
-        );
-        assert!(
-            reset
-                .iter()
-                .any(|event| event.cc_number == 128 && event.cc_value == 0.0)
-        );
-        assert!(
-            reset
-                .iter()
-                .any(|event| event.cc_number == 74 && event.cc_value == 0.0)
-        );
+        assert!(reset
+            .iter()
+            .any(|event| { event.cc_number == 129 && (event.cc_value - 0.5).abs() < 0.001 }));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 128 && event.cc_value == 0.0));
+        assert!(reset
+            .iter()
+            .any(|event| event.cc_number == 74 && event.cc_value == 0.0));
     }
 
     #[test]

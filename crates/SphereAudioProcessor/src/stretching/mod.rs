@@ -114,6 +114,17 @@ mod tests {
     }
 
     #[test]
+    fn source_read_rate_off_ignores_stale_pitch_data() {
+        let params = StretchParams {
+            mode: StretchMode::Off,
+            algorithm: StretchAlgorithm::Off,
+            pitch_ratio: 2.0,
+            ..StretchParams::default()
+        };
+        approx(source_read_rate_for_repitch(&params, None), 1.0);
+    }
+
+    #[test]
     fn stretched_duration_samples_scales() {
         assert_eq!(
             stretched_duration_samples(48_000, &manual(2.0), None),

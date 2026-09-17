@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::components::timeline::timeline_state::{
-    AudioClipStretchState, AudioImportState, ClipState, ClipType, MIN_NOTE_BEATS,
-    MidiControllerLane, MidiNoteState, TrackAudioFormat, TrackState, TrackType,
+    AudioClipStretchState, AudioImportState, ClipState, ClipType, MidiControllerLane,
+    MidiNoteState, TrackAudioFormat, TrackState, TrackType, MIN_NOTE_BEATS,
 };
 use crate::components::timeline::waveform_cache::{self, WaveformPeak};
-use sphere_midi_service::MidiInputEvent;
 use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
+use sphere_midi_service::MidiInputEvent;
 
-use super::{RecordingPreviewUi, RecordingUiState, StudioLayout, audio_recording_preview_clip_id};
+use super::{audio_recording_preview_clip_id, RecordingPreviewUi, RecordingUiState, StudioLayout};
 use DirectAudio::types::{JsRecordingTrackConfig, JsStartRecordingConfig};
 
 /// Active recording-session UI state — the take's start position, the UI phase,
@@ -118,21 +118,6 @@ impl StudioLayout {
         } else {
             self.start_native_recording(cx);
         }
-    }
-
-    /// Whether any track is record-armed.
-    ///
-    /// What Space consults before deciding a press means Record rather than
-    /// Play. Arm state only, not input or monitoring: a track can be armed with
-    /// nothing plugged into it, and the transport should still behave the way
-    /// the arm button says it will.
-    pub(super) fn any_track_record_armed(&self, cx: &Context<Self>) -> bool {
-        self.timeline
-            .read(cx)
-            .state
-            .tracks
-            .iter()
-            .any(|track| track.armed)
     }
 
     pub(super) fn start_native_recording(&mut self, cx: &mut Context<Self>) {
@@ -1867,15 +1852,13 @@ mod tests {
 
         let device = input_device(4);
         let track = timeline.find_track(&track_id).unwrap();
-        assert!(
-            recording_input_channels_checked(
-                track,
-                &timeline.audio_connections,
-                std::slice::from_ref(&device),
-                Some(&device),
-            )
-            .is_err()
-        );
+        assert!(recording_input_channels_checked(
+            track,
+            &timeline.audio_connections,
+            std::slice::from_ref(&device),
+            Some(&device),
+        )
+        .is_err());
     }
 
     /// A connection whose device vanished must fail clearly rather than record

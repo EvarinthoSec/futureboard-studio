@@ -630,7 +630,8 @@ impl WindowTextSystem {
             return Ok(lines);
         }
 
-        let lines = Arc::new(self.shape_text_uncached(text, font_size, runs, wrap_width, line_clamp)?);
+        let lines =
+            Arc::new(self.shape_text_uncached(text, font_size, runs, wrap_width, line_clamp)?);
         self.shaped_text_cache.lock().insert(key, lines.clone());
         Ok(lines)
     }

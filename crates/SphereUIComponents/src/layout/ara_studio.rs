@@ -684,11 +684,31 @@ impl StudioLayout {
         self.selected_ara_session_key(cx)
     }
 
-    /// Session key for the track the selected clip sits on, when it has ARA.
+    /// Session key for the current ARA track.
+    ///
+    /// Clip selection is preferred because it identifies the exact edit target.
+    /// Selecting a track clears `selected_clip_ids`, though, so the primary
+    /// current track must be used as the fallback for the docked Editor tab.
     fn selected_ara_session_key(&self, cx: &gpui::App) -> Option<AraSessionKey> {
         let state = &self.timeline.read(cx).state;
-        let clip_id = state.selection.selected_clip_ids.first()?;
-        let (track, _) = state.find_clip(clip_id)?;
+        Self::selected_ara_session_key_from_state(state)
+    }
+
+    fn selected_ara_session_key_from_state(
+        state: &crate::components::timeline::timeline_state::TimelineState,
+    ) -> Option<AraSessionKey> {
+        let clip_track = state
+            .selection
+            .selected_clip_ids
+            .first()
+            .and_then(|clip_id| state.find_clip(clip_id).map(|(track, _)| track))
+            .filter(|track| track.ara.is_some());
+        let current_track = state
+            .selection
+            .selected_track_id
+            .as_deref()
+            .and_then(|track_id| state.tracks.iter().find(|track| track.id == track_id));
+        let track = clip_track.or(current_track)?;
         let binding = track.ara.as_ref()?;
         Some(AraSessionKey {
             plugin_id: binding.plugin_id.clone(),
@@ -823,6 +843,7 @@ impl StudioLayout {
                 self.active_bottom_tab(),
                 crate::components::BottomTab::Editor
             )
+            && self.clip_editor_panel.read(cx).ara_tab_active()
             && self.ara_panel_target(cx).is_some();
         if !showing && self.ara_editor.read(cx).is_attached() {
             // Deferred: this runs inside the layout's draw, and tearing a
@@ -838,5 +859,40 @@ impl StudioLayout {
 fn ara_trace(line: &str) {
     if std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some() {
         eprintln!("[ara-panel] {line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{AraTrackBinding, TimelineState};
+
+    #[test]
+    fn current_track_is_an_ara_target_without_a_selected_clip() {
+        let mut state = TimelineState::demo_project();
+        let track_id = state.tracks[0].id.clone();
+        state.tracks[0].ara = Some(AraTrackBinding {
+            plugin_id: "test-ara".to_string(),
+            plugin_path: "/tmp/test-ara.vst3".to_string(),
+            class_id: "test-class".to_string(),
+        });
+        state.select_track(&track_id);
+
+        assert_eq!(
+            StudioLayout::selected_ara_session_key_from_state(&state),
+            Some(AraSessionKey {
+                plugin_id: "test-ara".to_string(),
+                track_id,
+            })
+        );
+    }
+
+    #[test]
+    fn no_current_or_clip_ara_selection_has_no_target() {
+        let state = TimelineState::default();
+        assert_eq!(
+            StudioLayout::selected_ara_session_key_from_state(&state),
+            None
+        );
     }
 }

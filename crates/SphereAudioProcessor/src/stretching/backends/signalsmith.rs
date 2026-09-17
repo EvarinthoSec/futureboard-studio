@@ -74,7 +74,7 @@ impl StretchProcessor for SignalsmithProcessor {
     }
 
     fn set_params(&mut self, params: StretchParams) {
-        self.params = params;
+        self.params = params.sanitized();
     }
 
     fn latency_samples(&self) -> usize {
@@ -84,12 +84,14 @@ impl StretchProcessor for SignalsmithProcessor {
 
     fn seek_input_len(&self, playback_rate: f32) -> usize {
         let rate = if playback_rate.is_finite() && playback_rate > 0.0 {
-            playback_rate
+            playback_rate.clamp(0.05, 20.0)
         } else {
             1.0
         };
         let len = unsafe { fb_signalsmith_output_seek_length(self.handle.as_ptr(), rate) };
-        len.max(0) as usize
+        // A malformed bridge result must not turn into a huge realtime scratch
+        // allocation. At 192 kHz the default preset is still well below this.
+        len.clamp(0, 262_144) as usize
     }
 
     fn output_seek(&mut self, input_l: &[f32], input_r: &[f32]) {
@@ -149,6 +151,13 @@ impl StretchProcessor for SignalsmithProcessor {
         };
 
         if status == 0 {
+            // Native DSP is allowed to fail closed. Never let a NaN/Inf from a
+            // third-party kernel contaminate the rest of the graph.
+            for sample in output_l.iter_mut().chain(output_r.iter_mut()) {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                }
+            }
             Ok(())
         } else {
             Err(StretchError::BackendFailed(format!(

@@ -15,6 +15,7 @@ use super::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, StretchAlgorithm, StretchMode, WarpMarker,
 };
+use sphere_audio_editor::{ClipEnvelope, EnvelopeCurve, EnvelopePoint};
 use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 use sphere_midi_service::{
     CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint, NoteExpression,
@@ -112,7 +113,11 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// it and whether it is the one heard.
 /// v45 appends protocol-neutral per-note expression curves. v46 appends
 /// per-track MPE output settings at the tail of each track block.
-pub const PROJECT_VERSION: u32 = 46;
+/// v47 appends the non-destructive clip gain envelope to each audio stretch
+/// block. Pre-v47 clips load with an empty envelope.
+/// v48 appends the clip de-noise amount. Pre-v48 clips load with de-noise
+/// bypassed.
+pub const PROJECT_VERSION: u32 = 48;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -575,8 +580,8 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
     w.write_u8(n.articulation); // v25 (0 = none)
     w.write_u64(n.id); // v26 (0 = mint on load for legacy writers)
     w.write_u8(n.release_velocity); // v26 (0 = unset)
-    // v38: continuous pitch performance. Cent deviations keyed by beats from
-    // the note start, so the shape survives transposition and moves.
+                                    // v38: continuous pitch performance. Cent deviations keyed by beats from
+                                    // the note start, so the shape survives transposition and moves.
     w.write_u32(n.pitch_curve.len() as u32);
     for point in &n.pitch_curve {
         w.write_u64(point.id);
@@ -760,13 +765,28 @@ fn encode_stretch(w: &mut FbWriter, s: &AudioClipStretchState) {
     w.write_f32(s.fade_out_ms);
     w.write_f32(s.gain_db);
     w.write_f32(s.pan);
-    w.write_u32(s.warp_markers.len() as u32);
-    for m in &s.warp_markers {
+    let marker_count = s
+        .warp_markers
+        .len()
+        .min(AudioClipStretchState::MAX_WARP_MARKERS);
+    w.write_u32(marker_count as u32);
+    for m in s.warp_markers.iter().take(marker_count) {
         w.write_u64(m.id);
         w.write_u64(m.source_sample);
         w.write_f64(m.timeline_beat);
         w.write_bool(m.locked);
     }
+    let point_count = s.gain_envelope.points.len().min(ClipEnvelope::MAX_POINTS);
+    w.write_u32(point_count as u32);
+    for point in s.gain_envelope.points.iter().take(point_count) {
+        w.write_u64(point.id);
+        w.write_f32(point.time);
+        w.write_f32(point.value_db);
+        w.write_u8(point.curve.to_tag());
+    }
+    // v48: adaptive clip de-noise amount. It is appended so all earlier
+    // stretch fields retain their byte offsets for backwards compatibility.
+    w.write_f32(s.denoise_amount.clamp(0.0, 1.0));
 }
 
 fn encode_clip(w: &mut FbWriter, c: &ProjectClip) {
@@ -994,8 +1014,8 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     encode_soundfont_player(w, t.soundfont.as_ref()); // v28
     w.write_bool(t.volume_automation_read); // v32
     encode_solfege_engine(w, t.solfege.as_ref()); // v37
-    // v42: the track's ARA plug-in. Identity only â its edits live in the
-    // project-level document archive keyed by (plug-in, track).
+                                                  // v42: the track's ARA plug-in. Identity only â its edits live in the
+                                                  // project-level document archive keyed by (plug-in, track).
     match &t.ara {
         Some(ara) => {
             w.write_u8(1);
@@ -1877,7 +1897,7 @@ fn decode_sysex_event(r: &mut FbReader) -> Result<MidiSysExEvent, ProjectError> 
 }
 
 /// v16: per-clip stretch/pitch block. See [`encode_stretch`].
-fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectError> {
+fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchState, ProjectError> {
     let mode = StretchMode::from_tag(r.read_u8()?);
     let algorithm = StretchAlgorithm::from_tag(r.read_u8()?);
     let original_sample_rate = r.read_u32()?;
@@ -1902,16 +1922,44 @@ fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectErro
     let gain_db = r.read_f32()?;
     let pan = r.read_f32()?;
     let marker_count = r.read_u32()? as usize;
-    let mut warp_markers = Vec::with_capacity(marker_count);
-    for _ in 0..marker_count {
-        warp_markers.push(WarpMarker {
+    let retained_marker_count = marker_count.min(AudioClipStretchState::MAX_WARP_MARKERS);
+    let mut warp_markers = Vec::with_capacity(retained_marker_count);
+    for marker_index in 0..marker_count {
+        let marker = WarpMarker {
             id: r.read_u64()?,
             source_sample: r.read_u64()?,
             timeline_beat: r.read_f64()?,
             locked: r.read_bool()?,
-        });
+        };
+        if marker_index < retained_marker_count {
+            warp_markers.push(marker);
+        }
     }
-    Ok(AudioClipStretchState {
+    let gain_envelope = if version >= 47 {
+        let point_count = r.read_u32()? as usize;
+        let retained_point_count = point_count.min(ClipEnvelope::MAX_POINTS);
+        let mut points = Vec::with_capacity(retained_point_count);
+        for point_index in 0..point_count {
+            let point = EnvelopePoint {
+                id: r.read_u64()?,
+                time: r.read_f32()?,
+                value_db: r.read_f32()?,
+                curve: EnvelopeCurve::from_tag(r.read_u8()?),
+            };
+            if point_index < retained_point_count {
+                points.push(point);
+            }
+        }
+        ClipEnvelope { points }
+    } else {
+        ClipEnvelope::default()
+    };
+    let denoise_amount = if version >= 48 {
+        r.read_f32()?.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut stretch = AudioClipStretchState {
         mode,
         algorithm,
         original_sample_rate,
@@ -1938,7 +1986,11 @@ fn decode_stretch(r: &mut FbReader) -> Result<AudioClipStretchState, ProjectErro
         // Transient: a freshly loaded clip is not pending re-process.
         dirty: false,
         warp_markers,
-    })
+        gain_envelope,
+        denoise_amount,
+    };
+    stretch.sanitize_in_place();
+    Ok(stretch)
 }
 
 fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectError> {
@@ -2026,7 +2078,7 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
     // v16: stretch/pitch block trails the source. Older files have none and
     // default to an un-stretched clip.
     let stretch = if version >= 16 {
-        decode_stretch(r)?
+        decode_stretch(r, version)?
     } else {
         AudioClipStretchState::default()
     };
@@ -2917,12 +2969,10 @@ mod tests {
         encode_midi_note(&mut w, &note(60, false));
         let bytes = w.into_bytes();
         let mut r = FbReader::new(&bytes);
-        assert!(
-            decode_midi_note(&mut r, PROJECT_VERSION)
-                .unwrap()
-                .accent
-                .is_none()
-        );
+        assert!(decode_midi_note(&mut r, PROJECT_VERSION)
+            .unwrap()
+            .accent
+            .is_none());
     }
 
     /// A v38 file has no accent bytes at all. Reading it as v39 would consume
@@ -3622,6 +3672,7 @@ mod tests {
             transient_preserve: false,
             transient_sensitivity: 0.65,
             reverse: true,
+            denoise_amount: 0.55,
             normalize_gain: true,
             fade_in_ms: 5.0,
             fade_out_ms: 12.5,
@@ -3642,6 +3693,22 @@ mod tests {
                     locked: false,
                 },
             ],
+            gain_envelope: ClipEnvelope {
+                points: vec![
+                    EnvelopePoint {
+                        id: 11,
+                        time: 0.0,
+                        value_db: -6.0,
+                        curve: EnvelopeCurve::Linear,
+                    },
+                    EnvelopePoint {
+                        id: 12,
+                        time: 0.75,
+                        value_db: 3.0,
+                        curve: EnvelopeCurve::SCurve,
+                    },
+                ],
+            },
         }
     }
 
@@ -3700,11 +3767,19 @@ mod tests {
         // v41 wrote an ARA presence byte per clip. v42 no longer writes it, but
         // the reader must still consume it or every field after the clip in a
         // v41 body would be read at the wrong offset.
-        let clip = empty_clip_with_stretch(sample_stretch());
+        let mut clip = empty_clip_with_stretch(sample_stretch());
+        // v41 predates the envelope block, so construct the legacy payload
+        // explicitly instead of appending v47 bytes to a v41 fixture.
+        clip.stretch.gain_envelope = ClipEnvelope::default();
+        // v47 added the envelope block and v48 appends de-noise after it;
+        // remove both trailers so the fixture really ends at the v41 boundary.
+        clip.stretch.denoise_amount = 0.0;
         let mut w = FbWriter::new();
         encode_clip(&mut w, &clip);
-        // Re-create a v41 clip body: the v42 encoding plus the old trailing byte.
+        // Re-create a v41 clip body: the current encoding without its v48
+        // trailer plus the old trailing byte.
         let mut v41 = w.into_bytes();
+        v41.truncate(v41.len().saturating_sub(2 * std::mem::size_of::<u32>()));
         v41.push(0);
         // A sentinel standing in for whatever followed the clip in a real body.
         v41.extend_from_slice(&7u32.to_le_bytes());

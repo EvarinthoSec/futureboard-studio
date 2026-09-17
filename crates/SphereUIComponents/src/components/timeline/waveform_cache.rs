@@ -246,6 +246,16 @@ pub fn get_file_status(path: &str) -> WaveformDisplayStatus {
     }
 }
 
+/// Read the immutable source metadata for an already-known asset without
+/// exposing the cache entry or its chunk storage to UI callers.
+pub fn get_file_meta(asset_key: &str) -> Option<Arc<WaveformFileMeta>> {
+    file_cache()
+        .lock()
+        .ok()?
+        .get(asset_key)
+        .and_then(|entry| entry.meta.clone())
+}
+
 /// The coarsest shipped LOD that still puts [`PEAKS_PER_COLUMN`] peaks behind
 /// every pixel column.
 ///

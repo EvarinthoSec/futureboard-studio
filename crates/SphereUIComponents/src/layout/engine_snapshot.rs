@@ -1,9 +1,9 @@
 use crate::components::plugin_picker::STUB_PLUGIN_ID;
 use crate::components::timeline::timeline_state::{
-    self, ClipState, ClipType, InsertSlotState, MASTER_TRACK_ID, MidiControllerKind, StretchMode,
-    TimelineState, TrackState, TrackType, vsti_output_bus_flat_range,
-    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
-    vsti_output_child_track_id,
+    self, vsti_output_bus_flat_range, vsti_output_bus_strip_indices,
+    vsti_output_child_channels_for_bus_layout, vsti_output_child_track_id, ClipState, ClipType,
+    InsertSlotState, MidiControllerKind, StretchMode, TimelineState, TrackState, TrackType,
+    MASTER_TRACK_ID,
 };
 
 use DirectAudio::types::{
@@ -742,7 +742,11 @@ fn vsti_output_children_json(slot: &InsertSlotState) -> serde_json::Value {
                 let (channel_l, channel_r) =
                     vsti_output_child_channels_for_bus_layout(bus_counts, bus_index)?;
                 let channel_count = if bus_counts.len() == 1 && bus_counts[0] > 2 {
-                    if channel_l == channel_r { 1 } else { 2 }
+                    if channel_l == channel_r {
+                        1
+                    } else {
+                        2
+                    }
                 } else if bus_counts.is_empty() {
                     2
                 } else {
@@ -1105,6 +1109,7 @@ fn build_engine_project_snapshot_inner(
                             markers
                         },
                         reverse: stretch.reverse,
+                        denoise_amount: stretch.denoise_amount.clamp(0.0, 1.0),
                     }),
                 })
             })
@@ -1941,7 +1946,7 @@ mod tests {
     #[test]
     fn vsti_multiout_children_are_stable_tracks_and_engine_routes() {
         use crate::components::timeline::timeline_state::{
-            InsertPluginFormat, vsti_output_child_track_id,
+            vsti_output_child_track_id, InsertPluginFormat,
         };
 
         let mut state = TimelineState::default();
@@ -2022,7 +2027,7 @@ mod tests {
     #[test]
     fn substrip_fx_insert_serializes_into_engine_snapshot() {
         use crate::components::timeline::timeline_state::{
-            InsertPluginFormat, vsti_output_child_track_id,
+            vsti_output_child_track_id, InsertPluginFormat,
         };
 
         let mut state = TimelineState::default();
@@ -2095,7 +2100,7 @@ mod tests {
     #[test]
     fn single_multichannel_vsti_bus_exports_flat_pair_children() {
         use crate::components::timeline::timeline_state::{
-            InsertPluginFormat, vsti_output_child_track_id,
+            vsti_output_child_track_id, InsertPluginFormat,
         };
 
         let mut state = TimelineState::default();

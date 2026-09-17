@@ -389,7 +389,10 @@ fn dump_census(frame: u64) {
             tally.nodes as f64 / frames
         );
     }
-    let _ = writeln!(report, "[element-census] --- text measure cost by label ---");
+    let _ = writeln!(
+        report,
+        "[element-census] --- text measure cost by label ---"
+    );
     for (text, tally) in texts.iter().take(CENSUS_ROWS) {
         let _ = writeln!(
             report,

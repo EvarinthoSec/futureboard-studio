@@ -688,6 +688,9 @@ pub struct EngineClipAudioProcess {
     /// snapshots deserialize.
     #[serde(default)]
     pub reverse: bool,
+    /// Adaptive clip de-noise amount. Older snapshots deserialize as bypass.
+    #[serde(default)]
+    pub denoise_amount: f32,
 }
 
 fn default_one_f64() -> f64 {

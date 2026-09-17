@@ -2645,20 +2645,34 @@ fn truncate_value(text: impl Into<String>) -> impl IntoElement {
 // to playback/export in a later slice (the Stretch section says so honestly).
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StretchBasicMode {
+enum StretchUiMode {
     Off,
-    RePitch,
-    PreservePitch,
+    Resample,
+    TempoSync,
+    Manual,
+    Warp,
 }
 
-const STRETCH_ACTIVE_MODE_OPTIONS: &[InspectorSelectOption<StretchBasicMode>] = &[
+const STRETCH_MODE_OPTIONS: &[InspectorSelectOption<StretchUiMode>] = &[
     InspectorSelectOption {
-        label: "RePitch",
-        value: StretchBasicMode::RePitch,
+        label: "Off",
+        value: StretchUiMode::Off,
     },
     InspectorSelectOption {
-        label: "Preserve Pitch",
-        value: StretchBasicMode::PreservePitch,
+        label: "Resample",
+        value: StretchUiMode::Resample,
+    },
+    InspectorSelectOption {
+        label: "Tempo Sync",
+        value: StretchUiMode::TempoSync,
+    },
+    InspectorSelectOption {
+        label: "Manual",
+        value: StretchUiMode::Manual,
+    },
+    InspectorSelectOption {
+        label: "Warp",
+        value: StretchUiMode::Warp,
     },
 ];
 
@@ -2669,61 +2683,87 @@ fn mode_supports_preserve_pitch(mode: StretchMode) -> bool {
     )
 }
 
-fn with_mode(s: &AudioClipStretchState, mode: StretchMode) -> AudioClipStretchState {
-    let mut n = s.clone();
-    n.mode = mode;
-    if mode == StretchMode::Off {
-        n.preserve_pitch = false;
-        n.algorithm = StretchAlgorithm::Auto;
-    } else if !mode_supports_preserve_pitch(mode) {
-        n.preserve_pitch = false;
-        n.algorithm = StretchAlgorithm::ResampleOnly;
-    } else if matches!(n.algorithm, StretchAlgorithm::Auto) {
-        n.algorithm = StretchAlgorithm::ResampleOnly;
+fn stretch_ui_mode(s: &AudioClipStretchState) -> StretchUiMode {
+    match s.mode {
+        StretchMode::Off => StretchUiMode::Off,
+        StretchMode::Resample => StretchUiMode::Resample,
+        StretchMode::TempoSync => StretchUiMode::TempoSync,
+        StretchMode::Manual => StretchUiMode::Manual,
+        StretchMode::Warp => StretchUiMode::Warp,
     }
+}
+
+fn with_ui_mode(s: &AudioClipStretchState, mode: StretchUiMode) -> AudioClipStretchState {
+    let mut n = s.clone();
+    match mode {
+        StretchUiMode::Off => {
+            n.mode = StretchMode::Off;
+            n.preserve_pitch = false;
+            n.algorithm = StretchAlgorithm::Auto;
+        }
+        StretchUiMode::Resample => {
+            n.mode = StretchMode::Resample;
+            n.preserve_pitch = false;
+            n.algorithm = StretchAlgorithm::ResampleOnly;
+        }
+        StretchUiMode::TempoSync => {
+            n.mode = StretchMode::TempoSync;
+            n.preserve_pitch = true;
+            n.algorithm = StretchAlgorithm::PhaseVocoder;
+        }
+        StretchUiMode::Manual => {
+            n.mode = StretchMode::Manual;
+            if matches!(n.algorithm, StretchAlgorithm::Auto) {
+                n.algorithm = if n.preserve_pitch {
+                    StretchAlgorithm::PhaseVocoder
+                } else {
+                    StretchAlgorithm::ResampleOnly
+                };
+            }
+        }
+        StretchUiMode::Warp => {
+            n.mode = StretchMode::Warp;
+            n.preserve_pitch = true;
+            n.algorithm = StretchAlgorithm::PhaseVocoder;
+        }
+    }
+    n.clip_timeline_duration_beats = 0.0;
     n.dirty = true;
     n
 }
 
-fn stretch_basic_mode(s: &AudioClipStretchState) -> StretchBasicMode {
-    if s.mode == StretchMode::Off {
-        StretchBasicMode::Off
-    } else if s.preserve_pitch && !matches!(s.algorithm, StretchAlgorithm::ResampleOnly) {
-        StretchBasicMode::PreservePitch
-    } else {
-        StretchBasicMode::RePitch
-    }
-}
-
-fn with_basic_mode(s: &AudioClipStretchState, mode: StretchBasicMode) -> AudioClipStretchState {
+fn with_preserve_pitch(s: &AudioClipStretchState, enabled: bool) -> AudioClipStretchState {
     let mut next = s.clone();
-    match mode {
-        StretchBasicMode::Off => {
-            next.mode = StretchMode::Off;
-            next.algorithm = StretchAlgorithm::Auto;
-            next.preserve_pitch = false;
-        }
-        StretchBasicMode::RePitch => {
-            next.mode = StretchMode::Manual;
-            next.algorithm = StretchAlgorithm::ResampleOnly;
-            next.preserve_pitch = false;
-        }
-        StretchBasicMode::PreservePitch => {
-            next.mode = StretchMode::Manual;
-            next.algorithm = StretchAlgorithm::PhaseVocoder;
-            next.preserve_pitch = true;
-        }
-    }
-    next.clip_timeline_duration_beats = 0.0;
+    next.preserve_pitch = enabled && mode_supports_preserve_pitch(next.mode);
+    next.algorithm = if next.preserve_pitch {
+        StretchAlgorithm::PhaseVocoder
+    } else if next.mode == StretchMode::Off {
+        StretchAlgorithm::Auto
+    } else {
+        StretchAlgorithm::ResampleOnly
+    };
     next.dirty = true;
     next
 }
 
+fn with_mode(s: &AudioClipStretchState, mode: StretchMode) -> AudioClipStretchState {
+    let ui_mode = match mode {
+        StretchMode::Off => StretchUiMode::Off,
+        StretchMode::Resample => StretchUiMode::Resample,
+        StretchMode::TempoSync => StretchUiMode::TempoSync,
+        StretchMode::Manual => StretchUiMode::Manual,
+        StretchMode::Warp => StretchUiMode::Warp,
+    };
+    with_ui_mode(s, ui_mode)
+}
+
 fn stretch_backend_summary(s: &AudioClipStretchState) -> &'static str {
-    match stretch_basic_mode(s) {
-        StretchBasicMode::Off => "Off",
-        StretchBasicMode::RePitch => "RePitch",
-        StretchBasicMode::PreservePitch => "Signalsmith",
+    if s.mode == StretchMode::Off {
+        "Off"
+    } else if s.preserve_pitch && mode_supports_preserve_pitch(s.mode) {
+        "Signalsmith"
+    } else {
+        "Internal RePitch"
     }
 }
 
@@ -2794,7 +2834,8 @@ fn stretch_metric_row(label: impl Into<String>, value: impl Into<String>) -> imp
         )
 }
 
-/// STRETCH section body — compact Basic mode with real state-backed actions.
+/// STRETCH section body — the common time/pitch controls plus tempo and warp
+/// affordances. Every control writes the authoritative clip state.
 fn stretch_section_body(
     clip: &SelectedClipSummary<'_>,
     s: &AudioClipStretchState,
@@ -2805,7 +2846,10 @@ fn stretch_section_body(
 ) -> impl IntoElement {
     let clip_id = clip.clip_id.to_string();
     let stretch_enabled = s.mode != StretchMode::Off;
-    let preserve_mode = stretch_basic_mode(s) == StretchBasicMode::PreservePitch;
+    let ui_mode = stretch_ui_mode(s);
+    let preserve_mode = s.preserve_pitch && mode_supports_preserve_pitch(s.mode);
+    let preserve_pitch_available = stretch_enabled && mode_supports_preserve_pitch(s.mode);
+    let warp_mode = s.mode == StretchMode::Warp;
     let (semi, fine) = s.pitch_semi_and_cents();
     let cur_src_bpm = s
         .bpm_source
@@ -2822,6 +2866,11 @@ fn stretch_section_body(
         format!("Manual {:.2}", s.bpm_target.unwrap_or(project_bpm))
     };
     let ratio = s.effective_time_ratio(project_bpm);
+    let amount_percent = if s.stretch_percent().is_finite() {
+        s.stretch_percent().clamp(5.0, 2_000.0)
+    } else {
+        100.0
+    };
     let length_summary = stretch_length_summary(s, project_bpm, clip.source_duration_seconds);
     let backend = stretch_backend_summary(s);
     let pitch_summary = format!("{:+.2} st / {:+.0} ct", semi, fine);
@@ -2858,9 +2907,9 @@ fn stretch_section_body(
                     let clip_id = clip_id.clone();
                     move |checked, w, cx| {
                         let next = if checked {
-                            with_basic_mode(&s, StretchBasicMode::RePitch)
+                            with_ui_mode(&s, StretchUiMode::Manual)
                         } else {
-                            with_basic_mode(&s, StretchBasicMode::Off)
+                            with_ui_mode(&s, StretchUiMode::Off)
                         };
                         cb(&(clip_id.clone(), next), w, cx);
                     }
@@ -2869,21 +2918,34 @@ fn stretch_section_body(
         ))
         .child(stretch_field_block(
             "Mode",
-            inspector_select(
-                "clip-stretch-mode",
-                if stretch_enabled {
-                    stretch_basic_mode(s)
-                } else {
-                    StretchBasicMode::RePitch
-                },
-                STRETCH_ACTIVE_MODE_OPTIONS,
-                !stretch_enabled,
+            inspector_select("clip-stretch-mode", ui_mode, STRETCH_MODE_OPTIONS, false, {
+                let s = s.clone();
+                let cb = cb.clone();
+                let clip_id = clip_id.clone();
+                move |mode, w, cx| {
+                    cb(&(clip_id.clone(), with_ui_mode(&s, mode)), w, cx);
+                }
+            }),
+        ))
+        .child(stretch_field_block(
+            "Amount",
+            clip_stretch_stepper(
+                "clip-stretch-amount",
+                &clip_id,
+                amount_percent,
+                format!("{amount_percent:.1}%"),
+                5.0,
+                2_000.0,
+                1.0,
+                !stretch_enabled || s.mode == StretchMode::TempoSync,
+                callbacks,
                 {
                     let s = s.clone();
-                    let cb = cb.clone();
-                    let clip_id = clip_id.clone();
-                    move |mode, w, cx| {
-                        cb(&(clip_id.clone(), with_basic_mode(&s, mode)), w, cx);
+                    move |percent| {
+                        let mut next = s.clone();
+                        next.set_stretch_percent(percent);
+                        next.clip_timeline_duration_beats = 0.0;
+                        next
                     }
                 },
             ),
@@ -3110,9 +3172,28 @@ fn stretch_section_body(
                 .text_color(Colors::text_muted())
                 .child("Pitch"),
         )
+        .children(preserve_pitch_available.then(|| {
+            let s = s.clone();
+            let cb = cb.clone();
+            let clip_id = clip_id.clone();
+            shared_inspector_checkbox(
+                "clip-stretch-preserve-pitch",
+                preserve_mode,
+                false,
+                if preserve_mode {
+                    "Preserve Pitch"
+                } else {
+                    "Pitch follows speed"
+                },
+                move |checked, w, cx| {
+                    cb(&(clip_id.clone(), with_preserve_pitch(&s, checked)), w, cx);
+                },
+            )
+        }))
         .children(
-            (!preserve_mode && stretch_enabled)
-                .then(|| inspector_hint_text("Pitch shift requires Preserve Pitch mode")),
+            (!preserve_mode && stretch_enabled).then(|| {
+                inspector_hint_text("Turn on Preserve Pitch to shift pitch independently.")
+            }),
         )
         .child(stretch_field_block(
             "Semi",
@@ -3232,12 +3313,7 @@ fn stretch_section_body(
         .children((!fit_selection_enabled).then(|| {
             inspector_hint_text("Fit Selection enables when an arrangement time range is selected.")
         }))
-        .child(stretch_field_block(
-            "Advanced",
-            inspector_hint_text(
-                "Formant, transient, warp markers, and quality — not available yet.",
-            ),
-        ))
+        .children(warp_mode.then(|| warp_section_body(&clip_id, s, callbacks)))
 }
 
 /// PITCH section body — semitone / fine-cents / formant.
@@ -3389,7 +3465,7 @@ fn transient_section_body(
         ))
 }
 
-/// WARP section body — marker count + add/clear, with an honest pending note.
+/// WARP section body — marker count + add/clear and a compact readback list.
 fn warp_section_body(
     clip_id: &str,
     s: &AudioClipStretchState,
@@ -3430,8 +3506,20 @@ fn warp_section_body(
                     move |_, w, cx| clear(&clear_id, w, cx),
                 )),
         ))
+        .children(s.warp_markers.iter().take(32).map(|marker| {
+            shared_inspector_row(
+                format!("#{:02}", marker.id),
+                false,
+                inspector_value(format!(
+                    "beat {:.2}  ·  src {}{}",
+                    marker.timeline_beat,
+                    marker.source_sample,
+                    if marker.locked { "  locked" } else { "" }
+                )),
+            )
+        }))
         .child(inspector_hint_text(
-            "Warp markers stored; playback uses global stretch",
+            "Add at the playhead. Markers are preserved with the clip.",
         ))
 }
 
@@ -4175,16 +4263,21 @@ mod stretch_inspector_tests {
     }
 
     #[test]
-    fn basic_mode_maps_to_real_stretch_params() {
+    fn ui_modes_map_to_real_stretch_params() {
         let state = AudioClipStretchState::default();
-        let repitch = with_basic_mode(&state, StretchBasicMode::RePitch);
-        assert_eq!(repitch.mode, StretchMode::Manual);
+        let repitch = with_ui_mode(&state, StretchUiMode::Resample);
+        assert_eq!(repitch.mode, StretchMode::Resample);
         assert_eq!(repitch.algorithm, StretchAlgorithm::ResampleOnly);
         assert!(!repitch.preserve_pitch);
 
-        let preserve = with_basic_mode(&state, StretchBasicMode::PreservePitch);
+        let preserve = with_ui_mode(&state, StretchUiMode::Manual);
+        let preserve = with_preserve_pitch(&preserve, true);
         assert_eq!(preserve.mode, StretchMode::Manual);
         assert_eq!(preserve.algorithm, StretchAlgorithm::PhaseVocoder);
         assert!(preserve.preserve_pitch);
+
+        let warp = with_ui_mode(&state, StretchUiMode::Warp);
+        assert_eq!(warp.mode, StretchMode::Warp);
+        assert!(warp.preserve_pitch);
     }
 }
