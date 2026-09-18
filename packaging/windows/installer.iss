@@ -34,7 +34,7 @@
 #endif
 
 #ifndef MyAppVersion
-#define MyAppVersion "2026.9.10-beta1.3"
+#define MyAppVersion "2026.9.19-beta1.4"
 #endif
 
 #define MyAppUserDir "{localappdata}\Programs\Futureboard Studio\Studio"
