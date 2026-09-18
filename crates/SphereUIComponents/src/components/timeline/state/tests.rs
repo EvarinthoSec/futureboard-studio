@@ -242,11 +242,9 @@ mod instrument_lifecycle_tests {
 
         // Collapse: flag flips, child channels remain in the model untouched.
         assert!(state.toggle_insert_multiout_collapsed(&track_id, &slot));
-        assert!(
-            state
-                .collapsed_vsti_output_group_keys()
-                .contains(&format!("{track_id}:{slot}"))
-        );
+        assert!(state
+            .collapsed_vsti_output_group_keys()
+            .contains(&format!("{track_id}:{slot}")));
         let still_there: Vec<String> = state
             .tracks
             .iter()
@@ -2377,11 +2375,9 @@ mod global_lane_resize_tests {
         let mut state = TimelineState::default();
         drag(&mut state, GlobalLaneKind::SongText, 0.0, 60.0);
         state.finish_global_lane_resize();
-        assert!(
-            state
-                .reset_global_lane_height(GlobalLaneKind::SongText)
-                .is_some()
-        );
+        assert!(state
+            .reset_global_lane_height(GlobalLaneKind::SongText)
+            .is_some());
         assert!(
             state
                 .reset_global_lane_height(GlobalLaneKind::SongText)
@@ -2762,7 +2758,7 @@ mod lane_pointer_transform_tests {
     /// made every click on a flag's name read as "empty lane".
     #[test]
     fn a_flag_is_grabbable_across_its_whole_body() {
-        use crate::components::timeline::marker_flag::{MARKER_FLAG_HIT_SLOP, flag_hit_index};
+        use crate::components::timeline::marker_flag::{flag_hit_index, MARKER_FLAG_HIT_SLOP};
 
         let spans = [(100.0_f32, 60.0_f32), (300.0, 40.0)];
         assert_eq!(flag_hit_index(&spans, 100.0, MARKER_FLAG_HIT_SLOP), Some(0));
@@ -3231,12 +3227,10 @@ mod time_display_ruler_tests {
         let ruler = state.ruler_grid_lines(1200.0);
         let grid = state.arrangement_grid_lines(1200.0);
         assert_eq!(ruler.len(), grid.len());
-        assert!(
-            ruler
-                .iter()
-                .zip(grid.iter())
-                .all(|(a, b)| a.x == b.x && a.beat == b.beat)
-        );
+        assert!(ruler
+            .iter()
+            .zip(grid.iter())
+            .all(|(a, b)| a.x == b.x && a.beat == b.beat));
     }
 
     /// A time-based timebase gets its own ticks. Every labelled one must land on

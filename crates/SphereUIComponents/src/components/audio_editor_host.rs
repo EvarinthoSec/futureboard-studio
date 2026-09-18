@@ -7,23 +7,23 @@
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
-    Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, ScrollWheelEvent, Styled, Subscription, Window, div,
+    div, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, ScrollWheelEvent, Styled, Subscription, Window,
 };
 use sphere_audio_editor::{
-    AUDIO_EDITOR_INSPECTOR_WIDTH, AUDIO_EDITOR_TOOLS_WIDTH, AudioEditorCallbacks, AudioEditorDrag,
-    AudioEditorEvent, AudioEditorSnap, AudioEditorState, AudioEditorTool, AudioEditorViewModel,
-    AudioRangeSelection, AudioToolKind, AudioToolTarget, EnvelopeCurve, EnvelopePoint,
-    FrequencyScale, SpectralSelection, audio_editor_panel, default_wheel_handler_at,
-    empty_audio_editor,
+    audio_editor_panel, default_wheel_handler_at, empty_audio_editor, AudioEditorCallbacks,
+    AudioEditorDrag, AudioEditorEvent, AudioEditorSnap, AudioEditorState, AudioEditorTool,
+    AudioEditorViewModel, AudioRangeSelection, AudioToolKind, AudioToolTarget, EnvelopeCurve,
+    EnvelopePoint, FrequencyScale, SpectralSelection, AUDIO_EDITOR_INSPECTOR_WIDTH,
+    AUDIO_EDITOR_TOOLS_WIDTH,
 };
 
 use crate::components::audio_editor_adapter::{
     audio_editor_theme, build_waveform_view_model, selected_audio_clip,
 };
 use crate::components::audio_editor_spectrogram::{
-    RenderedSpectrogram, SpectrogramJobParams, cached_or_analyze, error_view_model,
-    loading_view_model, to_view_model,
+    cached_or_analyze, error_view_model, loading_view_model, to_view_model, RenderedSpectrogram,
+    SpectrogramJobParams,
 };
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{

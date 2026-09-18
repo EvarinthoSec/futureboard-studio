@@ -7,11 +7,11 @@ use gpui::{App, Context, Window};
 use sphere_audio_editor::{AudioToolKind, AudioToolTarget};
 
 use crate::components::timeline::timeline_state::{
-    AudioImportState, ClipType, MIN_AUDIO_CLIP_BEATS, StretchMode, WarpMarker,
+    AudioImportState, ClipType, StretchMode, WarpMarker, MIN_AUDIO_CLIP_BEATS,
 };
 use crate::components::timeline::{waveform_cache, waveform_detail};
 use crate::components::{
-    AudioToolCommand, AudioToolWindowCallbacks, apply_previews_to_snapshot, open_audio_tool_window,
+    apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand, AudioToolWindowCallbacks,
 };
 
 use super::StudioLayout;

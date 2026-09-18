@@ -4,7 +4,7 @@
 //! spacing. Paint stays on the UI thread and only reads already-computed
 //! analysis snapshots.
 
-use gpui::{canvas, fill, point, px, size, Bounds, IntoElement, Pixels, Rgba, Styled, Window};
+use gpui::{Bounds, IntoElement, Pixels, Rgba, Styled, Window, canvas, fill, point, px, size};
 
 use crate::theme::Colors;
 
@@ -52,10 +52,7 @@ fn quad(window: &mut Window, bounds: Bounds<Pixels>, x: f32, y: f32, w: f32, h: 
         return;
     }
     window.paint_quad(fill(
-        Bounds::new(
-            bounds.origin + point(px(x), px(y)),
-            size(px(w), px(h)),
-        ),
+        Bounds::new(bounds.origin + point(px(x), px(y)), size(px(w), px(h))),
         color,
     ));
 }
@@ -399,15 +396,7 @@ pub fn loudness_view(
             let bar_w = ((meter_w - 3.0) / 4.0).max(4.0);
             for (i, (value, color)) in meters.iter().enumerate() {
                 let x = i as f32 * (bar_w + 1.0);
-                quad(
-                    window,
-                    bounds,
-                    x,
-                    0.0,
-                    bar_w,
-                    height,
-                    Colors::meter_rail(),
-                );
+                quad(window, bounds, x, 0.0, bar_w, height, Colors::meter_rail());
                 let y = db_y(*value, height);
                 quad(window, bounds, x, y, bar_w, height - y, *color);
             }
@@ -447,10 +436,7 @@ pub fn loudness_view(
     .size_full()
 }
 
-pub fn envelope_markers_view(
-    envelope: &[f32],
-    marker_norm: &[(f32, f32)],
-) -> impl IntoElement {
+pub fn envelope_markers_view(envelope: &[f32], marker_norm: &[(f32, f32)]) -> impl IntoElement {
     let envelope = envelope.to_vec();
     let markers = marker_norm.to_vec();
     canvas(
@@ -568,16 +554,16 @@ pub fn goniometer_view(
             } else {
                 Colors::meter_high()
             };
-            quad(window, bounds, mx + 4.0, y, meter_w - 8.0, bar_h.max(1.0), color);
             quad(
                 window,
                 bounds,
-                mx,
-                mid,
-                meter_w,
-                1.0,
-                Colors::text_faint(),
+                mx + 4.0,
+                y,
+                meter_w - 8.0,
+                bar_h.max(1.0),
+                color,
             );
+            quad(window, bounds, mx, mid, meter_w, 1.0, Colors::text_faint());
             if history.len() > 1 {
                 let n = history.len();
                 for (i, value) in history.iter().enumerate() {
@@ -670,11 +656,7 @@ pub fn dc_view(left: f32, right: f32, envelope: &[f32]) -> impl IntoElement {
     .size_full()
 }
 
-pub fn before_after_bars(
-    before_db: f32,
-    after_db: f32,
-    target_db: f32,
-) -> impl IntoElement {
+pub fn before_after_bars(before_db: f32, after_db: f32, target_db: f32) -> impl IntoElement {
     canvas(
         |_bounds, _window, _cx| {},
         move |bounds, (), window, _cx| {
@@ -814,10 +796,7 @@ pub fn candidate_bars(values: &[(f32, f32)], highlight: usize) -> impl IntoEleme
             let n = values.len() as f32;
             let gap = 4.0;
             let bar_w = ((width - gap * (n + 1.0)) / n).max(6.0);
-            let peak = values
-                .iter()
-                .map(|(_, c)| *c)
-                .fold(1.0e-4_f32, f32::max);
+            let peak = values.iter().map(|(_, c)| *c).fold(1.0e-4_f32, f32::max);
             for (i, (_, confidence)) in values.iter().enumerate() {
                 let x = gap + i as f32 * (bar_w + gap);
                 let h = (*confidence / peak).clamp(0.0, 1.0) * (height - 8.0);
@@ -918,7 +897,12 @@ pub fn channel_matrix_view(mode_index: usize) -> impl IntoElement {
             let idx = mode_index.min(routes.len() - 1);
             let m = routes[idx];
             let cell = height.min(width) * 0.28;
-            let labels = [(0.0, 0.0, m[0]), (0.0, 1.0, m[1]), (1.0, 0.0, m[2]), (1.0, 1.0, m[3])];
+            let labels = [
+                (0.0, 0.0, m[0]),
+                (0.0, 1.0, m[1]),
+                (1.0, 0.0, m[2]),
+                (1.0, 1.0, m[3]),
+            ];
             let ox = width * 0.28;
             let oy = height * 0.22;
             for (col, row, gain) in labels {
@@ -1070,7 +1054,9 @@ mod tests {
 
     #[test]
     fn hop_levels_covers_the_buffer() {
-        let samples: Vec<f32> = (0..1000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        let samples: Vec<f32> = (0..1000)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
         let hops = hop_levels(&samples, 10);
         assert_eq!(hops.len(), 10);
         assert!(hops.iter().all(|v| *v > 0.4));

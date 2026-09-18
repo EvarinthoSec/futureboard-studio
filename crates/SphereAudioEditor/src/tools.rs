@@ -87,20 +87,20 @@ impl AudioToolKind {
 
     pub const fn default_size(self) -> (f32, f32) {
         match self {
-            Self::SpectrumAnalyzer => (640.0, 420.0),
-            Self::Loudness => (420.0, 360.0),
-            Self::Normalize => (440.0, 420.0),
-            Self::TransientDetector => (460.0, 420.0),
-            Self::TimePitch => (480.0, 520.0),
-            Self::Resample => (400.0, 320.0),
-            Self::ChannelTools => (400.0, 380.0),
-            Self::PhaseAnalyzer => (420.0, 380.0),
-            Self::DcOffset => (400.0, 320.0),
-            Self::BpmAnalysis => (400.0, 360.0),
-            Self::KeyAnalysis => (400.0, 340.0),
-            Self::AudioRepair => (520.0, 480.0),
-            Self::SpectralProcessor => (480.0, 400.0),
-            Self::SpectrogramSettings => (380.0, 280.0),
+            Self::SpectrumAnalyzer => (720.0, 480.0),
+            Self::Loudness => (640.0, 420.0),
+            Self::Normalize => (640.0, 440.0),
+            Self::TransientDetector => (720.0, 440.0),
+            Self::TimePitch => (640.0, 420.0),
+            Self::Resample => (560.0, 380.0),
+            Self::ChannelTools => (560.0, 400.0),
+            Self::PhaseAnalyzer => (560.0, 440.0),
+            Self::DcOffset => (560.0, 360.0),
+            Self::BpmAnalysis => (560.0, 400.0),
+            Self::KeyAnalysis => (560.0, 400.0),
+            Self::AudioRepair => (720.0, 480.0),
+            Self::SpectralProcessor => (720.0, 440.0),
+            Self::SpectrogramSettings => (560.0, 360.0),
         }
     }
 }

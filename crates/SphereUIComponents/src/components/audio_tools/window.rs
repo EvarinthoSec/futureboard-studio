@@ -1,6 +1,6 @@
 //! Independent GPUI windows for audio editor analysis and processing tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use SphereAudioProcessor::{
     AudioClipProcessor, ChannelTransform, DcOffsetProcessor, DeclickParams, DehumParams,
     DehumProcessor, FftSize, FrequencyFocus, KeyEstimate, LoudnessMeasurement,
-    NormalizeMeasurement, NormalizeMode, NormalizeParams, SpectralDenoiseParams,
+    NormalizeMeasurement, NormalizeMode, NormalizeParams, PhaseMeasurement, SpectralDenoiseParams,
     SpectralGainParams, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot, SpectrumWindow,
     StftSettings, StretchAlgorithm, StretchMode, StretchParams, TempoCandidate,
     TransientDetectParams, TransientMarker, analyze_loudness, analyze_spectrum,
@@ -25,16 +25,26 @@ use gpui::{
 };
 use sphere_audio_editor::{AudioRepairModule, AudioToolKind, AudioToolSession, AudioToolTarget};
 
-use crate::components::controls::{FbButtonKind, fb_button, fb_checkbox};
+use crate::components::inspector::inspector_mini_button;
 use crate::components::timeline::Timeline;
 use crate::components::title_bar::external_window_titlebar;
-use crate::theme::{Colors, radius, space, typography};
+use crate::theme::{Colors, space};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 use super::preview::ClipPreviewOverride;
+use super::{viz, workspace};
 
-pub const AUDIO_TOOL_WINDOW_MIN_WIDTH: f32 = 360.0;
-pub const AUDIO_TOOL_WINDOW_MIN_HEIGHT: f32 = 240.0;
+pub const AUDIO_TOOL_WINDOW_MIN_WIDTH: f32 = 480.0;
+pub const AUDIO_TOOL_WINDOW_MIN_HEIGHT: f32 = 320.0;
+
+const GONIO_TRAIL: usize = 192;
+const LEVEL_HOPS: usize = 256;
+const AVAILABLE_REPAIR: [AudioRepairModule; 4] = [
+    AudioRepairModule::Denoise,
+    AudioRepairModule::DeClick,
+    AudioRepairModule::DeHum,
+    AudioRepairModule::SpectralRepair,
+];
 
 const REFRESH: Duration = Duration::from_millis(50);
 
@@ -133,6 +143,32 @@ enum TimePitchMode {
     FollowTempo,
 }
 
+#[derive(Clone)]
+struct AbSnapshot {
+    time_mode: TimePitchMode,
+    stretch_percent: f64,
+    pitch_semi: f32,
+    pitch_cents: f32,
+    preserve_transients: bool,
+    normalize: NormalizeParams,
+    channel: ChannelTransform,
+    resample_target: u32,
+    repair_module: AudioRepairModule,
+    denoise: SpectralDenoiseParams,
+    declick: DeclickParams,
+    dehum: DehumParams,
+    spectral_gain_db: f32,
+    fft_size: FftSize,
+    spectrum_window: SpectrumWindow,
+    smoothing: SpectrumSmoothing,
+    peak_hold: bool,
+    spectrum_mode: SpectrumMode,
+    transient_params: TransientDetectParams,
+    freq_focus: FrequencyFocus,
+    bpm_min: f32,
+    bpm_max: f32,
+}
+
 pub struct AudioToolWindow {
     pub(crate) session: AudioToolSession,
     timeline: Entity<Timeline>,
@@ -167,7 +203,13 @@ pub struct AudioToolWindow {
     // Channel / phase / resample / repair
     channel: ChannelTransform,
     phase_ms: bool,
-    phase_corr: f32,
+    phase: PhaseMeasurement,
+    gonio_trail: VecDeque<(f32, f32)>,
+    corr_history: VecDeque<f32>,
+    envelope: Vec<f32>,
+    level_history: Vec<f32>,
+    ab_bank: Option<AbSnapshot>,
+    ab_showing_b: bool,
     resample_target: u32,
     repair_module: AudioRepairModule,
     denoise: SpectralDenoiseParams,
@@ -203,7 +245,8 @@ impl AudioToolWindow {
         .detach();
 
         let target_sr = session.target.sample_rate.max(44_100);
-        Self {
+        let kind = session.tool_kind;
+        let mut window = Self {
             session,
             timeline,
             callbacks,
@@ -233,7 +276,13 @@ impl AudioToolWindow {
             preserve_transients: true,
             channel: ChannelTransform::Stereo,
             phase_ms: false,
-            phase_corr: 0.0,
+            phase: PhaseMeasurement::default(),
+            gonio_trail: VecDeque::with_capacity(GONIO_TRAIL),
+            corr_history: VecDeque::with_capacity(GONIO_TRAIL),
+            envelope: Vec::new(),
+            level_history: Vec::new(),
+            ab_bank: None,
+            ab_showing_b: false,
             resample_target: if target_sr == 44_100 { 48_000 } else { 44_100 },
             repair_module: AudioRepairModule::Denoise,
             denoise: SpectralDenoiseParams::default(),
@@ -242,7 +291,11 @@ impl AudioToolWindow {
             dehum: DehumParams::default(),
             spectral_gain_db: 0.0,
             spectrum_busy: false,
+        };
+        if !matches!(kind, AudioToolKind::SpectrogramSettings) {
+            window.spawn_analyze(cx);
         }
+        window
     }
 
     fn tick_realtime(&mut self, cx: &mut Context<Self>) {
@@ -299,7 +352,7 @@ impl AudioToolWindow {
                 let n = DirectAudio::analysis_tap().copy_recent(&mut left, &mut right);
                 if n > 16 {
                     let m = measure_phase(&left[..n], &right[..n], self.phase_ms);
-                    self.phase_corr = m.correlation;
+                    self.push_phase(m);
                 }
             }
             _ => {}
@@ -355,8 +408,14 @@ impl AudioToolWindow {
                 match result {
                     Ok((samples, mono, channels, sr)) => {
                         this.status.clear();
+                        this.envelope = viz::hop_levels(&mono, LEVEL_HOPS);
+                        this.level_history = this.envelope.clone();
                         match kind {
-                            AudioToolKind::SpectrumAnalyzer => {
+                            AudioToolKind::SpectrumAnalyzer
+                            | AudioToolKind::AudioRepair
+                            | AudioToolKind::SpectralProcessor
+                            | AudioToolKind::Resample
+                            | AudioToolKind::SpectrogramSettings => {
                                 this.spectrum = analyze_spectrum(
                                     &mono,
                                     sr,
@@ -394,19 +453,18 @@ impl AudioToolWindow {
                                         l.push(frame[0]);
                                         r.push(frame[1]);
                                     }
-                                    this.phase_corr =
-                                        measure_phase(&l, &r, this.phase_ms).correlation;
+                                    let measured = measure_phase(&l, &r, this.phase_ms);
+                                    this.push_phase(measured);
                                 }
                             }
-                            AudioToolKind::SpectralProcessor => {
-                                let _ = spectral;
-                                this.status = format!(
-                                    "region {}–{} Hz",
-                                    spectral.map(|s| s.min_hz).unwrap_or(0.0),
-                                    spectral.map(|s| s.max_hz).unwrap_or(0.0)
-                                );
-                            }
-                            _ => {}
+                            AudioToolKind::TimePitch | AudioToolKind::ChannelTools => {}
+                        }
+                        if kind == AudioToolKind::SpectralProcessor {
+                            this.status = format!(
+                                "region {}–{} Hz",
+                                spectral.map(|s| s.min_hz).unwrap_or(0.0),
+                                spectral.map(|s| s.max_hz).unwrap_or(sr as f32 * 0.5)
+                            );
                         }
                     }
                     Err(error) => this.status = error,
@@ -490,6 +548,89 @@ impl AudioToolWindow {
             _ => {}
         }
         self.dispatch(AudioToolCommand::Preview(preview), cx);
+    }
+
+    fn push_phase(&mut self, measured: PhaseMeasurement) {
+        self.phase = measured;
+        self.gonio_trail
+            .push_back((measured.gonio_x, measured.gonio_y));
+        if self.gonio_trail.len() > GONIO_TRAIL {
+            self.gonio_trail.pop_front();
+        }
+        self.corr_history.push_back(measured.correlation);
+        if self.corr_history.len() > GONIO_TRAIL {
+            self.corr_history.pop_front();
+        }
+    }
+
+    fn capture_ab(&self) -> AbSnapshot {
+        AbSnapshot {
+            time_mode: self.time_mode,
+            stretch_percent: self.stretch_percent,
+            pitch_semi: self.pitch_semi,
+            pitch_cents: self.pitch_cents,
+            preserve_transients: self.preserve_transients,
+            normalize: self.normalize,
+            channel: self.channel,
+            resample_target: self.resample_target,
+            repair_module: self.repair_module,
+            denoise: self.denoise,
+            declick: self.declick,
+            dehum: self.dehum,
+            spectral_gain_db: self.spectral_gain_db,
+            fft_size: self.fft_size,
+            spectrum_window: self.spectrum_window,
+            smoothing: self.smoothing,
+            peak_hold: self.peak_hold,
+            spectrum_mode: self.spectrum_mode,
+            transient_params: self.transient_params,
+            freq_focus: self.freq_focus,
+            bpm_min: self.bpm_min,
+            bpm_max: self.bpm_max,
+        }
+    }
+
+    fn restore_ab(&mut self, snap: AbSnapshot) {
+        self.time_mode = snap.time_mode;
+        self.stretch_percent = snap.stretch_percent;
+        self.pitch_semi = snap.pitch_semi;
+        self.pitch_cents = snap.pitch_cents;
+        self.preserve_transients = snap.preserve_transients;
+        self.normalize = snap.normalize;
+        self.channel = snap.channel;
+        self.resample_target = snap.resample_target;
+        self.repair_module = snap.repair_module;
+        self.denoise = snap.denoise;
+        self.declick = snap.declick;
+        self.dehum = snap.dehum;
+        self.spectral_gain_db = snap.spectral_gain_db;
+        self.fft_size = snap.fft_size;
+        self.spectrum_window = snap.spectrum_window;
+        self.smoothing = snap.smoothing;
+        self.peak_hold = snap.peak_hold;
+        self.spectrum_mode = snap.spectrum_mode;
+        self.transient_params = snap.transient_params;
+        self.freq_focus = snap.freq_focus;
+        self.bpm_min = snap.bpm_min;
+        self.bpm_max = snap.bpm_max;
+    }
+
+    fn toggle_ab(&mut self, cx: &mut App) {
+        if let Some(bank) = self.ab_bank.take() {
+            let current = self.capture_ab();
+            self.restore_ab(bank);
+            self.ab_bank = Some(current);
+            self.ab_showing_b = !self.ab_showing_b;
+            self.emit_preview(cx);
+        } else {
+            self.ab_bank = Some(self.capture_ab());
+            self.ab_showing_b = false;
+        }
+        self.session.dirty = true;
+    }
+
+    fn needs_analyze(kind: AudioToolKind) -> bool {
+        !matches!(kind, AudioToolKind::ChannelTools | AudioToolKind::TimePitch)
     }
 
     fn apply(&mut self, cx: &mut Context<Self>) {
@@ -816,28 +957,32 @@ fn processed_output_path(source: &std::path::Path, clip_id: &str) -> PathBuf {
     out
 }
 
-fn row_label(label: &str) -> impl IntoElement {
-    div()
-        .text_size(px(typography::DENSE_LABEL))
-        .text_color(Colors::text_muted())
-        .child(label.to_string())
+fn bind_f32(
+    cx: &mut Context<AudioToolWindow>,
+    write: impl Fn(&mut AudioToolWindow, f32, &mut Context<AudioToolWindow>) + 'static,
+) -> impl Fn(f32, &mut Window, &mut App) + 'static {
+    let handle = cx.entity();
+    move |value, _window, cx| {
+        handle.update(cx, |this, cx| write(this, value, cx));
+    }
 }
 
-fn row_value(value: impl Into<String>) -> impl IntoElement {
-    div()
-        .text_size(px(typography::UI_SM))
-        .text_color(Colors::text_primary())
-        .child(value.into())
-}
-
-fn info_row(label: &str, value: impl Into<String>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .h(px(22.0))
-        .child(row_label(label))
-        .child(row_value(value))
+fn tonic_index(tonic: SphereAudioProcessor::PitchClass) -> usize {
+    use SphereAudioProcessor::PitchClass::*;
+    match tonic {
+        C => 0,
+        Cs => 1,
+        D => 2,
+        Ds => 3,
+        E => 4,
+        F => 5,
+        Fs => 6,
+        G => 7,
+        Gs => 8,
+        A => 9,
+        As => 10,
+        B => 11,
+    }
 }
 
 impl Render for AudioToolWindow {
@@ -846,6 +991,18 @@ impl Render for AudioToolWindow {
         let analysis = kind.is_analysis_only();
         let on_close = self.callbacks.on_close.clone();
         let target = self.session.target.clone();
+        let status = if self.session.analyzing {
+            format!("Analyzing… {:.0}%", self.session.analyze_progress * 100.0)
+        } else {
+            self.status.clone()
+        };
+        let ab_label = if self.ab_bank.is_none() {
+            "A/B"
+        } else if self.ab_showing_b {
+            "B"
+        } else {
+            "A"
+        };
         div()
             .size_full()
             .flex()
@@ -861,175 +1018,132 @@ impl Render for AudioToolWindow {
                     window.remove_window();
                 },
             ))
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(space::SECTION))
-                    .py(px(space::BASE))
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .child(info_row("Target", target.target_label(kind)))
-                    .child(info_row("Source", target.summary_line())),
-            )
+            .child(workspace::header(
+                target.target_label(kind),
+                target.summary_line(),
+                status,
+                workspace::latch(
+                    "follow",
+                    "Follow",
+                    self.session.follow_selection,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.session.follow_selection = !this.session.follow_selection;
+                        this.session.pin_target = !this.session.follow_selection;
+                        cx.notify();
+                    }),
+                ),
+                workspace::latch(
+                    "pin",
+                    "Pin",
+                    self.session.pin_target,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.session.pin_target = !this.session.pin_target;
+                        this.session.follow_selection = !this.session.pin_target;
+                        cx.notify();
+                    }),
+                ),
+            ))
+            .when(kind == AudioToolKind::AudioRepair, |this| {
+                this.child(self.repair_nav(cx))
+            })
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
-                    .px(px(space::SECTION))
-                    .py(px(space::BASE))
+                    .min_w(px(0.0))
                     .overflow_hidden()
                     .child(self.tool_body(cx)),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(space::SECTION))
-                    .py(px(space::BASE))
-                    .border_t(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::BASE))
-                    .child(
-                        div()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_muted())
-                            .child(if self.session.analyzing {
-                                format!("Analyzing… {:.0}%", self.session.analyze_progress * 100.0)
-                            } else {
-                                self.status.clone()
+            .child(workspace::workflow_bar(
+                workspace::workflow_row()
+                    .when(Self::needs_analyze(kind), |row| {
+                        row.child(workspace::ghost_action(
+                            "analyze",
+                            "Analyze",
+                            !self.session.analyzing,
+                            cx.listener(|this, _, _, cx| this.spawn_analyze(cx)),
+                        ))
+                    })
+                    .when(!analysis, |row| {
+                        row.child(workspace::latch(
+                            "preview",
+                            "Preview",
+                            self.session.preview_enabled,
+                            true,
+                            cx.listener(|this, _, _, cx| {
+                                this.session.preview_enabled = !this.session.preview_enabled;
+                                this.emit_preview(cx);
+                                cx.notify();
                             }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(space::LOOSE))
-                                    .child(fb_checkbox(
-                                        "follow-sel",
-                                        "Follow Selection",
-                                        self.session.follow_selection,
-                                        true,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.session.follow_selection =
-                                                !this.session.follow_selection;
-                                            this.session.pin_target =
-                                                !this.session.follow_selection;
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .child(fb_checkbox(
-                                        "pin-target",
-                                        "Pin Target",
-                                        self.session.pin_target,
-                                        true,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.session.pin_target = !this.session.pin_target;
-                                            this.session.follow_selection =
-                                                !this.session.pin_target;
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .when(!analysis, |this| {
-                                        this.child(fb_checkbox(
-                                            "preview",
-                                            "Preview",
-                                            self.session.preview_enabled,
-                                            true,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.session.preview_enabled =
-                                                    !this.session.preview_enabled;
-                                                this.emit_preview(cx);
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(
-                                            fb_checkbox(
-                                                "bypass",
-                                                "Bypass",
-                                                self.session.preview_bypassed,
-                                                self.session.preview_enabled,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.session.preview_bypassed =
-                                                        !this.session.preview_bypassed;
-                                                    this.emit_preview(cx);
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(space::BASE))
-                                    .when(analysis, |this| {
-                                        this.child(fb_button(
-                                            "close",
-                                            "Close",
-                                            FbButtonKind::Default,
-                                            true,
-                                            {
-                                                let on_close = self.callbacks.on_close.clone();
-                                                move |_, window, cx| {
-                                                    on_close(kind, window.bounds(), cx);
-                                                    window.remove_window();
-                                                }
-                                            },
-                                        ))
-                                    })
-                                    .when(!analysis, |this| {
-                                        this.child(fb_button(
-                                            "cancel",
-                                            "Cancel",
-                                            FbButtonKind::Default,
-                                            true,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.cancel(cx);
-                                                (this.callbacks.on_close)(
-                                                    this.session.tool_kind,
-                                                    window.bounds(),
-                                                    cx,
-                                                );
-                                                window.remove_window();
-                                            }),
-                                        ))
-                                        .child(fb_button(
-                                            "apply",
-                                            "Apply",
-                                            FbButtonKind::Primary,
-                                            true,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.apply(cx);
-                                                cx.notify();
-                                            }),
-                                        ))
-                                    }),
-                            ),
-                    ),
-            )
+                        ))
+                        .child(workspace::latch(
+                            "bypass",
+                            "Bypass",
+                            self.session.preview_bypassed,
+                            self.session.preview_enabled,
+                            cx.listener(|this, _, _, cx| {
+                                this.session.preview_bypassed = !this.session.preview_bypassed;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(workspace::latch(
+                            "ab",
+                            ab_label,
+                            self.ab_bank.is_some(),
+                            true,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_ab(cx);
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(div().flex_1())
+                    .when(!analysis, |row| {
+                        row.child(workspace::ghost_action(
+                            "cancel",
+                            "Cancel",
+                            true,
+                            cx.listener(|this, _, window, cx| {
+                                this.cancel(cx);
+                                (this.callbacks.on_close)(
+                                    this.session.tool_kind,
+                                    window.bounds(),
+                                    cx,
+                                );
+                                window.remove_window();
+                            }),
+                        ))
+                        .child(workspace::apply_action(
+                            "apply",
+                            "Apply",
+                            true,
+                            cx.listener(|this, _, _, cx| {
+                                this.apply(cx);
+                                cx.notify();
+                            }),
+                        ))
+                    }),
+            ))
     }
 }
 
 impl AudioToolWindow {
     fn tool_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let analyze = cx.listener(|this, _, _, cx| this.spawn_analyze(cx));
         match self.session.tool_kind {
-            AudioToolKind::SpectrumAnalyzer => self.spectrum_body(analyze, cx).into_any_element(),
-            AudioToolKind::Loudness => self.loudness_body(analyze).into_any_element(),
-            AudioToolKind::Normalize => self.normalize_body(analyze, cx).into_any_element(),
-            AudioToolKind::TransientDetector => self.transient_body(analyze, cx).into_any_element(),
+            AudioToolKind::SpectrumAnalyzer => self.spectrum_body(cx).into_any_element(),
+            AudioToolKind::Loudness => self.loudness_body(cx).into_any_element(),
+            AudioToolKind::Normalize => self.normalize_body(cx).into_any_element(),
+            AudioToolKind::TransientDetector => self.transient_body(cx).into_any_element(),
             AudioToolKind::TimePitch => self.time_pitch_body(cx).into_any_element(),
             AudioToolKind::Resample => self.resample_body(cx).into_any_element(),
             AudioToolKind::ChannelTools => self.channel_body(cx).into_any_element(),
             AudioToolKind::PhaseAnalyzer => self.phase_body(cx).into_any_element(),
-            AudioToolKind::DcOffset => self.dc_body(analyze).into_any_element(),
-            AudioToolKind::BpmAnalysis => self.bpm_body(analyze, cx).into_any_element(),
-            AudioToolKind::KeyAnalysis => self.key_body(analyze).into_any_element(),
+            AudioToolKind::DcOffset => self.dc_body(cx).into_any_element(),
+            AudioToolKind::BpmAnalysis => self.bpm_body(cx).into_any_element(),
+            AudioToolKind::KeyAnalysis => self.key_body(cx).into_any_element(),
             AudioToolKind::AudioRepair => self.repair_body(cx).into_any_element(),
             AudioToolKind::SpectralProcessor => self.spectral_body(cx).into_any_element(),
             AudioToolKind::SpectrogramSettings => {
@@ -1038,962 +1152,1211 @@ impl AudioToolWindow {
         }
     }
 
-    fn spectrum_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let bars = self.spectrum.as_ref().map(|snap| {
-            let count = snap.magnitudes_db.len().min(240).max(1);
-            div()
-                .flex()
-                .items_end()
-                .gap(px(1.0))
-                .h(px(180.0))
-                .w_full()
-                .children((0..count).map(|i| {
-                    let idx = i * snap.magnitudes_db.len() / count;
-                    let db = snap.magnitudes_db.get(idx).copied().unwrap_or(-120.0);
-                    let hold = snap.peak_hold_db.get(idx).copied().unwrap_or(db);
-                    let h = ((db + 120.0) / 132.0).clamp(0.0, 1.0) * 180.0;
-                    let hold_h = ((hold + 120.0) / 132.0).clamp(0.0, 1.0) * 180.0;
-                    div()
-                        .flex_1()
-                        .h(px(hold_h.max(h)))
-                        .bg(Colors::with_alpha(Colors::accent_primary(), 0.85))
-                }))
-        });
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(info_row("Mode", self.spectrum_mode.label()))
-            .child(info_row("FFT", self.fft_size.label()))
-            .child(info_row("Window", self.spectrum_window.label()))
-            .child(info_row("Smoothing", self.smoothing.label()))
-            .child(info_row(
-                "Peak Hold",
-                if self.peak_hold { "On" } else { "Off" },
-            ))
-            .child(info_row("Range", "20 Hz → Nyquist"))
-            .children(bars)
-            .child(
-                div()
-                    .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "spec-mode",
-                        "Cycle Mode",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.spectrum_mode = match this.spectrum_mode {
-                                SpectrumMode::RealtimePlayback => SpectrumMode::SelectionAverage,
-                                SpectrumMode::SelectionAverage => SpectrumMode::SelectionPeak,
-                                SpectrumMode::SelectionPeak => SpectrumMode::StaticCursor,
-                                SpectrumMode::StaticCursor => SpectrumMode::RealtimePlayback,
-                            };
+    fn repair_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = AVAILABLE_REPAIR.len();
+        workspace::nav_strip(
+            workspace::segment_track().children(AVAILABLE_REPAIR.into_iter().enumerate().map(
+                |(index, module)| {
+                    workspace::compact_segment(
+                        format!("repair-nav-{}", module.label()),
+                        module.label(),
+                        self.repair_module == module,
+                        workspace::segment_position(index, count),
+                        cx.listener(move |this, _, _, cx| {
+                            this.repair_module = module;
+                            this.emit_preview(cx);
                             cx.notify();
                         }),
-                    ))
-                    .child(fb_button(
-                        "spec-fft",
-                        "Cycle FFT",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.fft_size = match this.fft_size {
-                                FftSize::N512 => FftSize::N1024,
-                                FftSize::N1024 => FftSize::N2048,
-                                FftSize::N2048 => FftSize::N4096,
-                                FftSize::N4096 => FftSize::N8192,
-                                FftSize::N8192 => FftSize::N16384,
-                                FftSize::N16384 => FftSize::N512,
-                            };
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "spec-win",
-                        "Cycle Window",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.spectrum_window = match this.spectrum_window {
-                                SpectrumWindow::Hann => SpectrumWindow::BlackmanHarris,
-                                SpectrumWindow::BlackmanHarris => SpectrumWindow::Hann,
-                            };
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "spec-smooth",
-                        "Cycle Smooth",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.smoothing = match this.smoothing {
-                                SpectrumSmoothing::None => SpectrumSmoothing::SixthOctave,
-                                SpectrumSmoothing::SixthOctave => SpectrumSmoothing::TwelfthOctave,
-                                SpectrumSmoothing::TwelfthOctave => SpectrumSmoothing::None,
-                            };
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "spec-hold",
-                        if self.peak_hold {
-                            "Peak Hold Off"
-                        } else {
-                            "Peak Hold On"
-                        },
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.peak_hold = !this.peak_hold;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(fb_button(
-                "spec-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-    }
-
-    fn loudness_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let m = self.loudness;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Momentary",
-                m.map(|v| format!("{:.1} LUFS", v.momentary_lufs))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "Short-Term",
-                m.map(|v| format!("{:.1} LUFS", v.shortterm_lufs))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "Integrated",
-                m.map(|v| format!("{:.1} LUFS", v.integrated_lufs))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "LRA",
-                m.map(|v| format!("{:.1} LU", v.loudness_range))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "True Peak",
-                m.map(|v| format!("{:.1} dBTP", v.true_peak_dbtp))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "Peak",
-                m.map(|v| format!("{:.1} dBFS", v.peak_dbfs))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(fb_button(
-                "lufs-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-    }
-
-    fn normalize_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let m = self.measurement;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row("Mode", self.normalize.mode.label()))
-            .child(info_row(
-                "Peak target",
-                format!("{:.2} dBFS", self.normalize.target_peak_dbfs),
-            ))
-            .child(info_row(
-                "True Peak target",
-                format!("{:.2} dBTP", self.normalize.target_true_peak_dbtp),
-            ))
-            .child(info_row(
-                "Loudness target",
-                format!("{:.1} LUFS", self.normalize.target_lufs),
-            ))
-            .child(info_row(
-                "Current Peak",
-                m.map(|v| format!("{:.1} dBFS", v.peak_dbfs))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "LUFS-I",
-                m.and_then(|v| v.lufs_i)
-                    .map(|v| format!("{v:.1}"))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "True Peak",
-                m.map(|v| format!("{:.1} dBTP", v.true_peak_dbtp))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "Required Gain",
-                m.map(|v| format!("{:+.1} dB", v.required_gain_db))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "norm-peak",
-                        "Peak",
-                        if self.normalize.mode == NormalizeMode::Peak {
-                            FbButtonKind::Primary
-                        } else {
-                            FbButtonKind::Default
-                        },
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.normalize.mode = NormalizeMode::Peak;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "norm-tp",
-                        "True Peak",
-                        if self.normalize.mode == NormalizeMode::TruePeak {
-                            FbButtonKind::Primary
-                        } else {
-                            FbButtonKind::Default
-                        },
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.normalize.mode = NormalizeMode::TruePeak;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "norm-lufs",
-                        "Loudness",
-                        if self.normalize.mode == NormalizeMode::Loudness {
-                            FbButtonKind::Primary
-                        } else {
-                            FbButtonKind::Default
-                        },
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.normalize.mode = NormalizeMode::Loudness;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(fb_button(
-                "norm-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-    }
-
-    fn transient_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Sensitivity",
-                format!("{:.0}%", self.transient_params.sensitivity * 100.0),
-            ))
-            .child(info_row(
-                "Minimum Gap",
-                format!("{:.0} ms", self.transient_params.min_gap_ms),
-            ))
-            .child(info_row("Frequency Focus", self.freq_focus.label()))
-            .child(info_row(
-                "Results",
-                format!("{} transients", self.transients.len()),
-            ))
-            .child(fb_button(
-                "tr-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "tr-markers",
-                        "Add Markers",
-                        FbButtonKind::Default,
-                        !self.transients.is_empty(),
-                        cx.listener(|this, _, _, cx| {
-                            let sr = this.session.target.sample_rate.max(1) as f64;
-                            let start = this
-                                .timeline
-                                .read(cx)
-                                .state
-                                .find_clip(&this.session.target.clip_id)
-                                .map(|(_, c)| c.start_beat as f64)
-                                .unwrap_or(0.0);
-                            let spb = this.timeline.read(cx).state.seconds_per_beat() as f64;
-                            let beats = this
-                                .transients
-                                .iter()
-                                .map(|m| start + (m.source_frame as f64 / sr) / spb.max(1.0e-6))
-                                .collect();
-                            this.dispatch(
-                                AudioToolCommand::AddMarkers {
-                                    beats,
-                                    label: "Add Transient Markers",
-                                },
-                                cx,
-                            );
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tr-warp",
-                        "Create Warp Markers",
-                        FbButtonKind::Default,
-                        !self.transients.is_empty(),
-                        cx.listener(|this, _, _, cx| {
-                            this.dispatch(
-                                AudioToolCommand::AddWarpMarkers {
-                                    clip_id: this.session.target.clip_id.clone(),
-                                    frames: this
-                                        .transients
-                                        .iter()
-                                        .map(|m| m.source_frame)
-                                        .collect(),
-                                },
-                                cx,
-                            );
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tr-slice",
-                        "Slice",
-                        FbButtonKind::Default,
-                        !self.transients.is_empty(),
-                        cx.listener(|this, _, _, cx| {
-                            let sr = this.session.target.sample_rate.max(1) as f32;
-                            let start = this
-                                .timeline
-                                .read(cx)
-                                .state
-                                .find_clip(&this.session.target.clip_id)
-                                .map(|(_, c)| c.start_beat)
-                                .unwrap_or(0.0);
-                            let spb = this.timeline.read(cx).state.seconds_per_beat();
-                            let beats = this
-                                .transients
-                                .iter()
-                                .map(|m| start + (m.source_frame as f32 / sr) / spb.max(1.0e-6))
-                                .collect();
-                            this.dispatch(
-                                AudioToolCommand::SliceClip {
-                                    clip_id: this.session.target.clip_id.clone(),
-                                    beats,
-                                },
-                                cx,
-                            );
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tr-quant",
-                        "Quantize",
-                        FbButtonKind::Default,
-                        false,
-                        |_, _, _| {},
-                    )),
-            )
-    }
-
-    fn time_pitch_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let clip = self
-            .timeline
-            .read(cx)
-            .state
-            .find_clip(&self.session.target.clip_id)
-            .map(|(_, c)| c.clone());
-        let duration = clip
-            .as_ref()
-            .map(|c| c.duration_beats * self.timeline.read(cx).state.seconds_per_beat())
-            .unwrap_or(0.0);
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Time mode",
-                match self.time_mode {
-                    TimePitchMode::Off => "Off",
-                    TimePitchMode::Stretch => "Stretch",
-                    TimePitchMode::FitDuration => "Fit Duration",
-                    TimePitchMode::FollowTempo => "Follow Tempo",
+                    )
                 },
-            ))
-            .child(info_row("Ratio", format!("{:.3} %", self.stretch_percent)))
-            .child(info_row("Target Duration", format!("{duration:.3} s")))
-            .child(info_row(
-                "Original BPM",
-                clip.as_ref()
-                    .and_then(|c| c.stretch.bpm_source)
-                    .map(|b| format!("{b:.3}"))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row("Semitones", format!("{:.0}", self.pitch_semi)))
-            .child(info_row("Cents", format!("{:.0}", self.pitch_cents)))
-            .child(info_row("Formant", "Neutral"))
-            .child(info_row(
-                "Preserve Transients",
-                if self.preserve_transients {
-                    "On"
-                } else {
-                    "Off"
-                },
-            ))
-            .child(info_row("Quality", "High"))
-            .child(
+            )),
+        )
+    }
+
+    fn spectrum_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let snap = self.spectrum.as_ref();
+        let mag = snap.map(|s| s.magnitudes_db.as_slice()).unwrap_or(&[]);
+        let hold = snap.map(|s| s.peak_hold_db.as_slice()).unwrap_or(&[]);
+        let sr = snap
+            .map(|s| s.sample_rate)
+            .unwrap_or(self.session.target.sample_rate);
+        let overlay = {
+            let mut stack = workspace::overlay_stack();
+            stack = stack.child(workspace::overlay_line(self.spectrum_mode.label()));
+            if let Some(snap) = snap {
+                if let Some((bin, db)) = snap
+                    .magnitudes_db
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                {
+                    let hz = bin as f32 * snap.sample_rate as f32 / snap.fft_size.max(1) as f32;
+                    stack = stack.child(workspace::overlay_line(format!(
+                        "Peak {hz:.0} Hz  {db:.1} dB"
+                    )));
+                }
+            } else {
+                stack = stack.child(workspace::overlay_line("Analyze or play to fill"));
+            }
+            stack
+        };
+        workspace::stage(
+            workspace::viz_frame(viz::spectrum_view(mag, hold, sr), overlay),
+            workspace::control_strip(
                 div()
                     .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "tp-off",
-                        "Off",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.time_mode = TimePitchMode::Off;
-                            this.stretch_percent = 100.0;
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tp-stretch",
-                        "Stretch",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.time_mode = TimePitchMode::Stretch;
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tp-plus",
-                        "+1 st",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.pitch_semi = (this.pitch_semi + 1.0).clamp(-24.0, 24.0);
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
-                        "tp-minus",
-                        "−1 st",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.pitch_semi = (this.pitch_semi - 1.0).clamp(-24.0, 24.0);
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    )),
-            )
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(self.spectrum_mode_track(cx))
+                    .child(self.fft_track(cx))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(space::TIGHT))
+                            .child(self.window_track(cx))
+                            .child(self.smooth_track(cx))
+                            .child(workspace::latch(
+                                "peak-hold",
+                                "Hold",
+                                self.peak_hold,
+                                true,
+                                cx.listener(|this, _, _, cx| {
+                                    this.peak_hold = !this.peak_hold;
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
+            ),
+        )
     }
 
-    fn resample_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Current",
-                format!("{} Hz", self.session.target.sample_rate),
-            ))
-            .child(info_row("Target", format!("{} Hz", self.resample_target)))
-            .child(info_row("Quality", "High"))
-            .child(info_row("Mode", "Offline Render"))
-            .child(fb_button(
-                "resample-target",
-                "Cycle Target Rate",
-                FbButtonKind::Default,
-                true,
-                cx.listener(|this, _, _, cx| {
-                    this.resample_target = match this.resample_target {
-                        44_100 => 48_000,
-                        48_000 => 88_200,
-                        88_200 => 96_000,
-                        _ => 44_100,
-                    };
-                    cx.notify();
-                }),
-            ))
-    }
-
-    fn channel_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div().flex().flex_col().gap(px(space::TIGHT)).children(
-            ChannelTransform::ALL.into_iter().map(|mode| {
-                fb_button(
-                    format!("ch-{}", mode.to_tag()),
-                    mode.label(),
-                    if self.channel == mode {
-                        FbButtonKind::Primary
-                    } else {
-                        FbButtonKind::Default
-                    },
-                    true,
+    fn spectrum_mode_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let modes = [
+            (SpectrumMode::RealtimePlayback, "Live"),
+            (SpectrumMode::SelectionAverage, "Avg"),
+            (SpectrumMode::SelectionPeak, "Peak"),
+            (SpectrumMode::StaticCursor, "Cursor"),
+        ];
+        let count = modes.len();
+        workspace::segment_track().children(modes.into_iter().enumerate().map(
+            |(index, (mode, label))| {
+                workspace::compact_segment(
+                    format!("spec-mode-{label}"),
+                    label,
+                    self.spectrum_mode == mode,
+                    workspace::segment_position(index, count),
                     cx.listener(move |this, _, _, cx| {
-                        this.channel = mode;
-                        this.emit_preview(cx);
+                        this.spectrum_mode = mode;
+                        if mode != SpectrumMode::RealtimePlayback {
+                            this.spawn_analyze(cx);
+                        }
                         cx.notify();
                     }),
                 )
-            }),
+            },
+        ))
+    }
+
+    fn fft_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = FftSize::ALL.len();
+        workspace::segment_track().children(FftSize::ALL.into_iter().enumerate().map(
+            |(index, size)| {
+                workspace::compact_segment(
+                    format!("fft-{}", size.label()),
+                    size.label(),
+                    self.fft_size == size,
+                    workspace::segment_position(index, count),
+                    cx.listener(move |this, _, _, cx| {
+                        this.fft_size = size;
+                        cx.notify();
+                    }),
+                )
+            },
+        ))
+    }
+
+    fn window_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let windows = [SpectrumWindow::Hann, SpectrumWindow::BlackmanHarris];
+        let count = windows.len();
+        workspace::segment_track().children(windows.into_iter().enumerate().map(
+            |(index, window)| {
+                workspace::compact_segment(
+                    format!("win-{}", window.label()),
+                    window.label(),
+                    self.spectrum_window == window,
+                    workspace::segment_position(index, count),
+                    cx.listener(move |this, _, _, cx| {
+                        this.spectrum_window = window;
+                        cx.notify();
+                    }),
+                )
+            },
+        ))
+    }
+
+    fn smooth_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = [
+            (SpectrumSmoothing::None, "Off"),
+            (SpectrumSmoothing::SixthOctave, "1/6"),
+            (SpectrumSmoothing::TwelfthOctave, "1/12"),
+        ];
+        let count = options.len();
+        workspace::segment_track().children(options.into_iter().enumerate().map(
+            |(index, (value, label))| {
+                workspace::compact_segment(
+                    format!("smooth-{label}"),
+                    label,
+                    self.smoothing == value,
+                    workspace::segment_position(index, count),
+                    cx.listener(move |this, _, _, cx| {
+                        this.smoothing = value;
+                        cx.notify();
+                    }),
+                )
+            },
+        ))
+    }
+
+    fn loudness_body(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let m = self.loudness;
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(
+                m.map(|v| format!("M {:+.1} LUFS", v.momentary_lufs))
+                    .unwrap_or_else(|| "M —".into()),
+            ))
+            .child(workspace::overlay_line(
+                m.map(|v| format!("S {:+.1} LUFS", v.shortterm_lufs))
+                    .unwrap_or_else(|| "S —".into()),
+            ))
+            .child(workspace::overlay_line(
+                m.map(|v| format!("I {:+.1} LUFS", v.integrated_lufs))
+                    .unwrap_or_else(|| "I —".into()),
+            ))
+            .child(workspace::overlay_line(
+                m.map(|v| {
+                    format!(
+                        "LRA {:.1} LU  TP {:+.1} dBTP",
+                        v.loudness_range, v.true_peak_dbtp
+                    )
+                })
+                .unwrap_or_else(|| "LRA —".into()),
+            ));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::loudness_view(
+                    &self.level_history,
+                    m.map(|v| v.momentary_lufs).unwrap_or(-70.0),
+                    m.map(|v| v.shortterm_lufs).unwrap_or(-70.0),
+                    m.map(|v| v.integrated_lufs).unwrap_or(-70.0),
+                    m.map(|v| v.true_peak_dbtp).unwrap_or(-70.0),
+                    None,
+                ),
+                overlay,
+            ),
+            workspace::control_strip(div().child(workspace::overlay_line(
+                "Momentary · Short-term · Integrated · True Peak",
+            ))),
+        )
+    }
+
+    fn normalize_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let m = self.measurement;
+        let current = match self.normalize.mode {
+            NormalizeMode::Peak => m.map(|v| v.peak_dbfs).unwrap_or(-70.0),
+            NormalizeMode::TruePeak => m.map(|v| v.true_peak_dbtp).unwrap_or(-70.0),
+            NormalizeMode::Loudness => m.and_then(|v| v.lufs_i).unwrap_or(-70.0),
+        };
+        let target = match self.normalize.mode {
+            NormalizeMode::Peak => self.normalize.target_peak_dbfs,
+            NormalizeMode::TruePeak => self.normalize.target_true_peak_dbtp,
+            NormalizeMode::Loudness => self.normalize.target_lufs,
+        };
+        let after = if m.is_some() { target } else { current };
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(self.normalize.mode.label()))
+            .child(workspace::overlay_line(format!("Target {target:.1}")))
+            .child(workspace::overlay_line(
+                m.map(|v| format!("Gain {:+.1} dB", v.required_gain_db))
+                    .unwrap_or_else(|| "Analyze to measure".into()),
+            ));
+        let modes = [
+            (NormalizeMode::Peak, "Peak"),
+            (NormalizeMode::TruePeak, "True Peak"),
+            (NormalizeMode::Loudness, "Loudness"),
+        ];
+        let count = modes.len();
+        workspace::stage(
+            workspace::viz_frame(viz::before_after_bars(current, after, target), overlay),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(
+                        workspace::segment_track().children(modes.into_iter().enumerate().map(
+                            |(index, (mode, label))| {
+                                workspace::compact_segment(
+                                    format!("norm-{label}"),
+                                    label,
+                                    self.normalize.mode == mode,
+                                    workspace::segment_position(index, count),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.normalize.mode = mode;
+                                        cx.notify();
+                                    }),
+                                )
+                            },
+                        )),
+                    )
+                    .child(workspace::param_row(
+                        "Peak",
+                        workspace::unipolar_slider(
+                            "norm-peak",
+                            self.normalize.target_peak_dbfs,
+                            -24.0,
+                            0.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.normalize.target_peak_dbfs = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(-1.0),
+                        ),
+                        format!("{:.1} dB", self.normalize.target_peak_dbfs),
+                    ))
+                    .child(workspace::param_row(
+                        "True Peak",
+                        workspace::unipolar_slider(
+                            "norm-tp",
+                            self.normalize.target_true_peak_dbtp,
+                            -24.0,
+                            0.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.normalize.target_true_peak_dbtp = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(-1.0),
+                        ),
+                        format!("{:.1} dB", self.normalize.target_true_peak_dbtp),
+                    ))
+                    .child(workspace::param_row(
+                        "Loudness",
+                        workspace::unipolar_slider(
+                            "norm-lufs",
+                            self.normalize.target_lufs,
+                            -24.0,
+                            -6.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.normalize.target_lufs = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(-14.0),
+                        ),
+                        format!("{:.1} LUFS", self.normalize.target_lufs),
+                    )),
+            ),
+        )
+    }
+
+    fn transient_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let frames = self
+            .session
+            .target
+            .time_selection
+            .map(|s| (s.end_frame - s.start_frame).max(1) as f32)
+            .unwrap_or(self.session.target.source_frames.max(1) as f32);
+        let markers: Vec<(f32, f32)> = self
+            .transients
+            .iter()
+            .map(|m| ((m.source_frame as f32 / frames).clamp(0.0, 1.0), m.strength))
+            .collect();
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "{} transients",
+                self.transients.len()
+            )))
+            .child(workspace::overlay_line(format!(
+                "Sens {:.0}%  Gap {:.0} ms",
+                self.transient_params.sensitivity * 100.0,
+                self.transient_params.min_gap_ms
+            )));
+        let foci = [
+            (FrequencyFocus::FullBand, "Full"),
+            (FrequencyFocus::Low, "Low"),
+            (FrequencyFocus::Mid, "Mid"),
+            (FrequencyFocus::High, "High"),
+        ];
+        let count = foci.len();
+        workspace::stage(
+            workspace::viz_frame(
+                viz::envelope_markers_view(&self.envelope, &markers),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(workspace::param_row(
+                        "Sensitivity",
+                        workspace::unipolar_slider(
+                            "tr-sens",
+                            self.transient_params.sensitivity,
+                            0.05,
+                            1.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.transient_params.sensitivity = value;
+                                cx.notify();
+                            }),
+                            Some(0.65),
+                        ),
+                        format!("{:.0}%", self.transient_params.sensitivity * 100.0),
+                    ))
+                    .child(workspace::param_row(
+                        "Min Gap",
+                        workspace::unipolar_slider(
+                            "tr-gap",
+                            self.transient_params.min_gap_ms,
+                            1.0,
+                            200.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.transient_params.min_gap_ms = value;
+                                cx.notify();
+                            }),
+                            Some(20.0),
+                        ),
+                        format!("{:.0} ms", self.transient_params.min_gap_ms),
+                    ))
+                    .child(
+                        workspace::segment_track().children(foci.into_iter().enumerate().map(
+                            |(index, (focus, label))| {
+                                workspace::compact_segment(
+                                    format!("tr-focus-{label}"),
+                                    label,
+                                    self.freq_focus == focus,
+                                    workspace::segment_position(index, count),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.freq_focus = focus;
+                                        cx.notify();
+                                    }),
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(space::HAIR))
+                            .child(inspector_mini_button(
+                                "tr-markers",
+                                "Markers",
+                                !self.transients.is_empty(),
+                                cx.listener(|this, _, _, cx| {
+                                    let sr = this.session.target.sample_rate.max(1) as f64;
+                                    let start = this
+                                        .timeline
+                                        .read(cx)
+                                        .state
+                                        .find_clip(&this.session.target.clip_id)
+                                        .map(|(_, c)| c.start_beat as f64)
+                                        .unwrap_or(0.0);
+                                    let spb =
+                                        this.timeline.read(cx).state.seconds_per_beat() as f64;
+                                    let beats = this
+                                        .transients
+                                        .iter()
+                                        .map(|m| {
+                                            start + (m.source_frame as f64 / sr) / spb.max(1.0e-6)
+                                        })
+                                        .collect();
+                                    this.dispatch(
+                                        AudioToolCommand::AddMarkers {
+                                            beats,
+                                            label: "Add Transient Markers",
+                                        },
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(inspector_mini_button(
+                                "tr-warp",
+                                "Warp",
+                                !self.transients.is_empty(),
+                                cx.listener(|this, _, _, cx| {
+                                    this.dispatch(
+                                        AudioToolCommand::AddWarpMarkers {
+                                            clip_id: this.session.target.clip_id.clone(),
+                                            frames: this
+                                                .transients
+                                                .iter()
+                                                .map(|m| m.source_frame)
+                                                .collect(),
+                                        },
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(inspector_mini_button(
+                                "tr-slice",
+                                "Slice",
+                                !self.transients.is_empty(),
+                                cx.listener(|this, _, _, cx| {
+                                    let sr = this.session.target.sample_rate.max(1) as f32;
+                                    let start = this
+                                        .timeline
+                                        .read(cx)
+                                        .state
+                                        .find_clip(&this.session.target.clip_id)
+                                        .map(|(_, c)| c.start_beat)
+                                        .unwrap_or(0.0);
+                                    let spb = this.timeline.read(cx).state.seconds_per_beat();
+                                    let beats = this
+                                        .transients
+                                        .iter()
+                                        .map(|m| {
+                                            start + (m.source_frame as f32 / sr) / spb.max(1.0e-6)
+                                        })
+                                        .collect();
+                                    this.dispatch(
+                                        AudioToolCommand::SliceClip {
+                                            clip_id: this.session.target.clip_id.clone(),
+                                            beats,
+                                        },
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(inspector_mini_button(
+                                "tr-quant",
+                                "Quantize",
+                                false,
+                                |_, _, _| {},
+                            )),
+                    ),
+            ),
+        )
+    }
+
+    fn time_pitch_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ratio = (self.stretch_percent / 100.0) as f32;
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "Time {:.1}%",
+                self.stretch_percent
+            )))
+            .child(workspace::overlay_line(format!(
+                "Pitch {:+.2} st",
+                self.pitch_semi + self.pitch_cents / 100.0
+            )));
+        let modes = [
+            (TimePitchMode::Off, "Off"),
+            (TimePitchMode::Stretch, "Stretch"),
+            (TimePitchMode::FitDuration, "Fit"),
+            (TimePitchMode::FollowTempo, "Tempo"),
+        ];
+        let count = modes.len();
+        workspace::stage(
+            workspace::viz_frame(
+                viz::time_pitch_view(ratio, self.pitch_semi + self.pitch_cents / 100.0),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(
+                        workspace::segment_track().children(modes.into_iter().enumerate().map(
+                            |(index, (mode, label))| {
+                                workspace::compact_segment(
+                                    format!("tp-{label}"),
+                                    label,
+                                    self.time_mode == mode,
+                                    workspace::segment_position(index, count),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.time_mode = mode;
+                                        if mode == TimePitchMode::Off {
+                                            this.stretch_percent = 100.0;
+                                        }
+                                        this.emit_preview(cx);
+                                        cx.notify();
+                                    }),
+                                )
+                            },
+                        )),
+                    )
+                    .child(workspace::param_row(
+                        "Stretch",
+                        workspace::unipolar_slider(
+                            "tp-stretch",
+                            self.stretch_percent as f32,
+                            25.0,
+                            400.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.stretch_percent = value as f64;
+                                this.time_mode = TimePitchMode::Stretch;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(100.0),
+                        ),
+                        format!("{:.1}%", self.stretch_percent),
+                    ))
+                    .child(workspace::param_row(
+                        "Semitones",
+                        workspace::unipolar_slider(
+                            "tp-semi",
+                            self.pitch_semi,
+                            -24.0,
+                            24.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.pitch_semi = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(0.0),
+                        ),
+                        format!("{:+.1}", self.pitch_semi),
+                    ))
+                    .child(workspace::param_row(
+                        "Cents",
+                        workspace::unipolar_slider(
+                            "tp-cents",
+                            self.pitch_cents,
+                            -50.0,
+                            50.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.pitch_cents = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(0.0),
+                        ),
+                        format!("{:+.0}", self.pitch_cents),
+                    ))
+                    .child(workspace::latch(
+                        "tp-trans",
+                        "Preserve Transients",
+                        self.preserve_transients,
+                        true,
+                        cx.listener(|this, _, _, cx| {
+                            this.preserve_transients = !this.preserve_transients;
+                            cx.notify();
+                        }),
+                    )),
+            ),
+        )
+    }
+
+    fn resample_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mag = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        let current = self.session.target.sample_rate as f32;
+        let target = self.resample_target as f32;
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!("Now {current:.0} Hz")))
+            .child(workspace::overlay_line(format!("Nyquist → {target:.0} Hz")));
+        let rates = [44_100u32, 48_000, 88_200, 96_000, 176_400, 192_000];
+        let count = rates.len();
+        workspace::stage(
+            workspace::viz_frame(viz::resample_view(current, target, mag), overlay),
+            workspace::control_strip(workspace::segment_track().children(
+                rates.into_iter().enumerate().map(|(index, rate)| {
+                    workspace::compact_segment(
+                        format!("sr-{rate}"),
+                        if rate >= 1000 {
+                            format!("{}k", rate / 1000)
+                        } else {
+                            rate.to_string()
+                        },
+                        self.resample_target == rate,
+                        workspace::segment_position(index, count),
+                        cx.listener(move |this, _, _, cx| {
+                            this.resample_target = rate;
+                            cx.notify();
+                        }),
+                    )
+                }),
+            )),
+        )
+    }
+
+    fn channel_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let overlay =
+            workspace::overlay_stack().child(workspace::overlay_line(self.channel.label()));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::channel_matrix_view(self.channel.to_tag() as usize),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(space::HAIR))
+                    .children(ChannelTransform::ALL.into_iter().map(|mode| {
+                        workspace::latch(
+                            format!("ch-{}", mode.to_tag()),
+                            mode.label(),
+                            self.channel == mode,
+                            true,
+                            cx.listener(move |this, _, _, cx| {
+                                this.channel = mode;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                        )
+                    })),
+            ),
         )
     }
 
     fn phase_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let x = ((self.phase_corr + 1.0) * 0.5).clamp(0.0, 1.0);
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(info_row("Mode", if self.phase_ms { "M/S" } else { "L/R" }))
-            .child(info_row("Correlation", format!("{:.2}", self.phase_corr)))
-            .child(
-                div()
-                    .h(px(10.0))
-                    .w_full()
-                    .rounded(px(radius::PILL))
-                    .bg(Colors::surface_canvas())
-                    .child(
-                        div().relative().size_full().child(
-                            div()
-                                .absolute()
-                                .left(gpui::relative(x))
-                                .w(px(8.0))
-                                .h_full()
-                                .bg(Colors::accent_primary()),
-                        ),
-                    ),
-            )
-            .child(row_label("−1 ← 0 → +1"))
-            .child(fb_button(
-                "phase-mode",
-                if self.phase_ms { "Use L/R" } else { "Use M/S" },
-                FbButtonKind::Default,
-                true,
-                cx.listener(|this, _, _, cx| {
-                    this.phase_ms = !this.phase_ms;
-                    cx.notify();
-                }),
-            ))
-    }
-
-    fn dc_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row("Left", format!("{:+.4}", self.dc.left)))
-            .child(info_row("Right", format!("{:+.4}", self.dc.right)))
-            .child(fb_button(
-                "dc-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-    }
-
-    fn bpm_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row("Minimum BPM", format!("{:.0}", self.bpm_min)))
-            .child(info_row("Maximum BPM", format!("{:.0}", self.bpm_max)))
-            .children(self.bpm.iter().take(3).map(|c| {
-                info_row(
-                    "Candidate",
-                    format!("{:.2}  ({:.0}%)", c.bpm, c.confidence * 100.0),
-                )
+        let trail: Vec<(f32, f32)> = self.gonio_trail.iter().copied().collect();
+        let history: Vec<f32> = self.corr_history.iter().copied().collect();
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(if self.phase_ms {
+                "M/S"
+            } else {
+                "L/R"
             }))
-            .child(fb_button(
-                "bpm-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-            .child(
+            .child(workspace::overlay_line(format!(
+                "Corr {:+.2}",
+                self.phase.correlation
+            )));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::goniometer_view(&trail, self.phase.correlation, &history),
+                overlay,
+            ),
+            workspace::control_strip({
+                let options = [(false, "L/R"), (true, "M/S")];
+                let count = options.len();
+                workspace::segment_track().children(options.into_iter().enumerate().map(
+                    |(index, (ms, label))| {
+                        workspace::compact_segment(
+                            format!("phase-{label}"),
+                            label,
+                            self.phase_ms == ms,
+                            workspace::segment_position(index, count),
+                            cx.listener(move |this, _, _, cx| {
+                                this.phase_ms = ms;
+                                cx.notify();
+                            }),
+                        )
+                    },
+                ))
+            }),
+        )
+    }
+
+    fn dc_body(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!("L {:+.4}", self.dc.left)))
+            .child(workspace::overlay_line(format!("R {:+.4}", self.dc.right)));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::dc_view(self.dc.left, self.dc.right, &self.envelope),
+                overlay,
+            ),
+            workspace::control_strip(div().child(workspace::overlay_line(
+                "Offset lines on the waveform mean. Apply removes DC.",
+            ))),
+        )
+    }
+
+    fn bpm_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let values: Vec<(f32, f32)> = self.bpm.iter().map(|c| (c.bpm, c.confidence)).collect();
+        let overlay = workspace::overlay_stack().child(workspace::overlay_line(
+            self.bpm
+                .first()
+                .map(|c| format!("{:.2} BPM  {:.0}%", c.bpm, c.confidence * 100.0))
+                .unwrap_or_else(|| "No tempo yet".into()),
+        ));
+        workspace::stage(
+            workspace::viz_frame(viz::candidate_bars(&values, 0), overlay),
+            workspace::control_strip(
                 div()
-                    .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "bpm-use",
-                        "Use as Original BPM",
-                        FbButtonKind::Default,
-                        self.bpm.first().is_some(),
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(best) = this.bpm.first() {
-                                this.dispatch(
-                                    AudioToolCommand::UseOriginalBpm {
-                                        clip_id: this.session.target.clip_id.clone(),
-                                        bpm: best.bpm as f64,
-                                    },
-                                    cx,
-                                );
-                            }
-                        }),
-                    ))
-                    .child(fb_button(
-                        "bpm-tempo",
-                        "Add Tempo Marker",
-                        FbButtonKind::Default,
-                        self.bpm.first().is_some(),
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(best) = this.bpm.first() {
-                                let beat = this
-                                    .timeline
-                                    .read(cx)
-                                    .state
-                                    .find_clip(&this.session.target.clip_id)
-                                    .map(|(_, c)| c.start_beat as f64)
-                                    .unwrap_or(0.0);
-                                this.dispatch(
-                                    AudioToolCommand::AddTempoPoint {
-                                        beat,
-                                        bpm: best.bpm as f64,
-                                    },
-                                    cx,
-                                );
-                            }
-                        }),
-                    )),
-            )
-    }
-
-    fn key_body(
-        &self,
-        analyze: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let detected = self.keys.first();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Detected",
-                detected
-                    .map(|k| k.display_label())
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "Confidence",
-                detected
-                    .map(|k| format!("{:.2}", k.confidence))
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .child(info_row(
-                "User key",
-                self.user_key
-                    .map(|k| k.display_label())
-                    .unwrap_or_else(|| "—".into()),
-            ))
-            .children(
-                self.keys
-                    .iter()
-                    .skip(1)
-                    .take(2)
-                    .map(|k| info_row("Alternate", k.display_label())),
-            )
-            .child(fb_button(
-                "key-analyze",
-                "Analyze",
-                FbButtonKind::Default,
-                true,
-                analyze,
-            ))
-    }
-
-    fn repair_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let modules = [
-            AudioRepairModule::Denoise,
-            AudioRepairModule::DeClick,
-            AudioRepairModule::DeHum,
-            AudioRepairModule::DeReverb,
-            AudioRepairModule::DeBleed,
-            AudioRepairModule::DeFeedback,
-            AudioRepairModule::DrumSilencer,
-            AudioRepairModule::SpectralRepair,
-        ];
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .children(modules.into_iter().map(|module| {
-                fb_button(
-                    format!("repair-{}", module.label()),
-                    if module.is_available() {
-                        module.label().to_string()
-                    } else {
-                        format!("{} (unavailable)", module.label())
-                    },
-                    if self.repair_module == module {
-                        FbButtonKind::Primary
-                    } else {
-                        FbButtonKind::Default
-                    },
-                    module.is_available(),
-                    cx.listener(move |this, _, _, cx| {
-                        this.repair_module = module;
-                        cx.notify();
-                    }),
-                )
-            }))
-            .child(match self.repair_module {
-                AudioRepairModule::Denoise => div()
                     .flex()
                     .flex_col()
                     .gap(px(space::TIGHT))
-                    .child(info_row(
-                        "Reduction",
-                        format!("{:.0} dB", self.denoise.reduction_db),
+                    .child(workspace::param_row(
+                        "Min",
+                        workspace::unipolar_slider(
+                            "bpm-min",
+                            self.bpm_min,
+                            40.0,
+                            200.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.bpm_min = value.min(this.bpm_max - 1.0);
+                                cx.notify();
+                            }),
+                            Some(60.0),
+                        ),
+                        format!("{:.0}", self.bpm_min),
                     ))
-                    .child(info_row(
-                        "Threshold",
-                        format!("{:.0} dB", self.denoise.threshold_db),
-                    ))
-                    .child(info_row(
-                        "Noise profile",
-                        if self.learned_noise.is_some() {
-                            "Learned"
-                        } else {
-                            "None"
-                        },
+                    .child(workspace::param_row(
+                        "Max",
+                        workspace::unipolar_slider(
+                            "bpm-max",
+                            self.bpm_max,
+                            60.0,
+                            300.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.bpm_max = value.max(this.bpm_min + 1.0);
+                                cx.notify();
+                            }),
+                            Some(200.0),
+                        ),
+                        format!("{:.0}", self.bpm_max),
                     ))
                     .child(
                         div()
                             .flex()
-                            .gap(px(space::BASE))
-                            .child(fb_button(
-                                "dn-minus",
-                                "−3 dB",
-                                FbButtonKind::Default,
-                                true,
+                            .gap(px(space::HAIR))
+                            .child(inspector_mini_button(
+                                "bpm-use",
+                                "Use Original BPM",
+                                self.bpm.first().is_some(),
                                 cx.listener(|this, _, _, cx| {
-                                    this.denoise.reduction_db =
-                                        (this.denoise.reduction_db - 3.0).max(0.0);
-                                    this.emit_preview(cx);
-                                    cx.notify();
+                                    if let Some(best) = this.bpm.first() {
+                                        this.dispatch(
+                                            AudioToolCommand::UseOriginalBpm {
+                                                clip_id: this.session.target.clip_id.clone(),
+                                                bpm: best.bpm as f64,
+                                            },
+                                            cx,
+                                        );
+                                    }
                                 }),
                             ))
-                            .child(fb_button(
-                                "dn-plus",
-                                "+3 dB",
-                                FbButtonKind::Default,
-                                true,
+                            .child(inspector_mini_button(
+                                "bpm-tempo",
+                                "Tempo Marker",
+                                self.bpm.first().is_some(),
                                 cx.listener(|this, _, _, cx| {
-                                    this.denoise.reduction_db =
-                                        (this.denoise.reduction_db + 3.0).min(24.0);
-                                    this.emit_preview(cx);
-                                    cx.notify();
+                                    if let Some(best) = this.bpm.first() {
+                                        let beat = this
+                                            .timeline
+                                            .read(cx)
+                                            .state
+                                            .find_clip(&this.session.target.clip_id)
+                                            .map(|(_, c)| c.start_beat as f64)
+                                            .unwrap_or(0.0);
+                                        this.dispatch(
+                                            AudioToolCommand::AddTempoPoint {
+                                                beat,
+                                                bpm: best.bpm as f64,
+                                            },
+                                            cx,
+                                        );
+                                    }
                                 }),
-                            ))
-                            .child(fb_button(
-                                "dn-learn",
-                                "Learn Noise Profile",
-                                FbButtonKind::Default,
-                                true,
-                                cx.listener(|this, _, _, cx| this.spawn_learn_noise(cx)),
                             )),
+                    ),
+            ),
+        )
+    }
+
+    fn key_body(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let mut conf = [0.0f32; 12];
+        for key in &self.keys {
+            let idx = tonic_index(key.tonic);
+            conf[idx] = conf[idx].max(key.confidence);
+        }
+        let tonic = self
+            .keys
+            .first()
+            .map(|k| tonic_index(k.tonic) as u8)
+            .unwrap_or(0);
+        let values: Vec<(f32, f32)> = self
+            .keys
+            .iter()
+            .map(|k| (tonic_index(k.tonic) as f32, k.confidence))
+            .collect();
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(
+                self.keys
+                    .first()
+                    .map(|k| k.display_label())
+                    .unwrap_or_else(|| "No key yet".into()),
+            ))
+            .child(workspace::overlay_line(
+                self.keys
+                    .first()
+                    .map(|k| format!("Confidence {:.2}", k.confidence))
+                    .unwrap_or_default(),
+            ));
+        workspace::stage(
+            workspace::viz_frame(
+                div()
+                    .flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .child(viz::pitch_class_view(tonic, &conf)),
                     )
-                    .into_any_element(),
-                AudioRepairModule::DeClick => div()
+                    .child(
+                        div()
+                            .w(px(120.0))
+                            .h_full()
+                            .child(viz::candidate_bars(&values, 0)),
+                    ),
+                overlay,
+            ),
+            workspace::control_strip(div().child(workspace::overlay_line(
+                "Pitch-class energy · ranked candidates",
+            ))),
+        )
+    }
+
+    fn repair_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.repair_module {
+            AudioRepairModule::Denoise => self.denoise_body(cx).into_any_element(),
+            AudioRepairModule::DeClick => self.declick_body(cx).into_any_element(),
+            AudioRepairModule::DeHum => self.dehum_body(cx).into_any_element(),
+            AudioRepairModule::SpectralRepair => self.spectral_body(cx).into_any_element(),
+            _ => workspace::stage(
+                workspace::viz_frame(
+                    viz::spectrum_view(&[], &[], self.session.target.sample_rate),
+                    workspace::overlay_line("This module is not available yet."),
+                ),
+                workspace::control_strip(div()),
+            )
+            .into_any_element(),
+        }
+    }
+
+    fn denoise_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mag = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        let profile = self.learned_noise.as_deref().unwrap_or(&[]);
+        let sr = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.sample_rate)
+            .unwrap_or(self.session.target.sample_rate);
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "Reduction {:.1} dB",
+                self.denoise.reduction_db
+            )))
+            .child(workspace::overlay_line(if self.learned_noise.is_some() {
+                "Noise profile learned"
+            } else {
+                "Learn a profile from the selection"
+            }));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::noise_profile_view(mag, profile, sr, self.denoise.reduction_db),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
                     .flex()
                     .flex_col()
                     .gap(px(space::TIGHT))
-                    .child(info_row(
+                    .child(workspace::param_row(
+                        "Reduction",
+                        workspace::unipolar_slider(
+                            "dn-red",
+                            self.denoise.reduction_db,
+                            0.0,
+                            24.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.denoise.reduction_db = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(12.0),
+                        ),
+                        format!("{:.1} dB", self.denoise.reduction_db),
+                    ))
+                    .child(workspace::param_row(
+                        "Threshold",
+                        workspace::unipolar_slider(
+                            "dn-thr",
+                            self.denoise.threshold_db,
+                            -80.0,
+                            -12.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.denoise.threshold_db = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(-48.0),
+                        ),
+                        format!("{:.0} dB", self.denoise.threshold_db),
+                    ))
+                    .child(inspector_mini_button(
+                        "dn-learn",
+                        "Learn Noise Profile",
+                        true,
+                        cx.listener(|this, _, _, cx| this.spawn_learn_noise(cx)),
+                    )),
+            ),
+        )
+    }
+
+    fn declick_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let markers: Vec<(f32, f32)> = {
+            let env = &self.envelope;
+            if env.len() < 3 {
+                Vec::new()
+            } else {
+                let mean = env.iter().sum::<f32>() / env.len() as f32;
+                let thresh = mean * (2.5 - self.declick.sensitivity).max(0.4);
+                env.iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        if *v > thresh {
+                            Some((
+                                i as f32 / env.len() as f32,
+                                (*v / (thresh + 1.0e-6)).min(1.0),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "{} candidate clicks",
+                markers.len()
+            )))
+            .child(workspace::overlay_line(format!(
+                "Sens {:.0}%  Width {}",
+                self.declick.sensitivity * 100.0,
+                self.declick.max_click_width
+            )));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::envelope_markers_view(&self.envelope, &markers),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(workspace::param_row(
                         "Sensitivity",
+                        workspace::unipolar_slider(
+                            "dc-sens",
+                            self.declick.sensitivity,
+                            0.05,
+                            1.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.declick.sensitivity = value;
+                                cx.notify();
+                            }),
+                            Some(0.65),
+                        ),
                         format!("{:.0}%", self.declick.sensitivity * 100.0),
                     ))
-                    .child(info_row(
-                        "Max Click Width",
+                    .child(workspace::param_row(
+                        "Width",
+                        workspace::unipolar_slider(
+                            "dc-width",
+                            self.declick.max_click_width as f32,
+                            2.0,
+                            64.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.declick.max_click_width = value.round() as usize;
+                                cx.notify();
+                            }),
+                            Some(12.0),
+                        ),
                         format!("{} smp", self.declick.max_click_width),
-                    ))
-                    .child(fb_button(
-                        "dc-sens",
-                        "Cycle Sensitivity",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.declick.sensitivity = if this.declick.sensitivity < 0.5 {
-                                0.65
-                            } else if this.declick.sensitivity < 0.85 {
-                                0.9
-                            } else {
-                                0.35
-                            };
-                            cx.notify();
-                        }),
-                    ))
-                    .into_any_element(),
-                AudioRepairModule::DeHum => div()
+                    )),
+            ),
+        )
+    }
+
+    fn dehum_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mag = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        let sr = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.sample_rate)
+            .unwrap_or(self.session.target.sample_rate);
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "{:.0} Hz × {} harmonics",
+                self.dehum.base_hz, self.dehum.harmonics
+            )))
+            .child(workspace::overlay_line(format!(
+                "Reduction {:.1} dB",
+                self.dehum.reduction_db
+            )));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::hum_harmonics_view(mag, sr, self.dehum.base_hz, self.dehum.harmonics),
+                overlay,
+            ),
+            workspace::control_strip(
+                div()
                     .flex()
                     .flex_col()
                     .gap(px(space::TIGHT))
-                    .child(info_row("Base", format!("{:.0} Hz", self.dehum.base_hz)))
-                    .child(info_row("Harmonics", format!("{}", self.dehum.harmonics)))
-                    .child(info_row(
+                    .child({
+                        let options = [(50.0f32, "50 Hz"), (60.0, "60 Hz")];
+                        let count = options.len();
+                        workspace::segment_track().children(options.into_iter().enumerate().map(
+                            |(index, (hz, label))| {
+                                workspace::compact_segment(
+                                    format!("dh-{label}"),
+                                    label,
+                                    (self.dehum.base_hz - hz).abs() < 1.0,
+                                    workspace::segment_position(index, count),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.dehum.base_hz = hz;
+                                        this.emit_preview(cx);
+                                        cx.notify();
+                                    }),
+                                )
+                            },
+                        ))
+                    })
+                    .child(workspace::param_row(
+                        "Harmonics",
+                        workspace::unipolar_slider(
+                            "dh-harm",
+                            self.dehum.harmonics as f32,
+                            1.0,
+                            10.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.dehum.harmonics = value.round().clamp(1.0, 10.0) as u8;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(4.0),
+                        ),
+                        format!("{}", self.dehum.harmonics),
+                    ))
+                    .child(workspace::param_row(
                         "Reduction",
-                        format!("{:.0} dB", self.dehum.reduction_db),
-                    ))
-                    .child(fb_button(
-                        "dh-base",
-                        "Cycle 50/60 Hz",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.dehum.base_hz = if (this.dehum.base_hz - 50.0).abs() < 1.0 {
-                                60.0
-                            } else {
-                                50.0
-                            };
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    .into_any_element(),
-                AudioRepairModule::SpectralRepair => div()
-                    .child(row_label(
-                        "Use Spectral Processing with a spectral selection.",
-                    ))
-                    .into_any_element(),
-                _ => div()
-                    .child(row_label("This module is not available yet."))
-                    .into_any_element(),
-            })
+                        workspace::unipolar_slider(
+                            "dh-red",
+                            self.dehum.reduction_db,
+                            0.0,
+                            48.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.dehum.reduction_db = value;
+                                this.emit_preview(cx);
+                                cx.notify();
+                            }),
+                            Some(18.0),
+                        ),
+                        format!("{:.1} dB", self.dehum.reduction_db),
+                    )),
+            ),
+        )
     }
 
     fn spectral_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mag = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        let sr = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.sample_rate)
+            .unwrap_or(self.session.target.sample_rate);
         let sel = self.session.target.spectral_selection;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row(
-                "Time",
-                sel.map(|s| format!("{}–{}", s.start_frame, s.end_frame))
-                    .unwrap_or_else(|| "entire clip".into()),
-            ))
-            .child(info_row(
-                "Frequency",
-                sel.map(|s| format!("{:.0}–{:.0} Hz", s.min_hz, s.max_hz))
-                    .unwrap_or_else(|| "full band".into()),
-            ))
-            .child(info_row(
-                "Gain",
-                format!("{:+.1} dB", self.spectral_gain_db),
-            ))
-            .child(row_label("Apply writes a derived WAV via STFT gain."))
-            .child(
+        let min_hz = sel.map(|s| s.min_hz).unwrap_or(20.0);
+        let max_hz = sel.map(|s| s.max_hz).unwrap_or(sr as f32 * 0.5);
+        let overlay = workspace::overlay_stack()
+            .child(workspace::overlay_line(format!(
+                "{min_hz:.0}–{max_hz:.0} Hz"
+            )))
+            .child(workspace::overlay_line(format!(
+                "Gain {:+.1} dB",
+                self.spectral_gain_db
+            )));
+        workspace::stage(
+            workspace::viz_frame(
+                viz::spectral_gain_view(mag, sr, min_hz, max_hz, self.spectral_gain_db),
+                overlay,
+            ),
+            workspace::control_strip(
                 div()
                     .flex()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "sg-minus",
-                        "−3 dB",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.spectral_gain_db = (this.spectral_gain_db - 3.0).max(-120.0);
-                            cx.notify();
-                        }),
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(workspace::param_row(
+                        "Gain",
+                        workspace::unipolar_slider(
+                            "sg-gain",
+                            self.spectral_gain_db,
+                            -48.0,
+                            24.0,
+                            bind_f32(cx, |this, value, cx| {
+                                this.spectral_gain_db = value;
+                                cx.notify();
+                            }),
+                            Some(0.0),
+                        ),
+                        format!("{:+.1} dB", self.spectral_gain_db),
                     ))
-                    .child(fb_button(
-                        "sg-plus",
-                        "+3 dB",
-                        FbButtonKind::Default,
-                        true,
-                        cx.listener(|this, _, _, cx| {
-                            this.spectral_gain_db = (this.spectral_gain_db + 3.0).min(24.0);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(fb_button(
+                    .child(inspector_mini_button(
                         "sg-silence",
-                        "Silence",
-                        FbButtonKind::Default,
+                        "Silence Band",
                         true,
                         cx.listener(|this, _, _, cx| {
                             this.spectral_gain_db = -120.0;
                             cx.notify();
                         }),
                     )),
-            )
+            ),
+        )
     }
 
     fn spectrogram_settings_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(info_row("FFT", self.fft_size.label()))
-            .child(info_row("Window", self.spectrum_window.label()))
-            .child(row_label("These settings drive the Spectrum Analyzer FFT."))
-            .child(fb_button(
-                "specset-fft",
-                "Cycle FFT",
-                FbButtonKind::Default,
-                true,
-                cx.listener(|this, _, _, cx| {
-                    this.fft_size = match this.fft_size {
-                        FftSize::N512 => FftSize::N1024,
-                        FftSize::N1024 => FftSize::N2048,
-                        FftSize::N2048 => FftSize::N4096,
-                        FftSize::N4096 => FftSize::N8192,
-                        FftSize::N8192 => FftSize::N16384,
-                        FftSize::N16384 => FftSize::N512,
-                    };
-                    cx.notify();
-                }),
-            ))
+        let mag = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        let hold = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.peak_hold_db.as_slice())
+            .unwrap_or(&[]);
+        let sr = self.session.target.sample_rate;
+        workspace::stage(
+            workspace::viz_frame(
+                viz::spectrum_view(mag, hold, sr),
+                workspace::overlay_line("FFT window for Spectrum Analyzer"),
+            ),
+            workspace::control_strip(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    .child(self.fft_track(cx))
+                    .child(self.window_track(cx)),
+            ),
+        )
     }
 }
 
