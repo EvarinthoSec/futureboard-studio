@@ -133,6 +133,10 @@ struct PackageArgs {
     /// Intentionally package without the shared CEF runtime.
     #[arg(long)]
     no_cef: bool,
+
+    /// Skip wrapping a macOS package into `Futureboard Studio.app`.
+    #[arg(long)]
+    no_bundle: bool,
 }
 
 fn main() -> ExitCode {
@@ -187,6 +191,7 @@ fn run_package(args: PackageArgs) -> ExitCode {
             false,
         ),
         stage_cef: !args.no_cef,
+        bundle_macos: !args.no_bundle,
     };
     match package::run(&options) {
         Ok(path) => {

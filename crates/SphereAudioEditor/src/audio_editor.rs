@@ -21,6 +21,7 @@ use crate::editing::{
 use crate::spectrogram::{
     AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramViewModel,
 };
+use crate::tools::AudioToolKind;
 use crate::waveform_view::{WaveformViewModel, waveform_view};
 
 /// Theme tokens passed from the host shell (Futureboard dark DAW palette).
@@ -66,6 +67,7 @@ pub enum AudioEditorEvent {
     SetFollowTempo(bool),
     SetReverse(bool),
     SetDenoiseAmount(f32),
+    OpenTool(AudioToolKind),
 }
 
 /// One of the compact editor controls that opens a menu. Keeping this in the
@@ -82,6 +84,7 @@ pub enum AudioEditorDropdown {
     FollowTempo,
     Reverse,
     Denoise,
+    Tools,
 }
 
 pub type AudioEditorEventHandler = Arc<dyn Fn(AudioEditorEvent, &mut Window, &mut App) + 'static>;
@@ -110,6 +113,10 @@ pub struct AudioEditorViewModel {
     pub file_label: Option<String>,
     /// Immutable source path used only by the host's background analysis job.
     pub source_path: Option<String>,
+    /// Inclusive source-frame window this clip currently plays.
+    pub source_start_frame: i64,
+    /// Exclusive source-frame window end. Equal to `source_start_frame` when unknown.
+    pub source_end_frame: i64,
     pub start_beat: f32,
     pub duration_beats: f32,
     pub offset_beats: f32,
@@ -152,6 +159,8 @@ pub struct AudioEditorViewModel {
 const TOOLBAR_H: f32 = 32.0;
 const STATUS_H: f32 = 24.0;
 const INSPECTOR_W: f32 = 174.0;
+pub const AUDIO_EDITOR_INSPECTOR_WIDTH: f32 = INSPECTOR_W;
+pub const AUDIO_EDITOR_TOOLS_WIDTH: f32 = 148.0;
 const GRID_SUBDIV: f32 = 0.25;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -212,31 +221,127 @@ fn toolbar_button(
 struct DropdownOption {
     label: &'static str,
     selected: bool,
-    event: AudioEditorEvent,
+    heading: bool,
+    event: Option<AudioEditorEvent>,
 }
 
 fn dropdown_option(label: &'static str, selected: bool, event: AudioEditorEvent) -> DropdownOption {
     DropdownOption {
         label,
         selected,
-        event,
+        heading: false,
+        event: Some(event),
+    }
+}
+
+fn dropdown_heading(label: &'static str) -> DropdownOption {
+    DropdownOption {
+        label,
+        selected: false,
+        heading: true,
+        event: None,
     }
 }
 
 fn tool_options(active: AudioEditorTool) -> Vec<DropdownOption> {
     [
-        ("Pointer", AudioEditorTool::Pointer),
-        ("Range", AudioEditorTool::Range),
-        ("Spectral Range", AudioEditorTool::SpectralRange),
-        ("Split", AudioEditorTool::Split),
-        ("Fade", AudioEditorTool::Fade),
-        ("Warp", AudioEditorTool::Warp),
-        ("Transient", AudioEditorTool::Transient),
-        ("Draw Envelope", AudioEditorTool::Draw),
+        AudioEditorTool::Pointer,
+        AudioEditorTool::Range,
+        AudioEditorTool::SpectralRange,
+        AudioEditorTool::Split,
+        AudioEditorTool::Trim,
+        AudioEditorTool::Fade,
+        AudioEditorTool::Marker,
+        AudioEditorTool::Draw,
+        AudioEditorTool::Scrub,
     ]
     .into_iter()
-    .map(|(label, tool)| dropdown_option(label, active == tool, AudioEditorEvent::SetTool(tool)))
+    .map(|tool| {
+        dropdown_option(
+            tool.label(),
+            active == tool,
+            AudioEditorEvent::SetTool(tool),
+        )
+    })
     .collect()
+}
+
+fn tools_menu_options() -> Vec<DropdownOption> {
+    vec![
+        dropdown_heading("Analysis"),
+        dropdown_option(
+            "Spectrum Analyzer",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::SpectrumAnalyzer),
+        ),
+        dropdown_option(
+            "Loudness",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::Loudness),
+        ),
+        dropdown_option(
+            "BPM",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::BpmAnalysis),
+        ),
+        dropdown_option(
+            "Key",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::KeyAnalysis),
+        ),
+        dropdown_option(
+            "Transients",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::TransientDetector),
+        ),
+        dropdown_heading("Process"),
+        dropdown_option(
+            "Normalize",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::Normalize),
+        ),
+        dropdown_option(
+            "Time & Pitch",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::TimePitch),
+        ),
+        dropdown_option(
+            "Resample",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::Resample),
+        ),
+        dropdown_option(
+            "Channel Tools",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::ChannelTools),
+        ),
+        dropdown_option(
+            "DC Offset",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::DcOffset),
+        ),
+        dropdown_option(
+            "Audio Repair",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::AudioRepair),
+        ),
+        dropdown_option(
+            "Spectral Processing",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::SpectralProcessor),
+        ),
+        dropdown_heading("View"),
+        dropdown_option(
+            "Spectrogram Settings",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::SpectrogramSettings),
+        ),
+        dropdown_option(
+            "Phase Analyzer",
+            false,
+            AudioEditorEvent::OpenTool(AudioToolKind::PhaseAnalyzer),
+        ),
+    ]
 }
 
 fn dropdown_button(
@@ -341,9 +446,11 @@ fn dropdown_button(
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .children(options.into_iter().enumerate().map(move |(index, option)| {
             let callbacks = callbacks_for_options.clone();
+            let heading = option.heading;
+            let event = option.event;
             div()
                 .id((id, index))
-                .min_h(px(24.0))
+                .min_h(px(if heading { 20.0 } else { 24.0 }))
                 .w_full()
                 .px(px(7.0))
                 .flex()
@@ -355,18 +462,29 @@ fn dropdown_button(
                 } else {
                     gpui::transparent_black().into()
                 })
-                .text_size(px(10.5))
-                .text_color(if option.selected {
+                .text_size(px(if heading { 9.5 } else { 10.5 }))
+                .font_weight(if heading {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if heading {
+                    theme.text_muted
+                } else if option.selected {
                     theme.text_primary
                 } else {
                     theme.text_secondary
                 })
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|s| s.bg(with_alpha(theme.surface_base, 0.9)))
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    emit(&callbacks, option.event, window, cx);
-                    window.prevent_default();
+                .when(!heading && event.is_some(), |this| {
+                    this.cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|s| s.bg(with_alpha(theme.surface_base, 0.9)))
+                })
+                .when_some(event.filter(|_| !heading), |this, event| {
+                    this.on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        emit(&callbacks, event, window, cx);
+                        window.prevent_default();
+                    })
                 })
                 .child(option.label)
                 .child(if option.selected { "✓" } else { "" })
@@ -911,96 +1029,6 @@ fn toolbar(
                     state.snap == AudioEditorSnap::Grid,
                     AudioEditorEvent::SetSnap(AudioEditorSnap::Grid),
                 ),
-                dropdown_option(
-                    "Zero Cross",
-                    state.snap == AudioEditorSnap::ZeroCrossing,
-                    AudioEditorEvent::SetSnap(AudioEditorSnap::ZeroCrossing),
-                ),
-                dropdown_option(
-                    "Markers",
-                    state.snap == AudioEditorSnap::Markers,
-                    AudioEditorEvent::SetSnap(AudioEditorSnap::Markers),
-                ),
-                dropdown_option(
-                    "Transients",
-                    state.snap == AudioEditorSnap::Transients,
-                    AudioEditorEvent::SetSnap(AudioEditorSnap::Transients),
-                ),
-            ],
-        ))
-        .child(dropdown_button(
-            "audio-channel-dropdown",
-            "Channels",
-            vm.channel_mode.label(),
-            state.open_dropdown == Some(AudioEditorDropdown::Channel),
-            104.0,
-            &vm.theme,
-            callbacks,
-            AudioEditorDropdown::Channel,
-            vec![
-                dropdown_option(
-                    "Combined",
-                    vm.channel_mode == AudioChannelMode::Combined,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::Combined),
-                ),
-                dropdown_option(
-                    "Split Stereo",
-                    vm.channel_mode == AudioChannelMode::SplitStereo,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::SplitStereo),
-                ),
-                dropdown_option(
-                    "Left",
-                    vm.channel_mode == AudioChannelMode::Left,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::Left),
-                ),
-                dropdown_option(
-                    "Right",
-                    vm.channel_mode == AudioChannelMode::Right,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::Right),
-                ),
-                dropdown_option(
-                    "Mono Sum",
-                    vm.channel_mode == AudioChannelMode::MonoSum,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::MonoSum),
-                ),
-                dropdown_option(
-                    "Channels",
-                    vm.channel_mode == AudioChannelMode::Channels,
-                    AudioEditorEvent::SetChannelMode(AudioChannelMode::Channels),
-                ),
-            ],
-        ))
-        .child(toolbar_separator(&vm.theme))
-        .child(dropdown_button(
-            "audio-denoise-toolbar-dropdown",
-            "De-noise",
-            denoise_label(vm.denoise_amount),
-            state.open_dropdown == Some(AudioEditorDropdown::Denoise),
-            96.0,
-            &vm.theme,
-            callbacks,
-            AudioEditorDropdown::Denoise,
-            vec![
-                dropdown_option(
-                    "Off",
-                    vm.denoise_amount <= 0.0,
-                    AudioEditorEvent::SetDenoiseAmount(0.0),
-                ),
-                dropdown_option(
-                    "Light",
-                    denoise_is(vm.denoise_amount, 0.25),
-                    AudioEditorEvent::SetDenoiseAmount(0.25),
-                ),
-                dropdown_option(
-                    "Medium",
-                    denoise_is(vm.denoise_amount, 0.55),
-                    AudioEditorEvent::SetDenoiseAmount(0.55),
-                ),
-                dropdown_option(
-                    "Strong",
-                    denoise_is(vm.denoise_amount, 0.9),
-                    AudioEditorEvent::SetDenoiseAmount(0.9),
-                ),
             ],
         ))
         .child(div().flex_1())
@@ -1213,20 +1241,77 @@ fn inspector(
         )
 }
 
-fn denoise_label(amount: f32) -> &'static str {
-    if amount <= 0.0 {
-        "Off"
-    } else if amount < 0.4 {
-        "Light"
-    } else if amount < 0.75 {
-        "Medium"
-    } else {
-        "Strong"
-    }
+fn tools_sidebar(theme: &AudioEditorTheme, callbacks: &AudioEditorCallbacks) -> impl IntoElement {
+    div()
+        .id("audio-tools-sidebar")
+        .flex_none()
+        .w(px(AUDIO_EDITOR_TOOLS_WIDTH))
+        .h_full()
+        .px(px(8.0))
+        .py(px(8.0))
+        .border_l(px(1.0))
+        .border_color(theme.border_subtle)
+        .bg(theme.surface_panel)
+        .overflow_y_scroll()
+        .child(
+            div()
+                .pb(px(6.0))
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_secondary)
+                .child("TOOLS"),
+        )
+        .children(
+            tools_menu_options()
+                .into_iter()
+                .enumerate()
+                .map(|(index, option)| tool_sidebar_row(index, option, theme, callbacks)),
+        )
 }
 
-fn denoise_is(amount: f32, preset: f32) -> bool {
-    (amount - preset).abs() <= 0.01
+fn tool_sidebar_row(
+    index: usize,
+    option: DropdownOption,
+    theme: &AudioEditorTheme,
+    callbacks: &AudioEditorCallbacks,
+) -> impl IntoElement {
+    if option.heading {
+        return div()
+            .id(("audio-tool-sidebar-heading", index))
+            .pt(px(8.0))
+            .pb(px(3.0))
+            .text_size(px(9.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(theme.text_muted)
+            .child(option.label)
+            .into_any_element();
+    }
+    let event = option.event;
+    let callbacks = callbacks.clone();
+    div()
+        .id(("audio-tool-sidebar-row", index))
+        .h(px(22.0))
+        .px(px(6.0))
+        .rounded(px(4.0))
+        .flex()
+        .items_center()
+        .text_size(px(10.5))
+        .text_color(theme.text_secondary)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|style| {
+            style
+                .bg(with_alpha(theme.accent, 0.14))
+                .text_color(theme.accent)
+        })
+        .when_some(event, |this, event| {
+            this.on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                emit(&callbacks, event, window, cx);
+                window.prevent_default();
+            })
+        })
+        .child(option.label)
+        .into_any_element()
 }
 
 fn status_bar(vm: &AudioEditorViewModel) -> impl IntoElement {
@@ -1647,7 +1732,8 @@ pub fn audio_editor_panel(
                         .min_h_0()
                         .child(ruler)
                         .child(canvas),
-                ),
+                )
+                .child(tools_sidebar(&vm.theme, callbacks)),
         )
         .child(status_bar(vm))
 }

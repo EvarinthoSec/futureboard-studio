@@ -102,6 +102,40 @@ pub fn estimate_bpm(
     })
 }
 
+/// Ranked tempo candidates: the winner plus musically related doubles/halves.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempoCandidate {
+    pub bpm: f32,
+    pub confidence: f32,
+}
+
+pub fn estimate_bpm_candidates(
+    samples: &[f32],
+    sample_rate: f32,
+    min_bpm: f32,
+    max_bpm: f32,
+) -> Vec<TempoCandidate> {
+    let Some(best) = estimate_bpm(samples, sample_rate, min_bpm, max_bpm) else {
+        return Vec::new();
+    };
+    let (min_bpm, max_bpm) = sanitize_range(min_bpm, max_bpm);
+    let mut candidates = vec![TempoCandidate {
+        bpm: best.bpm,
+        confidence: best.confidence,
+    }];
+    for (ratio, conf_scale) in [(0.5, 0.72), (2.0, 0.68)] {
+        let bpm = (best.bpm * ratio as f32 * 100.0).round() / 100.0;
+        if bpm >= min_bpm && bpm <= max_bpm {
+            candidates.push(TempoCandidate {
+                bpm,
+                confidence: (best.confidence * conf_scale).clamp(0.0, 1.0),
+            });
+        }
+    }
+    candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    candidates
+}
+
 fn sanitize_range(min_bpm: f32, max_bpm: f32) -> (f32, f32) {
     let mut lo = if min_bpm.is_finite() && min_bpm > 0.0 {
         min_bpm

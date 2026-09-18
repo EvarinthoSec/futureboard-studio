@@ -182,10 +182,11 @@ fn build_peak_columns(
             if min == 0.0 && max == 0.0 {
                 return None;
             }
+            let gain = clip.gain.max(0.0);
             Some(WaveformColumn {
                 x: x0 - scroll_x,
-                min,
-                max,
+                min: min * gain,
+                max: max * gain,
             })
         })
         .collect()

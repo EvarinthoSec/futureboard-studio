@@ -227,6 +227,8 @@ heapless = "0.9.2"
 memmap2 = "0.9"
 midir = "0.9"
 rustfft = "6"
+# EBU R128 loudness (LUFS / LRA / true peak). MIT.
+ebur128 = "0.1"
 
 # Solfege is consumed from its own Git repository so Singer follows the
 # engine's host-neutral runtime and event contracts instead of maintaining a

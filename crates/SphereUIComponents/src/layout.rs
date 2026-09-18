@@ -41,6 +41,7 @@ mod ara_graph;
 mod ara_menu;
 pub(crate) mod ara_ops;
 mod ara_studio;
+mod audio_tool_ops;
 mod audio_transport;
 mod bottom_panel_ops;
 mod browser_ops;
@@ -589,6 +590,8 @@ pub struct StudioLayout {
     recording: recording_ops::RecordingSessionState,
     /// Async tempo-detection jobs for the Audio Stretch inspector.
     stretch_tempo: stretch_tempo_ops::StretchTempoState,
+    /// Floating audio-editor analysis/processing windows.
+    audio_tools: crate::components::AudioToolWindowManager,
     /// Throttle / sync timestamps for engine ↔ UI bridging (playhead, snapshot
     /// sync, meter push, tempo commit). Grouped into
     /// [`audio_transport::EngineSyncState`] (decomposition slice).
@@ -790,13 +793,14 @@ impl StudioLayout {
             let owner = cx.entity();
             cx.new(|cx| components::AraEditorHost::new(owner, cx))
         };
-        let clip_editor_panel = cx.new(|_| {
+        let clip_editor_panel = cx.new(|cx| {
             components::ClipEditorPanel::new(
                 timeline.clone(),
                 piano_roll.clone(),
                 solfege_editor.clone(),
                 audio_editor.clone(),
                 ara_editor.clone(),
+                cx,
             )
         });
         let studio_entity = cx.entity();
@@ -1184,6 +1188,7 @@ impl StudioLayout {
             .with_placeholder("Run command..."),
             background_tasks: BackgroundTaskStore::default(),
             stretch_tempo: stretch_tempo_ops::StretchTempoState::default(),
+            audio_tools: crate::components::AudioToolWindowManager::default(),
             project_switcher: ProjectSwitcherState::default(),
             project_switcher_search_input: TextInputState::new(
                 "project-switcher-search-input",

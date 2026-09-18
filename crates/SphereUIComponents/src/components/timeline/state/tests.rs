@@ -242,9 +242,11 @@ mod instrument_lifecycle_tests {
 
         // Collapse: flag flips, child channels remain in the model untouched.
         assert!(state.toggle_insert_multiout_collapsed(&track_id, &slot));
-        assert!(state
-            .collapsed_vsti_output_group_keys()
-            .contains(&format!("{track_id}:{slot}")));
+        assert!(
+            state
+                .collapsed_vsti_output_group_keys()
+                .contains(&format!("{track_id}:{slot}"))
+        );
         let still_there: Vec<String> = state
             .tracks
             .iter()
@@ -1904,6 +1906,39 @@ mod audio_clip_split_tests {
     }
 
     #[test]
+    fn metadata_update_does_not_resize_trimmed_siblings() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let left_id =
+            state.import_audio_at("C:/a/loop.wav".to_string(), "loop".to_string(), 0.0, 1.0e9);
+        state.update_audio_clip_metadata("C:/a/loop.wav", "wav", 48_000, 2, 192_000, 4.0);
+        let snapshot = state
+            .find_clip(&left_id)
+            .map(|(_, clip)| clip.clone())
+            .unwrap();
+        let Some((left, right)) = state.plan_audio_clip_split(&snapshot, snapshot.start_beat + 2.0)
+        else {
+            panic!("split should succeed");
+        };
+        state.delete_clip(&left_id);
+        let left_len = left.duration_beats;
+        let right_len = right.duration_beats;
+        let right_start = right.stretch.source_start_samples;
+        if let Some(track) = state.tracks.first_mut() {
+            track.clips.push(left);
+            track.clips.push(right);
+        }
+
+        state.update_audio_clip_metadata("C:/a/loop.wav", "wav", 48_000, 2, 192_000, 4.0);
+
+        let clips: Vec<_> = state.tracks[0].clips.iter().cloned().collect();
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].duration_beats - left_len).abs() < 1e-4);
+        assert!((clips[1].duration_beats - right_len).abs() < 1e-4);
+        assert_eq!(clips[1].stretch.source_start_samples, right_start);
+    }
+
+    #[test]
     fn split_is_a_noop_near_edges_and_for_non_audio() {
         let state = TimelineState::default();
         let clip = audio_clip("clip-1", 0.0, 4.0, 0.0);
@@ -2342,9 +2377,11 @@ mod global_lane_resize_tests {
         let mut state = TimelineState::default();
         drag(&mut state, GlobalLaneKind::SongText, 0.0, 60.0);
         state.finish_global_lane_resize();
-        assert!(state
-            .reset_global_lane_height(GlobalLaneKind::SongText)
-            .is_some());
+        assert!(
+            state
+                .reset_global_lane_height(GlobalLaneKind::SongText)
+                .is_some()
+        );
         assert!(
             state
                 .reset_global_lane_height(GlobalLaneKind::SongText)
@@ -2725,7 +2762,7 @@ mod lane_pointer_transform_tests {
     /// made every click on a flag's name read as "empty lane".
     #[test]
     fn a_flag_is_grabbable_across_its_whole_body() {
-        use crate::components::timeline::marker_flag::{flag_hit_index, MARKER_FLAG_HIT_SLOP};
+        use crate::components::timeline::marker_flag::{MARKER_FLAG_HIT_SLOP, flag_hit_index};
 
         let spans = [(100.0_f32, 60.0_f32), (300.0, 40.0)];
         assert_eq!(flag_hit_index(&spans, 100.0, MARKER_FLAG_HIT_SLOP), Some(0));
@@ -3194,10 +3231,12 @@ mod time_display_ruler_tests {
         let ruler = state.ruler_grid_lines(1200.0);
         let grid = state.arrangement_grid_lines(1200.0);
         assert_eq!(ruler.len(), grid.len());
-        assert!(ruler
-            .iter()
-            .zip(grid.iter())
-            .all(|(a, b)| a.x == b.x && a.beat == b.beat));
+        assert!(
+            ruler
+                .iter()
+                .zip(grid.iter())
+                .all(|(a, b)| a.x == b.x && a.beat == b.beat)
+        );
     }
 
     /// A time-based timebase gets its own ticks. Every labelled one must land on

@@ -16,6 +16,8 @@ serde.workspace = true
 thiserror.workspace = true
 log.workspace = true
 rustfft.workspace = true
+ebur128.workspace = true
+rubato.workspace = true
 sphere-stem-extractor.workspace = true
 
 # Optional learned instrument classifier (pure-Rust ONNX, CPU). Off by default.

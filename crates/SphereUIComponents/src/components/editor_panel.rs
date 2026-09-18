@@ -2,7 +2,7 @@
 
 use gpui::{
     div, px, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use sphere_audio_editor::{editor_kind_for_clip, ClipEditorKind};
 
@@ -54,6 +54,7 @@ pub struct ClipEditorPanel {
     /// Last branch reported by the trace, so the choice is logged on change
     /// rather than every frame.
     traced: Option<&'static str>,
+    _timeline_observer: Subscription,
 }
 
 impl ClipEditorPanel {
@@ -63,7 +64,9 @@ impl ClipEditorPanel {
         solfege_editor: Entity<SolfegeEditorPanel>,
         audio_editor: Entity<AudioEditorHost>,
         ara_editor: Entity<AraEditorHost>,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let _timeline_observer = cx.observe(&timeline, |_, _, cx| cx.notify());
         Self {
             timeline,
             piano_roll,
@@ -73,6 +76,7 @@ impl ClipEditorPanel {
             active_surface_tab: EditorSurfaceTab::default(),
             last_selection_target: None,
             traced: None,
+            _timeline_observer,
         }
     }
 

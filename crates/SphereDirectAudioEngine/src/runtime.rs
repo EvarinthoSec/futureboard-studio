@@ -1635,6 +1635,15 @@ pub struct RuntimeClip {
     /// Per-clip adaptive de-noise state. It is prepared with the runtime graph
     /// and only mutated by the render thread, so the callback never allocates.
     pub denoise: DenoiseProcessor,
+    pub id_hash: u64,
+    pub channel_transform: SphereAudioProcessor::ChannelTransform,
+    pub dc_remove: bool,
+    pub dc_left: f32,
+    pub dc_right: f32,
+    pub extra_gain: f32,
+    pub dehum: SphereAudioProcessor::DehumProcessor,
+    pub envelope_points: Vec<(f32, f32)>,
+    pub preview_bypass: bool,
     /// Clip-level mute — a muted clip is skipped entirely during render.
     pub muted: bool,
     /// An ARA plug-in owns this clip's playback.
@@ -1720,6 +1729,18 @@ impl Clone for RuntimeClip {
             processor: self.processor,
             reverse: self.reverse,
             denoise: DenoiseProcessor::new(self.denoise.sample_rate(), self.denoise.amount()),
+            id_hash: self.id_hash,
+            channel_transform: self.channel_transform,
+            dc_remove: self.dc_remove,
+            dc_left: self.dc_left,
+            dc_right: self.dc_right,
+            extra_gain: self.extra_gain,
+            dehum: SphereAudioProcessor::DehumProcessor::new(
+                self.denoise.sample_rate(),
+                self.dehum.params(),
+            ),
+            envelope_points: self.envelope_points.clone(),
+            preview_bypass: self.preview_bypass,
             muted: self.muted,
             ara_rendered: self.ara_rendered,
             fade_in_samples: self.fade_in_samples,
@@ -5262,6 +5283,16 @@ mod stretch_runtime_tests {
             warp_markers: Vec::new(),
             reverse: false,
             denoise_amount: 0.0,
+            channel_transform: 0,
+            dc_remove: false,
+            dc_left: 0.0,
+            dc_right: 0.0,
+            extra_gain: 1.0,
+            dehum_hz: 0.0,
+            dehum_harmonics: 0,
+            dehum_reduction_db: 0.0,
+            envelope_points: Vec::new(),
+            preview_bypass: false,
         });
         let migrated = resolved_clip_stretch_params(&clip);
         assert_eq!(migrated.mode, StretchMode::Manual);
@@ -5788,6 +5819,60 @@ fn build_clip_runtime(
         processor,
         reverse,
         denoise: DenoiseProcessor::new(output_sample_rate, denoise_amount),
+        id_hash: crate::analysis_tap::clip_id_hash(&clip.id),
+        channel_transform: SphereAudioProcessor::ChannelTransform::from_tag(
+            clip.audio_process
+                .as_ref()
+                .map(|p| p.channel_transform)
+                .unwrap_or(0),
+        ),
+        dc_remove: clip
+            .audio_process
+            .as_ref()
+            .map(|p| p.dc_remove)
+            .unwrap_or(false),
+        dc_left: clip
+            .audio_process
+            .as_ref()
+            .map(|p| p.dc_left)
+            .unwrap_or(0.0),
+        dc_right: clip
+            .audio_process
+            .as_ref()
+            .map(|p| p.dc_right)
+            .unwrap_or(0.0),
+        extra_gain: clip
+            .audio_process
+            .as_ref()
+            .map(|p| {
+                if p.extra_gain.is_finite() && p.extra_gain > 0.0 {
+                    p.extra_gain
+                } else {
+                    1.0
+                }
+            })
+            .unwrap_or(1.0),
+        dehum: {
+            let process = clip.audio_process.as_ref();
+            SphereAudioProcessor::DehumProcessor::new(
+                output_sample_rate,
+                SphereAudioProcessor::DehumParams {
+                    base_hz: process.map(|p| p.dehum_hz).unwrap_or(0.0),
+                    harmonics: process.map(|p| p.dehum_harmonics).unwrap_or(0),
+                    reduction_db: process.map(|p| p.dehum_reduction_db).unwrap_or(0.0),
+                },
+            )
+        },
+        envelope_points: clip
+            .audio_process
+            .as_ref()
+            .map(|p| p.envelope_points.clone())
+            .unwrap_or_default(),
+        preview_bypass: clip
+            .audio_process
+            .as_ref()
+            .map(|p| p.preview_bypass)
+            .unwrap_or(false),
         muted: clip.muted,
         fade_in_samples,
         fade_out_samples,

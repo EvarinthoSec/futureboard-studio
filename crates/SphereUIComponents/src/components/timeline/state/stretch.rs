@@ -957,6 +957,15 @@ pub struct AudioClipStretchState {
     /// Adaptive de-noise amount. `0` is bypass; higher values apply stronger
     /// reduction to steady low-level noise during playback and bounce.
     pub denoise_amount: f32,
+
+    /// Non-destructive channel transform. Identity is Stereo.
+    pub channel_transform: u8,
+    pub dc_remove: bool,
+    pub dc_left: f32,
+    pub dc_right: f32,
+    pub dehum_hz: f32,
+    pub dehum_harmonics: u8,
+    pub dehum_reduction_db: f32,
 }
 
 impl Default for AudioClipStretchState {
@@ -991,6 +1000,13 @@ impl Default for AudioClipStretchState {
             warp_markers: Vec::new(),
             gain_envelope: ClipEnvelope::default(),
             denoise_amount: 0.0,
+            channel_transform: 0,
+            dc_remove: false,
+            dc_left: 0.0,
+            dc_right: 0.0,
+            dehum_hz: 0.0,
+            dehum_harmonics: 0,
+            dehum_reduction_db: 0.0,
         }
     }
 }

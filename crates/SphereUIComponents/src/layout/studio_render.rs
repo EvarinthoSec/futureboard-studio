@@ -55,6 +55,7 @@ impl Render for StudioLayout {
         self.maybe_autosave_project(cx);
         self.window_hooks.cached_bounds = Some(window.bounds());
         self.flush_deferred_insert_editor_opens(window, cx);
+        self.flush_pending_audio_tools(window, cx);
 
         // Keep the OS window title in sync with the project lifecycle state
         // (Part G/H), e.g. "Untitled Project — Unsaved" / "My Song — Saved".

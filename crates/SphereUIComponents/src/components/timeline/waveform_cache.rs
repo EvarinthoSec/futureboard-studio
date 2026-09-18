@@ -745,6 +745,19 @@ fn waveform_debug_log(msg: &str) {
     }
 }
 
+/// Drop in-memory peaks for `path_key` so the next import decodes the file again.
+///
+/// Required when a clip's source is rewritten in place (same path) or retargeted
+/// onto a new derived file that must not keep drawing the previous asset.
+pub fn invalidate_file(path_key: &str) {
+    if let Ok(mut cache) = file_cache().lock() {
+        cache.remove(path_key);
+    }
+    if let Ok(mut cache) = clip_cache().lock() {
+        cache.remove(path_key);
+    }
+}
+
 /// Legacy entry: marks pending; actual work is started by `audio_import::start_file_import`.
 pub fn request_decode_file(path: PathBuf) {
     let key = path.to_string_lossy().to_string();
@@ -1336,5 +1349,25 @@ mod tests {
         assert!(cache.get(1).is_none(), "oldest entry should be evicted");
         assert!(cache.get(2).is_some());
         assert!(cache.get(3).is_some());
+    }
+
+    #[test]
+    fn invalidate_file_drops_the_cached_entry() {
+        let key = "test-invalidate-asset";
+        begin_peak_build(
+            key,
+            Arc::new(WaveformFileMeta {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_seconds: 1.0,
+                total_frames: 48_000,
+                primary_spp: 256,
+                peak_count: 1,
+            }),
+            1,
+        );
+        assert!(get_file_meta(key).is_some());
+        invalidate_file(key);
+        assert!(get_file_meta(key).is_none());
     }
 }

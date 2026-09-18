@@ -7,20 +7,23 @@
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
-    div, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, ScrollWheelEvent, Styled, Window,
+    Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
+    Render, ScrollWheelEvent, Styled, Subscription, Window, div,
 };
 use sphere_audio_editor::{
-    audio_editor_panel, default_wheel_handler_at, empty_audio_editor, AudioEditorCallbacks,
-    AudioEditorDrag, AudioEditorEvent, AudioEditorSnap, AudioEditorState, AudioEditorTool,
-    AudioEditorViewModel, EnvelopeCurve, EnvelopePoint, FrequencyScale, SpectralSelection,
+    AUDIO_EDITOR_INSPECTOR_WIDTH, AUDIO_EDITOR_TOOLS_WIDTH, AudioEditorCallbacks, AudioEditorDrag,
+    AudioEditorEvent, AudioEditorSnap, AudioEditorState, AudioEditorTool, AudioEditorViewModel,
+    AudioRangeSelection, AudioToolKind, AudioToolTarget, EnvelopeCurve, EnvelopePoint,
+    FrequencyScale, SpectralSelection, audio_editor_panel, default_wheel_handler_at,
+    empty_audio_editor,
 };
 
 use crate::components::audio_editor_adapter::{
     audio_editor_theme, build_waveform_view_model, selected_audio_clip,
 };
 use crate::components::audio_editor_spectrogram::{
-    cached_or_analyze, error_view_model, loading_view_model, to_view_model, RenderedSpectrogram,
+    RenderedSpectrogram, SpectrogramJobParams, cached_or_analyze, error_view_model,
+    loading_view_model, to_view_model,
 };
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
@@ -29,7 +32,8 @@ use crate::components::timeline::timeline_state::{
 use crate::components::timeline::waveform_cache;
 use crate::theme::Colors;
 
-const INSPECTOR_W: f32 = 174.0;
+const INSPECTOR_W: f32 = AUDIO_EDITOR_INSPECTOR_WIDTH;
+const TOOLS_W: f32 = AUDIO_EDITOR_TOOLS_WIDTH;
 
 pub struct AudioEditorHost {
     timeline: Entity<Timeline>,
@@ -45,6 +49,8 @@ pub struct AudioEditorHost {
     spectrogram_key: Option<String>,
     spectrogram_result: Option<Result<Arc<RenderedSpectrogram>, String>>,
     spectrogram_generation: u64,
+    pending_open_tool: Option<(AudioToolKind, AudioToolTarget)>,
+    _timeline_observer: Subscription,
 }
 
 impl AudioEditorHost {
@@ -54,7 +60,17 @@ impl AudioEditorHost {
             self.spectrogram_result = None;
             return;
         };
-        let key = format!("{path}|{:?}", self.state.frequency_scale);
+        let params = SpectrogramJobParams {
+            frequency_scale: self.state.frequency_scale,
+            pitch_semitones: vm.pitch_semitones + vm.fine_cents / 100.0,
+            reverse: vm.reverse,
+        };
+        let key = format!(
+            "{path}|{:?}|p{:.3}|r{}",
+            params.frequency_scale,
+            params.pitch_semitones,
+            u8::from(params.reverse)
+        );
         if self.spectrogram_key.as_deref() == Some(key.as_str()) {
             return;
         }
@@ -63,12 +79,11 @@ impl AudioEditorHost {
         self.spectrogram_result = None;
         self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
         let generation = self.spectrogram_generation;
-        let frequency_scale = self.state.frequency_scale;
         let host = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { cached_or_analyze(&path, frequency_scale) })
+                .spawn(async move { cached_or_analyze(&path, params) })
                 .await;
             let _ = host.update(cx, |this, cx| {
                 if this.spectrogram_generation != generation {
@@ -94,13 +109,24 @@ impl AudioEditorHost {
             "x" => Some(AudioEditorTool::SpectralRange),
             "s" => Some(AudioEditorTool::Split),
             "f" => Some(AudioEditorTool::Fade),
-            "w" => Some(AudioEditorTool::Warp),
-            "t" => Some(AudioEditorTool::Transient),
+            "m" => Some(AudioEditorTool::Marker),
+            "y" => Some(AudioEditorTool::Trim),
+            "z" => Some(AudioEditorTool::Scrub),
             "d" | "e" => Some(AudioEditorTool::Draw),
             _ => None,
         };
 
         match (key, tool) {
+            ("t", None) => {
+                if let Some(target) = self.build_tool_target(cx) {
+                    self.pending_open_tool = Some((AudioToolKind::TransientDetector, target));
+                }
+            }
+            ("n", None) => {
+                if let Some(target) = self.build_tool_target(cx) {
+                    self.pending_open_tool = Some((AudioToolKind::Normalize, target));
+                }
+            }
             (_, Some(tool)) => {
                 self.state.active_tool = tool;
                 self.state.open_dropdown = None;
@@ -134,6 +160,7 @@ impl AudioEditorHost {
     }
 
     pub fn new(timeline: Entity<Timeline>, cx: &mut Context<Self>) -> Self {
+        let _timeline_observer = cx.observe(&timeline, |_, _, cx| cx.notify());
         Self {
             timeline,
             state: AudioEditorState::default(),
@@ -148,7 +175,71 @@ impl AudioEditorHost {
             spectrogram_key: None,
             spectrogram_result: None,
             spectrogram_generation: 0,
+            pending_open_tool: None,
+            _timeline_observer,
         }
+    }
+
+    /// Drop cached spectrogram tiles so the next render re-analyzes the clip.
+    pub(crate) fn refresh_clip_visuals(
+        &mut self,
+        source_path: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = source_path {
+            crate::components::audio_editor_spectrogram::invalidate_path(path);
+        }
+        self.spectrogram_key = None;
+        self.spectrogram_result = None;
+        self.spectrogram_generation = self.spectrogram_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    pub fn take_pending_open_tool(&mut self) -> Option<(AudioToolKind, AudioToolTarget)> {
+        self.pending_open_tool.take()
+    }
+
+    pub fn current_tool_target(&self, cx: &Context<Self>) -> Option<AudioToolTarget> {
+        self.build_tool_target(cx)
+    }
+
+    fn build_tool_target(&self, cx: &Context<Self>) -> Option<AudioToolTarget> {
+        let vm = self.build_view_model(cx)?;
+        let tl = self.timeline.read(cx);
+        let (_, clip) = self.active_clip(&tl.state)?;
+        let meta = clip
+            .audio_asset_key()
+            .and_then(waveform_cache::get_file_meta);
+        let sample_rate = meta
+            .as_ref()
+            .map(|m| m.sample_rate)
+            .or_else(|| (vm.spectrogram.sample_rate > 0).then_some(vm.spectrogram.sample_rate))
+            .unwrap_or(clip.stretch.original_sample_rate.max(44_100));
+        let channels = meta.as_ref().map(|m| m.channels).unwrap_or(2);
+        let source_frames = meta
+            .as_ref()
+            .map(|m| m.total_frames as i64)
+            .unwrap_or_else(|| self.total_source_frames(&vm));
+        let time_selection = self.state.selection_range.map(|(a, b)| {
+            let start = self.frame_for_rel_beat(&vm, a.min(b));
+            let end = self.frame_for_rel_beat(&vm, a.max(b));
+            AudioRangeSelection::new(start, end)
+        });
+        Some(AudioToolTarget {
+            clip_id: vm.clip_id.clone(),
+            source_id: clip
+                .audio_asset_key()
+                .unwrap_or(vm.clip_id.as_str())
+                .to_string(),
+            clip_name: vm.clip_name,
+            file_label: vm.file_label.unwrap_or_else(|| "Audio Clip".to_string()),
+            source_path: vm.source_path,
+            sample_rate,
+            channels,
+            source_frames,
+            time_selection,
+            spectral_selection: self.state.spectral_selection,
+        })
     }
 
     fn active_clip<'a>(
@@ -257,6 +348,18 @@ impl AudioEditorHost {
             clip_name: clip.name.clone(),
             file_label,
             source_path,
+            source_start_frame: clip.stretch.source_start_samples as i64,
+            source_end_frame: {
+                let start = clip.stretch.source_start_samples;
+                if clip.stretch.source_end_samples > start {
+                    clip.stretch.source_end_samples as i64
+                } else {
+                    clip.stretch
+                        .original_duration_samples
+                        .max(meta.as_ref().map(|m| m.total_frames).unwrap_or(0))
+                        as i64
+                }
+            },
             start_beat: clip.start_beat,
             duration_beats: clip.duration_beats,
             offset_beats: clip.offset_beats,
@@ -442,6 +545,13 @@ impl AudioEditorHost {
             AudioEditorEvent::SetDenoiseAmount(amount) => {
                 self.set_denoise_amount(amount, cx);
             }
+            AudioEditorEvent::OpenTool(kind) => {
+                self.state.open_dropdown = None;
+                if let Some(target) = self.build_tool_target(cx) {
+                    self.pending_open_tool = Some((kind, target));
+                }
+                cx.notify();
+            }
         }
         let _ = window;
     }
@@ -516,7 +626,7 @@ impl AudioEditorHost {
                     self.seek_relative(vm.start_beat + rel_beat, cx);
                 }
             }
-            AudioEditorTool::Pointer => {
+            AudioEditorTool::Pointer | AudioEditorTool::Trim => {
                 let clip_start_x = -self.state.viewport.scroll_x;
                 let clip_end_x = vm.duration_beats * self.state.viewport.pixels_per_beat
                     - self.state.viewport.scroll_x;
@@ -531,9 +641,28 @@ impl AudioEditorHost {
                     self.state.drag = AudioEditorDrag::TrimmingRight {
                         start_beat: vm.start_beat,
                     };
-                } else {
+                } else if matches!(self.state.active_tool, AudioEditorTool::Pointer) {
                     self.seek_relative(vm.start_beat + rel_beat, cx);
                 }
+            }
+            AudioEditorTool::Marker => {
+                let abs_beat = vm.start_beat + rel_beat;
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    let prev = timeline.state.markers.clone();
+                    timeline.state.add_marker_at_beat(abs_beat as f64);
+                    if timeline.record_marker_edit("Add Marker", prev, cx) {
+                        timeline.mark_media_changed(cx);
+                    }
+                });
+            }
+            AudioEditorTool::Scrub => {
+                self.seek_relative(vm.start_beat + rel_beat, cx);
+                self.state.drag = AudioEditorDrag::SelectingRange {
+                    anchor_beat: rel_beat,
+                };
+            }
+            AudioEditorTool::Warp => {
+                self.seek_relative(vm.start_beat + rel_beat, cx);
             }
             AudioEditorTool::Draw => {
                 let local_y = self.local_y(_y);
@@ -591,12 +720,6 @@ impl AudioEditorHost {
                 });
                 self.state.drag = AudioEditorDrag::MovingEnvelopePoint { point_id };
             }
-            AudioEditorTool::Warp | AudioEditorTool::Transient => {
-                // The toolbar exposes these future tools so the state machine
-                // and command boundary are ready, but no misleading edit is
-                // emitted until their analysis/command backends exist.
-                self.seek_relative(vm.start_beat + rel_beat, cx);
-            }
         }
     }
 
@@ -615,8 +738,12 @@ impl AudioEditorHost {
         match drag {
             AudioEditorDrag::None => {}
             AudioEditorDrag::SelectingRange { anchor_beat } => {
-                self.state.selection_range = Some((anchor_beat, rel_beat));
-                cx.notify();
+                if self.state.active_tool == AudioEditorTool::Scrub {
+                    self.seek_relative(vm.start_beat + rel_beat, cx);
+                } else {
+                    self.state.selection_range = Some((anchor_beat, rel_beat));
+                    cx.notify();
+                }
             }
             AudioEditorDrag::SelectingSpectralRange {
                 anchor_frame,
@@ -730,6 +857,10 @@ impl AudioEditorHost {
     }
 
     fn total_source_frames(&self, vm: &AudioEditorViewModel) -> i64 {
+        let window = (vm.source_end_frame - vm.source_start_frame).max(0);
+        if window > 0 {
+            return vm.source_end_frame.max(0);
+        }
         (vm.spectrogram.duration_seconds.max(0.0) * vm.spectrogram.sample_rate as f32)
             .round()
             .max(0.0) as i64
@@ -743,11 +874,13 @@ impl AudioEditorHost {
     }
 
     fn frame_for_rel_beat(&self, vm: &AudioEditorViewModel, rel_beat: f32) -> i64 {
-        let total_frames = self.total_source_frames(vm);
-        if total_frames <= 0 || vm.duration_beats <= f32::EPSILON {
-            return 0;
+        let start = vm.source_start_frame.max(0);
+        let end = vm.source_end_frame.max(start);
+        if end <= start || vm.duration_beats <= f32::EPSILON {
+            return start;
         }
-        ((rel_beat / vm.duration_beats).clamp(0.0, 1.0) * total_frames as f32).round() as i64
+        let t = (rel_beat / vm.duration_beats).clamp(0.0, 1.0);
+        start + ((t * (end - start) as f32).round() as i64)
     }
 
     fn hz_for_local_y(&self, vm: &AudioEditorViewModel, local_y: f32, view_h: f32) -> f32 {
@@ -1029,7 +1162,7 @@ impl Render for AudioEditorHost {
                         let origin_y: f32 = bounds.origin.y.into();
                         let width: f32 = bounds.size.width.into();
                         let height: f32 = bounds.size.height.into();
-                        let viewport = (width - INSPECTOR_W).max(320.0);
+                        let viewport = (width - INSPECTOR_W - TOOLS_W).max(320.0);
                         let visual_height = (height - 56.0).max(180.0);
                         if (viewport_width.get() - viewport).abs() > 0.5
                             || (viewport_height.get() - visual_height).abs() > 0.5

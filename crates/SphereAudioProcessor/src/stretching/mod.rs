@@ -14,6 +14,90 @@ pub use ratios::{
     semitone_to_pitch_ratio, source_read_rate_for_repitch, stretched_duration_samples,
 };
 
+/// Offline bounce of interleaved PCM through the clip stretch/pitch engine.
+/// Worker / tool-apply path only — never call from the audio callback.
+pub fn render_stretch_interleaved(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    params: &StretchParams,
+) -> Result<Vec<f32>, StretchError> {
+    let channels = channels.clamp(1, 2);
+    let frames = samples.len() / channels;
+    if frames == 0 {
+        return Ok(Vec::new());
+    }
+    let params = params.sanitized();
+    if params.mode == StretchMode::Off
+        && (params.pitch_ratio - 1.0).abs() < 1.0e-4
+        && (effective_time_ratio(&params, None) - 1.0).abs() < 1.0e-4
+    {
+        return Ok(samples.to_vec());
+    }
+
+    let mut bounce_params = params.clone();
+    if bounce_params.mode == StretchMode::Off {
+        bounce_params.mode = StretchMode::Manual;
+        bounce_params.algorithm = if bounce_params.preserve_pitch {
+            StretchAlgorithm::PreservePitch
+        } else {
+            StretchAlgorithm::RePitch
+        };
+    }
+
+    let mut left = vec![0.0_f32; frames];
+    let mut right = vec![0.0_f32; frames];
+    for (index, frame) in samples.chunks(channels).enumerate() {
+        left[index] = frame[0];
+        right[index] = if channels > 1 { frame[1] } else { frame[0] };
+    }
+
+    let out_frames =
+        stretched_duration_samples(frames as u64, &bounce_params, None).max(1) as usize;
+    let backend = resolve_backend(&bounce_params);
+    let mut out_l = vec![0.0_f32; out_frames];
+    let mut out_r = vec![0.0_f32; out_frames];
+    if backend == StretchBackend::InternalRePitch {
+        let read_rate = source_read_rate_for_repitch(&bounce_params, None);
+        for index in 0..out_frames {
+            let position = index as f32 * read_rate;
+            out_l[index] = interp_at(&left, position);
+            out_r[index] = interp_at(&right, position);
+        }
+    } else {
+        let mut processor =
+            create_stretch_processor(backend, sample_rate.max(1) as f32, 2, bounce_params.clone())?;
+        processor.reset();
+        processor.process_stereo(&left, &right, &mut out_l, &mut out_r)?;
+    }
+
+    let mut out = Vec::with_capacity(out_frames * channels);
+    for index in 0..out_frames {
+        out.push(out_l[index]);
+        if channels > 1 {
+            out.push(out_r[index]);
+        }
+    }
+    Ok(out)
+}
+
+fn interp_at(channel: &[f32], position: f32) -> f32 {
+    if channel.is_empty() {
+        return 0.0;
+    }
+    if position <= 0.0 {
+        return channel[0];
+    }
+    let max_index = channel.len() - 1;
+    if position >= max_index as f32 {
+        return channel[max_index];
+    }
+    let index = position.floor() as usize;
+    let frac = position - index as f32;
+    let next = (index + 1).min(max_index);
+    channel[index] + (channel[next] - channel[index]) * frac
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +391,28 @@ mod tests {
         eprintln!("SIGNALSMITH_LATENCY_SAMPLES={latency}");
         // Sanity bound: a sane preset stays well under a second of latency.
         assert!(latency < 48_000, "unexpectedly large latency: {latency}");
+    }
+
+    #[test]
+    fn identity_offline_bounce_keeps_samples() {
+        let samples = vec![0.1_f32, -0.2, 0.3, -0.4];
+        let out = render_stretch_interleaved(&samples, 2, 48_000, &StretchParams::default())
+            .expect("identity bounce");
+        assert_eq!(out, samples);
+    }
+
+    #[test]
+    fn manual_stretch_offline_bounce_changes_length() {
+        let samples = vec![0.1_f32; 512];
+        let params = StretchParams {
+            mode: StretchMode::Manual,
+            algorithm: StretchAlgorithm::RePitch,
+            time_ratio: 2.0,
+            preserve_pitch: false,
+            ..StretchParams::default()
+        };
+        let out = render_stretch_interleaved(&samples, 2, 48_000, &params).expect("stretch bounce");
+        assert!(out.len() > samples.len());
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }

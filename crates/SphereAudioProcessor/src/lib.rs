@@ -8,15 +8,31 @@
 //! surface from `SphereStemExtractor` for the Stem Extractor dialog and jobs.
 
 pub mod analysis;
+pub mod clip_process;
 pub mod denoise;
 pub mod ffi;
 pub mod stem;
 pub mod stretching;
 
 pub use analysis::{
-    AnalysisOptions, AudioAnalysis, Classifier, HeuristicClassifier, InstrumentCategory,
-    InstrumentEstimate, KeyEstimate, KeyMode, PitchClass, SpectralFeatures, TempoEstimate,
-    analyze_mono, analyze_mono_with, analyze_stereo,
+    AnalysisOptions, AudioAnalysis, Classifier, FftSize, FrequencyFocus, HeuristicClassifier,
+    InstrumentCategory, InstrumentEstimate, KeyEstimate, KeyMode, LoudnessMeasurement,
+    PhaseMeasurement, PitchClass, SpectralFeatures, SpectrumMode, SpectrumSmoothing,
+    SpectrumSnapshot, SpectrumWindow, TempoCandidate, TempoEstimate, TransientDetectParams,
+    TransientMarker, analyze_loudness, analyze_mono, analyze_mono_with, analyze_ring_window,
+    analyze_spectrum, analyze_stereo, detect_transients, estimate_bpm_candidates,
+    estimate_key_ranked, measure_phase,
+};
+
+pub use clip_process::{
+    AudioClipProcessor, ChannelTransform, DcOffset, DcOffsetProcessor, DeclickParams, DehumParams,
+    DehumProcessor, NormalizeMeasurement, NormalizeMode, NormalizeParams, ResampleError,
+    SpectralDenoiseParams, SpectralGainParams, StftSettings, apply_channel_transform,
+    apply_channel_transform_interleaved, apply_gain_interleaved, apply_spectral_gain, db_to_lin,
+    declick_interleaved, downmix_interleaved, interpolate_spectral_region, learn_noise_profile,
+    lin_to_db, measure_dc_offset, measure_normalize, peak_amplitude, reduce_noise_stft,
+    replace_frame_range, required_normalize_gain_db, resample_interleaved, slice_frames,
+    write_wav_f32,
 };
 
 pub use denoise::DenoiseProcessor;
@@ -34,6 +50,7 @@ pub use stem::{
 pub use stretching::{
     StretchAlgorithm, StretchBackend, StretchError, StretchMode, StretchParams, StretchProcessor,
     create_stretch_processor, effective_pitch_ratio, effective_time_ratio,
-    pitch_ratio_to_semitone_cents, resolve_backend, semitone_to_pitch_ratio,
-    signalsmith_stretch_available, source_read_rate_for_repitch, stretched_duration_samples,
+    pitch_ratio_to_semitone_cents, render_stretch_interleaved, resolve_backend,
+    semitone_to_pitch_ratio, signalsmith_stretch_available, source_read_rate_for_repitch,
+    stretched_duration_samples,
 };

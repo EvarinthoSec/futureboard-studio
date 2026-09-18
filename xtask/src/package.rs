@@ -1,6 +1,7 @@
 //! Package orchestration: build → collect → stage → validate → publish.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::MetadataCommand;
@@ -67,6 +68,8 @@ pub struct PackageOptions {
     pub plugins: PluginSelection,
     /// Stage the shared CEF runtime flat beside the binary when available.
     pub stage_cef: bool,
+    /// After a macOS package, wrap the staged tree into `Futureboard Studio.app`.
+    pub bundle_macos: bool,
 }
 
 /// Run the full package pipeline and return the published directory.
@@ -295,7 +298,79 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     staging::cleanup_staging_root_if_empty(&plan.staging_dir);
     eprintln!("[xtask] published package: {}", plan.final_dir.display());
 
+    if options.bundle_macos {
+        if let Some(app_dir) = bundle_macos_app(&workspace, &plan.final_dir, &target_triple)? {
+            eprintln!("[xtask] bundled macOS app: {}", app_dir.display());
+        }
+    }
+
     Ok(plan.final_dir)
+}
+
+/// Sibling of the staged runtime so `bundle-macos.sh` can `cp -a PACKAGE_DIR/.`
+/// into `Contents/MacOS` without copying the `.app` into itself.
+fn macos_app_bundle_out(package_dir: &Path) -> PathBuf {
+    let platform = package_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("macos");
+    package_dir
+        .parent()
+        .map(|parent| parent.join(format!("{platform}-app")))
+        .unwrap_or_else(|| package_dir.join("app"))
+}
+
+/// Wrap a published macOS runtime tree in a real `Contents/` `.app` bundle.
+fn bundle_macos_app(
+    workspace: &Path,
+    package_dir: &Path,
+    target_triple: &str,
+) -> Result<Option<PathBuf>> {
+    if !target_triple.ends_with("apple-darwin") {
+        return Ok(None);
+    }
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "[xtask] skipping macOS .app bundle: host is not macOS (need PlistBuddy/codesign)"
+        );
+        return Ok(None);
+    }
+    if !package_dir.join("FutureboardNative").is_file() {
+        return Ok(None);
+    }
+
+    let script = workspace.join("packaging/native/bundle-macos.sh");
+    if !script.is_file() {
+        bail!("macOS bundle script missing: {}", script.display());
+    }
+    let app_out = macos_app_bundle_out(package_dir);
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg(package_dir)
+        .arg(&app_out)
+        .status()
+        .with_context(|| format!("failed to run {}", script.display()))?;
+    if !status.success() {
+        bail!(
+            "macOS bundle script failed with status {status} ({})",
+            script.display()
+        );
+    }
+    let app_dir = app_out.join("Futureboard Studio.app");
+    let contents = app_dir.join("Contents");
+    if !contents.join("MacOS/FutureboardNative").is_file() {
+        bail!(
+            "macOS bundle is missing Contents/MacOS/FutureboardNative: {}",
+            app_dir.display()
+        );
+    }
+    if app_dir.join("Content").exists() && !contents.exists() {
+        bail!(
+            "macOS bundle used Content/ instead of Contents/: {}",
+            app_dir.display()
+        );
+    }
+    Ok(Some(app_dir))
 }
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
@@ -376,8 +451,11 @@ fn package_version() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
-    use super::{DiscoveredPlugin, PluginSelection, selected_editor_directory_names};
+    use super::{
+        DiscoveredPlugin, PluginSelection, macos_app_bundle_out, selected_editor_directory_names,
+    };
 
     #[test]
     fn plugin_selection_all_and_none() {
@@ -440,6 +518,20 @@ mod tests {
         assert_eq!(
             selected_editor_directory_names(&[&clipper]),
             vec!["67Clipper".to_string()]
+        );
+    }
+
+    #[test]
+    fn macos_app_bundle_is_a_sibling_not_nested_in_the_package() {
+        let package = PathBuf::from("/out/release/community/macos-arm64");
+        let app_out = macos_app_bundle_out(&package);
+        assert_eq!(
+            app_out,
+            PathBuf::from("/out/release/community/macos-arm64-app")
+        );
+        assert!(
+            !app_out.starts_with(&package),
+            "bundle output must not live inside the staged runtime tree"
         );
     }
 }

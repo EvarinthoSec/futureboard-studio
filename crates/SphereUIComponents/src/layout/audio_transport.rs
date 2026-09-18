@@ -1450,12 +1450,14 @@ impl StudioLayout {
 
         let snapshot = {
             let timeline = self.timeline.read(cx);
-            build_engine_project_snapshot(
+            let mut snapshot = build_engine_project_snapshot(
                 &timeline.state,
                 sample_rate,
                 project_root.as_deref(),
                 Some(preferred_input_device.as_str()),
-            )
+            );
+            self.overlay_audio_tool_previews(&mut snapshot);
+            snapshot
         };
         log_engine_sync_snapshot(
             &snapshot,

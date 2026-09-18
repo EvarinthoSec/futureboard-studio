@@ -206,6 +206,16 @@ fn forget(key: &ChunkKey) {
     }
 }
 
+/// Drop on-demand detail chunks for an asset so a rewritten source is decoded
+/// from the new file instead of drawing leftover high-resolution peaks.
+pub fn forget_asset(cache_key: &str) {
+    let Ok(mut reg) = registry().lock() else {
+        return;
+    };
+    reg.known.retain(|key| key.cache_key != cache_key);
+    reg.resident.retain(|key| key.cache_key != cache_key);
+}
+
 /// The finest samples-per-peak worth building for `pixels_per_second`.
 ///
 /// `None` when the shipped ladder already resolves the zoom — which is the

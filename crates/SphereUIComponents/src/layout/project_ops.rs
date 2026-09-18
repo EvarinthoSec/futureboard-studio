@@ -324,6 +324,7 @@ impl StudioLayout {
         // `teardown_all_plugin_instances`; this is the picker itself, which
         // otherwise survives a close/switch aimed at a track that is gone.
         self.close_insert_picker_window(cx);
+        self.close_audio_tool_windows(cx);
         self.project_session = ProjectSession::untitled();
         self.project_path = None;
         self.project_folder = None;

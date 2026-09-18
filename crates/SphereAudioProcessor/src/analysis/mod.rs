@@ -11,16 +11,27 @@ mod error;
 mod features;
 mod instrument;
 mod key;
-mod spectrum;
+pub mod loudness;
+pub mod phase;
+pub mod spectrum;
+pub mod spectrum_analyzer;
+pub mod transients;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
-pub use bpm::TempoEstimate;
+pub use bpm::{TempoCandidate, TempoEstimate, estimate_bpm_candidates};
 pub use error::AnalysisError;
 pub use features::{FEATURE_VECTOR_LEN, SpectralFeatures};
 pub use instrument::{Classifier, HeuristicClassifier, InstrumentCategory, InstrumentEstimate};
-pub use key::{KeyEstimate, KeyMode, PitchClass};
+pub use key::{KeyEstimate, KeyMode, PitchClass, estimate_key_ranked};
+pub use loudness::{LoudnessMeasurement, analyze_loudness};
+pub use phase::{PhaseMeasurement, measure_phase};
+pub use spectrum_analyzer::{
+    FftSize, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot, SpectrumWindow,
+    analyze_ring_window, analyze_spectrum,
+};
+pub use transients::{FrequencyFocus, TransientDetectParams, TransientMarker, detect_transients};
 
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxClassifier;

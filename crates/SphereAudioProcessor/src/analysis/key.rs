@@ -73,6 +73,13 @@ impl KeyMode {
             Self::Minor => "min",
         }
     }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Major => "major",
+            Self::Minor => "minor",
+        }
+    }
 }
 
 /// Estimated musical key.
@@ -88,6 +95,11 @@ impl KeyEstimate {
     /// Compact label, e.g. `"A min"`.
     pub fn label(&self) -> String {
         format!("{} {}", self.tonic.name(), self.mode.name())
+    }
+
+    /// Longer label, e.g. `"A minor"`.
+    pub fn display_label(&self) -> String {
+        format!("{} {}", self.tonic.name(), self.mode.display_name())
     }
 }
 
@@ -107,13 +119,19 @@ const MAX_HZ: f32 = 5000.0;
 /// Estimate the musical key of a mono buffer. Returns `None` if the signal is
 /// too short or carries no pitched energy.
 pub fn estimate_key(samples: &[f32], sample_rate: f32) -> Option<KeyEstimate> {
+    estimate_key_ranked(samples, sample_rate).into_iter().next()
+}
+
+/// Ranked key estimates, best first. `detected_key` is index 0; the rest are
+/// alternates. User-chosen key is stored separately by the tool window.
+pub fn estimate_key_ranked(samples: &[f32], sample_rate: f32) -> Vec<KeyEstimate> {
     if sample_rate <= 0.0 || !sample_rate.is_finite() {
-        return None;
+        return Vec::new();
     }
 
     let frames = magnitude_frames(samples, FRAME_SIZE, HOP);
     if frames.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let mut chroma = [0.0_f32; 12];
@@ -131,41 +149,55 @@ pub fn estimate_key(samples: &[f32], sample_rate: f32) -> Option<KeyEstimate> {
 
     let total: f32 = chroma.iter().sum();
     if total <= f32::EPSILON {
-        return None;
+        return Vec::new();
     }
     for c in &mut chroma {
         *c /= total;
     }
 
-    // Correlate chroma against all 24 rotated major/minor profiles.
-    let mut best = (0.0_f32, PitchClass::C, KeyMode::Major);
-    let mut second_best = f32::NEG_INFINITY;
+    let mut ranked: Vec<(f32, PitchClass, KeyMode)> = Vec::with_capacity(24);
     for tonic in 0..12 {
         for (mode, profile) in [
             (KeyMode::Major, &MAJOR_PROFILE),
             (KeyMode::Minor, &MINOR_PROFILE),
         ] {
             let score = correlation(&chroma, profile, tonic);
-            if score > best.0 {
-                second_best = best.0;
-                best = (score, PitchClass::from_index(tonic as i32), mode);
-            } else if score > second_best {
-                second_best = score;
-            }
+            ranked.push((score, PitchClass::from_index(tonic as i32), mode));
         }
     }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, (score, tonic, mode))| {
+            let next = ranked_score_at(&chroma, index + 1);
+            let confidence = if score > 0.0 && next.is_finite() {
+                ((score - next) / score).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            KeyEstimate {
+                tonic,
+                mode,
+                confidence,
+            }
+        })
+        .collect()
+}
 
-    let confidence = if best.0 > 0.0 && second_best.is_finite() {
-        ((best.0 - second_best) / best.0).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    Some(KeyEstimate {
-        tonic: best.1,
-        mode: best.2,
-        confidence,
-    })
+fn ranked_score_at(chroma: &[f32; 12], skip: usize) -> f32 {
+    let mut scores = Vec::with_capacity(24);
+    for tonic in 0..12 {
+        for (mode, profile) in [
+            (KeyMode::Major, &MAJOR_PROFILE),
+            (KeyMode::Minor, &MINOR_PROFILE),
+        ] {
+            let _ = mode;
+            scores.push(correlation(chroma, profile, tonic));
+        }
+    }
+    scores.sort_by(|a, b| b.total_cmp(a));
+    scores.get(skip).copied().unwrap_or(f32::NEG_INFINITY)
 }
 
 /// Pearson correlation between the chroma vector and a profile rotated so that

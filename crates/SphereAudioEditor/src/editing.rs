@@ -13,10 +13,14 @@ pub enum AudioEditorTool {
     /// Time-frequency range selection for spectral repair tools.
     SpectralRange,
     Split,
+    Trim,
     Fade,
-    Warp,
-    Transient,
+    Marker,
+    /// Non-destructive gain envelope.
     Draw,
+    Scrub,
+    /// Warp marker editing. Hidden until the warp DSP path is wired.
+    Warp,
 }
 
 impl AudioEditorTool {
@@ -26,11 +30,17 @@ impl AudioEditorTool {
             Self::Range => "Range",
             Self::SpectralRange => "Spectral Range",
             Self::Split => "Split",
+            Self::Trim => "Trim",
             Self::Fade => "Fade",
+            Self::Marker => "Marker",
+            Self::Draw => "Gain Envelope",
+            Self::Scrub => "Scrub",
             Self::Warp => "Warp",
-            Self::Transient => "Transient",
-            Self::Draw => "Draw",
         }
+    }
+
+    pub const fn is_available(self) -> bool {
+        !matches!(self, Self::Warp)
     }
 }
 
@@ -55,6 +65,10 @@ impl AudioEditorSnap {
             Self::Markers => "Markers",
             Self::Transients => "Transients",
         }
+    }
+
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::Off | Self::Grid)
     }
 }
 

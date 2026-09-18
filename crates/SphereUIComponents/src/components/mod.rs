@@ -7,6 +7,7 @@ pub mod audio_connections_window;
 mod audio_editor_adapter;
 mod audio_editor_host;
 mod audio_editor_spectrogram;
+mod audio_tools;
 pub mod background_tasks;
 mod bottom_panel;
 mod bottom_panel_shell;
@@ -113,6 +114,11 @@ pub use app_chrome::{
 };
 pub use ara_editor_host::AraEditorHost;
 pub use audio_editor_host::AudioEditorHost;
+pub use audio_tools::{
+    apply_preview_to_clip, apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand,
+    AudioToolWindow, AudioToolWindowCallbacks, AudioToolWindowManager, ClipPreviewOverride,
+    AUDIO_TOOL_WINDOW_MIN_HEIGHT, AUDIO_TOOL_WINDOW_MIN_WIDTH,
+};
 pub use background_tasks::{
     background_task_button, background_task_panel, BackgroundTaskCancelCb, BackgroundTaskKind,
     BackgroundTaskProgress, BackgroundTaskStatus, BackgroundTaskStore, BackgroundTaskToggleCb,

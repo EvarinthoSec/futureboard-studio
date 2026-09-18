@@ -691,6 +691,34 @@ pub struct EngineClipAudioProcess {
     /// Adaptive clip de-noise amount. Older snapshots deserialize as bypass.
     #[serde(default)]
     pub denoise_amount: f32,
+    /// Clip channel transform. Older snapshots deserialize as stereo.
+    #[serde(default)]
+    pub channel_transform: u8,
+    #[serde(default)]
+    pub dc_remove: bool,
+    #[serde(default)]
+    pub dc_left: f32,
+    #[serde(default)]
+    pub dc_right: f32,
+    /// Extra linear gain applied after clip gain. Preview overlay uses this;
+    /// project snapshots keep it at 1.0.
+    #[serde(default = "default_one_f32")]
+    pub extra_gain: f32,
+    #[serde(default)]
+    pub dehum_hz: f32,
+    #[serde(default)]
+    pub dehum_harmonics: u8,
+    #[serde(default)]
+    pub dehum_reduction_db: f32,
+    /// Envelope points as (normalized time, dB). Empty means unity.
+    #[serde(default)]
+    pub envelope_points: Vec<(f32, f32)>,
+    #[serde(default)]
+    pub preview_bypass: bool,
+}
+
+fn default_one_f32() -> f32 {
+    1.0
 }
 
 fn default_one_f64() -> f64 {

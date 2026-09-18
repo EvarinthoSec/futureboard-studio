@@ -3708,16 +3708,6 @@ fn clip_inspector(
                         ),
                     ))
                     .child(compact_property_row(
-                        "Normalize",
-                        shared_inspector_checkbox(
-                            "clip-normalize",
-                            s.normalize_gain,
-                            true,
-                            "Pending",
-                            |_, _, _| {},
-                        ),
-                    ))
-                    .child(compact_property_row(
                         "Fade In",
                         clip_stretch_stepper(
                             "clip-fade-in",

@@ -1110,6 +1110,21 @@ fn build_engine_project_snapshot_inner(
                         },
                         reverse: stretch.reverse,
                         denoise_amount: stretch.denoise_amount.clamp(0.0, 1.0),
+                        channel_transform: stretch.channel_transform,
+                        dc_remove: stretch.dc_remove,
+                        dc_left: stretch.dc_left,
+                        dc_right: stretch.dc_right,
+                        extra_gain: 1.0,
+                        dehum_hz: stretch.dehum_hz,
+                        dehum_harmonics: stretch.dehum_harmonics,
+                        dehum_reduction_db: stretch.dehum_reduction_db,
+                        envelope_points: stretch
+                            .gain_envelope
+                            .points
+                            .iter()
+                            .map(|p| (p.time, p.value_db))
+                            .collect(),
+                        preview_bypass: false,
                     }),
                 })
             })

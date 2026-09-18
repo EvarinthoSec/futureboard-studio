@@ -19,6 +19,7 @@
 #![allow(clippy::needless_pass_by_value)] // napi-rs requires owned String args
 #![allow(non_snake_case)] // lib name "DirectAudio" is intentional branding
 
+mod analysis_tap;
 #[cfg(target_os = "windows")]
 pub mod asio_registry;
 mod audio_file;
@@ -65,6 +66,7 @@ pub mod vst3_processor;
 //
 // without reaching into the NAPI-flavored modules. Both this facade and
 // the `SphereDirectAudioEngine` NAPI class wrap the same `EngineInner`.
+pub use crate::analysis_tap::{analysis_tap, clip_id_hash, AnalysisTap};
 pub use crate::audio_file::{
     generate_audio_peaks, load_audio_file, probe_audio_file, AudioFileBuffer, AudioFileFormat,
     AudioFileInfo, AudioPeak, AudioPeakFile, AudioPeakLod, AUDITION_PREVIEW_SECONDS,

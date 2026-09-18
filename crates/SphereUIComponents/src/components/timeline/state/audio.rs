@@ -162,11 +162,19 @@ impl TimelineState {
                     clip.stretch.project_sample_rate = sample_rate;
                     clip.stretch.original_duration_samples =
                         clip.stretch.original_duration_samples.max(total_frames);
-                    if clip.stretch.source_end_samples <= clip.stretch.source_start_samples {
+                    let trim_unset =
+                        clip.stretch.source_end_samples <= clip.stretch.source_start_samples;
+                    if trim_unset {
                         clip.stretch.source_start_samples = 0;
                         clip.stretch.source_end_samples = total_frames;
+                    } else {
+                        clip.stretch.source_end_samples =
+                            clip.stretch.source_end_samples.min(total_frames);
                     }
-                    if (clip.duration_beats - duration_beats).abs() > 0.001 {
+                    // Split/trimmed siblings share this asset. Adopting the file
+                    // duration would stretch them back to the full take — or, after
+                    // a processed bounce, crop them to the other clip's bounce.
+                    if trim_unset && (clip.duration_beats - duration_beats).abs() > 0.001 {
                         clip.duration_beats = duration_beats;
                         changed = true;
                     }

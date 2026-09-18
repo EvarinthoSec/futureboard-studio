@@ -117,7 +117,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// block. Pre-v47 clips load with an empty envelope.
 /// v48 appends the clip de-noise amount. Pre-v48 clips load with de-noise
 /// bypassed.
-pub const PROJECT_VERSION: u32 = 48;
+/// v49 appends clip channel/DC/de-hum process fields. Pre-v49 clips load as
+/// stereo identity with DC and de-hum bypassed.
+pub const PROJECT_VERSION: u32 = 49;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -787,6 +789,14 @@ fn encode_stretch(w: &mut FbWriter, s: &AudioClipStretchState) {
     // v48: adaptive clip de-noise amount. It is appended so all earlier
     // stretch fields retain their byte offsets for backwards compatibility.
     w.write_f32(s.denoise_amount.clamp(0.0, 1.0));
+    // v49: clip process graph (channel / DC / de-hum).
+    w.write_u8(s.channel_transform);
+    w.write_bool(s.dc_remove);
+    w.write_f32(s.dc_left);
+    w.write_f32(s.dc_right);
+    w.write_f32(s.dehum_hz);
+    w.write_u8(s.dehum_harmonics);
+    w.write_f32(s.dehum_reduction_db);
 }
 
 fn encode_clip(w: &mut FbWriter, c: &ProjectClip) {
@@ -1959,6 +1969,27 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
     } else {
         0.0
     };
+    let (
+        channel_transform,
+        dc_remove,
+        dc_left,
+        dc_right,
+        dehum_hz,
+        dehum_harmonics,
+        dehum_reduction_db,
+    ) = if version >= 49 {
+        (
+            r.read_u8()?,
+            r.read_bool()?,
+            r.read_f32()?,
+            r.read_f32()?,
+            r.read_f32()?,
+            r.read_u8()?,
+            r.read_f32()?,
+        )
+    } else {
+        (0, false, 0.0, 0.0, 0.0, 0, 0.0)
+    };
     let mut stretch = AudioClipStretchState {
         mode,
         algorithm,
@@ -1983,11 +2014,17 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
         fade_out_ms,
         gain_db,
         pan,
-        // Transient: a freshly loaded clip is not pending re-process.
         dirty: false,
         warp_markers,
         gain_envelope,
         denoise_amount,
+        channel_transform,
+        dc_remove,
+        dc_left,
+        dc_right,
+        dehum_hz,
+        dehum_harmonics,
+        dehum_reduction_db,
     };
     stretch.sanitize_in_place();
     Ok(stretch)
@@ -3709,6 +3746,13 @@ mod tests {
                     },
                 ],
             },
+            channel_transform: 0,
+            dc_remove: false,
+            dc_left: 0.0,
+            dc_right: 0.0,
+            dehum_hz: 0.0,
+            dehum_harmonics: 0,
+            dehum_reduction_db: 0.0,
         }
     }
 
@@ -3771,15 +3815,16 @@ mod tests {
         // v41 predates the envelope block, so construct the legacy payload
         // explicitly instead of appending v47 bytes to a v41 fixture.
         clip.stretch.gain_envelope = ClipEnvelope::default();
-        // v47 added the envelope block and v48 appends de-noise after it;
-        // remove both trailers so the fixture really ends at the v41 boundary.
+        // v47 added the envelope block, v48 appends de-noise, v49 appends the
+        // channel/DC/de-hum process fields; remove those trailers so the
+        // fixture really ends at the v41 boundary.
         clip.stretch.denoise_amount = 0.0;
         let mut w = FbWriter::new();
         encode_clip(&mut w, &clip);
-        // Re-create a v41 clip body: the current encoding without its v48
-        // trailer plus the old trailing byte.
         let mut v41 = w.into_bytes();
-        v41.truncate(v41.len().saturating_sub(2 * std::mem::size_of::<u32>()));
+        // envelope count u32 + denoise f32 + v49 process block.
+        let v49 = 1 + 1 + 4 + 4 + 4 + 1 + 4;
+        v41.truncate(v41.len().saturating_sub(8 + v49));
         v41.push(0);
         // A sentinel standing in for whatever followed the clip in a real body.
         v41.extend_from_slice(&7u32.to_le_bytes());

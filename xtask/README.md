@@ -131,6 +131,10 @@ Optional flags:
   crates build as `cdylib`s; the loadable-plugin C ABI is still being wired up.
 - `--no-cef` — intentionally create a developer package without the shared CEF
   runtime. Normal packages fail when `build/cef` is unavailable.
+- `--no-bundle` — skip wrapping a macOS package into `Futureboard Studio.app`.
+  On macOS hosts, `package` otherwise runs `packaging/native/bundle-macos.sh`
+  and writes `out/<profile>/<edition>/<platform>-app/Futureboard Studio.app`
+  with Apple's required `Contents/` layout (never `Content/`).
 
 ## CEF runtime staging (shared, flat)
 

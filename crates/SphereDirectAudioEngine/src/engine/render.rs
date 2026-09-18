@@ -140,6 +140,15 @@ pub fn render_project_sample(
             runtime.clips[clip_index].denoise.reset();
         }
         (l, r) = runtime.clips[clip_index].denoise.process_stereo(l, r);
+        if !runtime.clips[clip_index].preview_bypass {
+            let clip = &mut runtime.clips[clip_index];
+            (l, r) = SphereAudioProcessor::apply_channel_transform(l, r, clip.channel_transform);
+            if clip.dc_remove {
+                l -= clip.dc_left;
+                r -= clip.dc_right;
+            }
+            (l, r) = clip.dehum.process_stereo(l, r);
+        }
         if l == 0.0 && r == 0.0 {
             continue;
         }
@@ -152,9 +161,23 @@ pub fn render_project_sample(
             clip_fade_in_curve,
             clip_fade_out_curve,
         );
-        let g = clip_gain * fade;
+        let extra = if runtime.clips[clip_index].preview_bypass {
+            1.0
+        } else {
+            let env = envelope_linear_gain(
+                &runtime.clips[clip_index].envelope_points,
+                rel as f32 / clip_duration_samples.max(1) as f32,
+            );
+            runtime.clips[clip_index].extra_gain * env
+        };
+        let g = clip_gain * fade * extra;
         l *= g;
         r *= g;
+        crate::analysis_tap::analysis_tap().write_if_target(
+            runtime.clips[clip_index].id_hash,
+            l,
+            r,
+        );
 
         // Build-time resolved output index (None for master/missing) — never
         // clone ids or the sends Vec on the audio thread.
@@ -2733,6 +2756,26 @@ pub(crate) fn scatter_vsti_output_children(
             }
         }
     }
+}
+
+#[inline]
+fn envelope_linear_gain(points: &[(f32, f32)], time: f32) -> f32 {
+    if points.is_empty() {
+        return 1.0;
+    }
+    let t = time.clamp(0.0, 1.0);
+    if t <= points[0].0 {
+        return SphereAudioProcessor::db_to_lin(points[0].1);
+    }
+    for pair in points.windows(2) {
+        if t <= pair[1].0 {
+            let span = (pair[1].0 - pair[0].0).max(1.0e-6);
+            let x = ((t - pair[0].0) / span).clamp(0.0, 1.0);
+            let db = pair[0].1 + (pair[1].1 - pair[0].1) * x;
+            return SphereAudioProcessor::db_to_lin(db);
+        }
+    }
+    SphereAudioProcessor::db_to_lin(points.last().map(|p| p.1).unwrap_or(0.0))
 }
 
 #[inline]
