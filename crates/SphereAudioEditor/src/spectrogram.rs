@@ -66,6 +66,44 @@ impl FrequencyScale {
     }
 }
 
+/// Vertical position of `hz` on a spectrogram surface, `0.0` at the bottom of
+/// the plotted band and `1.0` at Nyquist.
+///
+/// Tiles, the frequency ruler, spectral selections, and the repair overlays all
+/// route through this function so a band drawn at 60 Hz sits on the 60 Hz row of
+/// the image behind it.
+pub fn frequency_position(hz: f32, max_frequency_hz: f32, scale: FrequencyScale) -> f32 {
+    let max_hz = max_frequency_hz.max(1.0);
+    let hz = hz.clamp(0.0, max_hz);
+    match scale {
+        FrequencyScale::Linear => hz / max_hz,
+        FrequencyScale::Logarithmic => {
+            let min_hz = spectrogram_min_hz(max_hz);
+            ((hz.max(min_hz).ln() - min_hz.ln()) / (max_hz.ln() - min_hz.ln()).max(1.0e-6))
+                .clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Inverse of [`frequency_position`], used by canvas hit-testing.
+pub fn position_frequency(position: f32, max_frequency_hz: f32, scale: FrequencyScale) -> f32 {
+    let max_hz = max_frequency_hz.max(1.0);
+    let position = position.clamp(0.0, 1.0);
+    match scale {
+        FrequencyScale::Linear => max_hz * position,
+        FrequencyScale::Logarithmic => {
+            let min_hz = spectrogram_min_hz(max_hz);
+            (min_hz.ln() + position * (max_hz.ln() - min_hz.ln())).exp()
+        }
+    }
+}
+
+/// Lowest frequency the logarithmic scale plots. Kept in one place so the tile
+/// renderer and the overlays cannot disagree at the bottom of the axis.
+fn spectrogram_min_hz(max_frequency_hz: f32) -> f32 {
+    20.0_f32.min(max_frequency_hz.max(20.0))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SpectrogramSettings {
     pub fft_size: usize,
@@ -289,13 +327,7 @@ fn frequency_bin_for_row(
     scale: FrequencyScale,
 ) -> usize {
     let t = row as f32 / (height - 1) as f32;
-    let frequency = match scale {
-        FrequencyScale::Linear => max_frequency_hz * (1.0 - t),
-        FrequencyScale::Logarithmic => {
-            let low = 20.0_f32.min(max_frequency_hz.max(20.0));
-            max_frequency_hz * (low / max_frequency_hz.max(low)).powf(t)
-        }
-    };
+    let frequency = position_frequency(1.0 - t, max_frequency_hz, scale);
     ((frequency / max_frequency_hz.max(1.0)) * (bin_count - 1) as f32)
         .round()
         .clamp(0.0, (bin_count - 1) as f32) as usize

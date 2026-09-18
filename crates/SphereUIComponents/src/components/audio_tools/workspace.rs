@@ -5,14 +5,14 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, InteractiveElement, IntoElement, ParentElement, Role, StatefulInteractiveElement, Styled,
-    Toggled, Window, div, px,
+    div, px, App, InteractiveElement, IntoElement, ParentElement, Role, StatefulInteractiveElement,
+    Styled, Toggled, Window,
 };
 
-use crate::components::controls::{FbSegment, fb_segment, fb_segmented_track};
+use crate::components::controls::{fb_segment, fb_segmented_track, FbSegment};
 use crate::components::inspector::inspector_mini_button;
 use crate::components::slider::compact_slider_with_reset;
-use crate::theme::{Colors, radius, size, space, typography};
+use crate::theme::{radius, size, space, typography, Colors};
 
 pub fn stage(viz: impl IntoElement, controls: impl IntoElement) -> impl IntoElement {
     div()

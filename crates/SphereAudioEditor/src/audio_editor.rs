@@ -19,7 +19,7 @@ use crate::editing::{
     SpectralSelection,
 };
 use crate::spectrogram::{
-    AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramViewModel,
+    AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramViewModel, frequency_position,
 };
 use crate::tools::AudioToolKind;
 use crate::waveform_view::{WaveformViewModel, waveform_view};
@@ -703,17 +703,7 @@ fn selection_overlay(x0: f32, x1: f32, view_h: f32, theme: &AudioEditorTheme) ->
 }
 
 fn frequency_to_y(hz: f32, max_frequency_hz: f32, view_h: f32, scale: FrequencyScale) -> f32 {
-    let max_hz = max_frequency_hz.max(1.0);
-    let hz = hz.clamp(0.0, max_hz);
-    let position = match scale {
-        FrequencyScale::Linear => hz / max_hz,
-        FrequencyScale::Logarithmic => {
-            let min_hz = 20.0_f32.min(max_hz);
-            ((hz.max(min_hz).ln() - min_hz.ln()) / (max_hz.ln() - min_hz.ln()).max(1.0e-6))
-                .clamp(0.0, 1.0)
-        }
-    };
-    view_h * (1.0 - position)
+    view_h * (1.0 - frequency_position(hz, max_frequency_hz, scale))
 }
 
 fn spectral_selection_overlay(

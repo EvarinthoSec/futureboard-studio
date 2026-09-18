@@ -72,8 +72,9 @@ impl SpectrumWindow {
 pub enum SpectrumSmoothing {
     #[default]
     None,
-    SixthOctave,
     TwelfthOctave,
+    SixthOctave,
+    ThirdOctave,
 }
 
 impl SpectrumSmoothing {
@@ -82,6 +83,7 @@ impl SpectrumSmoothing {
             Self::None => "None",
             Self::SixthOctave => "1/6 octave",
             Self::TwelfthOctave => "1/12 octave",
+            Self::ThirdOctave => "1/3 octave",
         }
     }
 
@@ -90,6 +92,7 @@ impl SpectrumSmoothing {
             Self::None => None,
             Self::SixthOctave => Some(1.0 / 6.0),
             Self::TwelfthOctave => Some(1.0 / 12.0),
+            Self::ThirdOctave => Some(1.0 / 3.0),
         }
     }
 }

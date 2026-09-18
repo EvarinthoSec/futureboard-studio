@@ -15,9 +15,11 @@ mod spectral;
 
 pub use channel::{ChannelTransform, apply_channel_transform, apply_channel_transform_interleaved};
 pub use dc::{DcOffset, DcOffsetProcessor, measure_dc_offset};
-pub use declick::{DeclickParams, declick_interleaved};
+pub use declick::{ClickEvent, DeclickParams, declick_interleaved, detect_clicks};
 pub use dehum::{DehumParams, DehumProcessor};
-pub use denoise_spectral::{SpectralDenoiseParams, learn_noise_profile, reduce_noise_stft};
+pub use denoise_spectral::{
+    NoiseGateMask, SpectralDenoiseParams, learn_noise_profile, noise_gate_mask, reduce_noise_stft,
+};
 pub use normalize::{
     NormalizeMeasurement, NormalizeMode, NormalizeParams, apply_gain_interleaved,
     measure_normalize, required_normalize_gain_db,

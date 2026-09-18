@@ -1,12 +1,16 @@
 //! Floating audio-editor tool windows.
 
+mod canvas;
+mod graph;
+mod module_list;
 mod preview;
+mod repair;
 mod viz;
 mod window;
 mod workspace;
 
-pub use preview::{ClipPreviewOverride, apply_preview_to_clip, apply_previews_to_snapshot};
+pub use preview::{apply_preview_to_clip, apply_previews_to_snapshot, ClipPreviewOverride};
 pub use window::{
-    AUDIO_TOOL_WINDOW_MIN_HEIGHT, AUDIO_TOOL_WINDOW_MIN_WIDTH, AudioToolCommand, AudioToolWindow,
-    AudioToolWindowCallbacks, AudioToolWindowManager, open_audio_tool_window,
+    open_audio_tool_window, AudioToolCommand, AudioToolWindow, AudioToolWindowCallbacks,
+    AudioToolWindowManager, AUDIO_TOOL_WINDOW_MIN_HEIGHT, AUDIO_TOOL_WINDOW_MIN_WIDTH,
 };

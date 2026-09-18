@@ -25,14 +25,14 @@ pub use analysis::{
 };
 
 pub use clip_process::{
-    AudioClipProcessor, ChannelTransform, DcOffset, DcOffsetProcessor, DeclickParams, DehumParams,
-    DehumProcessor, NormalizeMeasurement, NormalizeMode, NormalizeParams, ResampleError,
-    SpectralDenoiseParams, SpectralGainParams, StftSettings, apply_channel_transform,
-    apply_channel_transform_interleaved, apply_gain_interleaved, apply_spectral_gain, db_to_lin,
-    declick_interleaved, downmix_interleaved, interpolate_spectral_region, learn_noise_profile,
-    lin_to_db, measure_dc_offset, measure_normalize, peak_amplitude, reduce_noise_stft,
-    replace_frame_range, required_normalize_gain_db, resample_interleaved, slice_frames,
-    write_wav_f32,
+    AudioClipProcessor, ChannelTransform, ClickEvent, DcOffset, DcOffsetProcessor, DeclickParams,
+    DehumParams, DehumProcessor, NoiseGateMask, NormalizeMeasurement, NormalizeMode,
+    NormalizeParams, ResampleError, SpectralDenoiseParams, SpectralGainParams, StftSettings,
+    apply_channel_transform, apply_channel_transform_interleaved, apply_gain_interleaved,
+    apply_spectral_gain, db_to_lin, declick_interleaved, detect_clicks, downmix_interleaved,
+    interpolate_spectral_region, learn_noise_profile, lin_to_db, measure_dc_offset,
+    measure_normalize, noise_gate_mask, peak_amplitude, reduce_noise_stft, replace_frame_range,
+    required_normalize_gain_db, resample_interleaved, slice_frames, write_wav_f32,
 };
 
 pub use denoise::DenoiseProcessor;

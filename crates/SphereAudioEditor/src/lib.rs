@@ -26,7 +26,7 @@ pub use editor_kind::{ClipEditorKind, ClipTypeHint, editor_kind_for_clip};
 pub use spectrogram::{
     AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramAnalysis,
     SpectrogramAnalysisError, SpectrogramSettings, SpectrogramTile, SpectrogramTileView,
-    SpectrogramViewModel, analyze_spectrogram,
+    SpectrogramViewModel, analyze_spectrogram, frequency_position, position_frequency,
 };
 pub use tools::{AudioRepairModule, AudioToolKind, AudioToolSession, AudioToolTarget};
 pub use viewport::AudioEditorViewport;

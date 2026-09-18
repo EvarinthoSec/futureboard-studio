@@ -64,6 +64,9 @@ impl AssetSource for EmbeddedAssets {
         if path == LOGO_TEXT_PATH {
             return Ok(Some(Cow::Borrowed(LOGO_TEXT_PNG)));
         }
+        if let Some(svg) = assets::audio_repair_icon(path) {
+            return Ok(Some(Cow::Borrowed(svg.as_bytes())));
+        }
         let bytes = match path {
             assets::ICON_PLAY_PATH => Some(assets::icons::PLAY.as_bytes()),
             assets::ICON_LAYERS_PATH => Some(assets::icons::LAYERS.as_bytes()),
@@ -214,7 +217,10 @@ impl AssetSource for EmbeddedAssets {
             assets::TIMELINE_SCROLL_PATH,
         ];
         let mut list = Vec::new();
-        for p in all_paths {
+        for p in all_paths
+            .into_iter()
+            .chain(assets::AUDIO_REPAIR_ICONS.iter().map(|(p, _)| *p))
+        {
             if p.starts_with(path) {
                 list.push(SharedString::from(p));
             }

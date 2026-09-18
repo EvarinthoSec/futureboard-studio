@@ -188,6 +188,66 @@ pub const ICON_TRASH_PATH: &str = "icons/trash-2.svg";
 pub const ICON_CHEVRON_LEFT_PATH: &str = "icons/chevron-left.svg";
 pub const ICON_CLOSE_SMALL_PATH: &str = "icons/x.svg";
 
+// Audio Repair module glyphs. One stroke family drawn for the module
+// navigator, not borrowed from a general-purpose icon set.
+pub const ICON_REPAIR_NOISE_REDUCTION_PATH: &str = "icons/audio_repair/noise_reduction.svg";
+pub const ICON_REPAIR_DE_CLICK_PATH: &str = "icons/audio_repair/de_click.svg";
+pub const ICON_REPAIR_DE_HUM_PATH: &str = "icons/audio_repair/de_hum.svg";
+pub const ICON_REPAIR_SPECTRAL_PATH: &str = "icons/audio_repair/spectral_repair.svg";
+pub const ICON_REPAIR_DE_REVERB_PATH: &str = "icons/audio_repair/de_reverb.svg";
+pub const ICON_REPAIR_DE_BLEED_PATH: &str = "icons/audio_repair/de_bleed.svg";
+pub const ICON_REPAIR_DE_FEEDBACK_PATH: &str = "icons/audio_repair/de_feedback.svg";
+pub const ICON_REPAIR_DRUM_SILENCER_PATH: &str = "icons/audio_repair/drum_silencer.svg";
+
+/// The Audio Repair glyph family, registered once.
+///
+/// Adding a repair module means adding an SVG file and one row here; the
+/// embedded asset source resolves the whole table, so no per-icon `match` arm
+/// or `list()` entry has to be kept in sync. The files carry no final UI color
+/// — GPUI rasterizes them as a coverage mask and tints from the theme.
+pub const AUDIO_REPAIR_ICONS: [(&str, &str); 8] = [
+    (
+        ICON_REPAIR_NOISE_REDUCTION_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/noise_reduction.svg"),
+    ),
+    (
+        ICON_REPAIR_DE_CLICK_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/de_click.svg"),
+    ),
+    (
+        ICON_REPAIR_DE_HUM_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/de_hum.svg"),
+    ),
+    (
+        ICON_REPAIR_SPECTRAL_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/spectral_repair.svg"),
+    ),
+    (
+        ICON_REPAIR_DE_REVERB_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/de_reverb.svg"),
+    ),
+    (
+        ICON_REPAIR_DE_BLEED_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/de_bleed.svg"),
+    ),
+    (
+        ICON_REPAIR_DE_FEEDBACK_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/de_feedback.svg"),
+    ),
+    (
+        ICON_REPAIR_DRUM_SILENCER_PATH,
+        include_str!("../../../packages/shared/icons/audio_repair/drum_silencer.svg"),
+    ),
+];
+
+/// Resolve an Audio Repair glyph by its virtual asset path.
+pub fn audio_repair_icon(path: &str) -> Option<&'static str> {
+    AUDIO_REPAIR_ICONS
+        .iter()
+        .find(|(candidate, _)| *candidate == path)
+        .map(|(_, svg)| *svg)
+}
+
 #[cfg(target_os = "windows")]
 fn log_startup_dpi() {
     use windows::Win32::UI::HiDpi::GetDpiForSystem;

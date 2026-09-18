@@ -1,15 +1,19 @@
 //! DSP visualizations for audio tool windows.
 //!
 //! Each view is a single `canvas` so enlarging the window grows plot area, not
-//! spacing. Paint stays on the UI thread and only reads already-computed
-//! analysis snapshots.
+//! spacing. Analyzer curves are remapped in display space and painted as
+//! anti-aliased contours — FFT bin count never equals on-screen rectangles.
 
-use gpui::{Bounds, IntoElement, Pixels, Rgba, Styled, Window, canvas, fill, point, px, size};
+use gpui::{canvas, fill, point, px, size, Bounds, IntoElement, Pixels, Styled, Window};
 
 use crate::theme::Colors;
 
-const DB_FLOOR: f32 = -96.0;
-const DB_CEIL: f32 = 12.0;
+use super::graph::{self, plot_canvas, AnalyzerPlot, SpectrumLayer};
+
+pub use super::graph::{DisplaySmoothing, GraphDraw, GraphStyle};
+
+const DB_FLOOR: f32 = graph::DB_FLOOR;
+const DB_CEIL: f32 = graph::DB_CEIL;
 
 pub fn hop_levels(samples: &[f32], buckets: usize) -> Vec<f32> {
     if samples.is_empty() || buckets == 0 {
@@ -47,7 +51,15 @@ fn canvas_size(bounds: Bounds<Pixels>) -> (f32, f32) {
     )
 }
 
-fn quad(window: &mut Window, bounds: Bounds<Pixels>, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
+fn quad(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: gpui::Rgba,
+) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
@@ -62,121 +74,49 @@ fn db_y(db: f32, height: f32) -> f32 {
     height * (1.0 - t)
 }
 
-fn log_x(hz: f32, min_hz: f32, max_hz: f32, width: f32) -> f32 {
-    let min_hz = min_hz.max(1.0);
-    let max_hz = max_hz.max(min_hz + 1.0);
-    let hz = hz.clamp(min_hz, max_hz);
-    let t = (hz / min_hz).log10() / (max_hz / min_hz).log10();
-    t.clamp(0.0, 1.0) * width
-}
-
-fn paint_grid(window: &mut Window, bounds: Bounds<Pixels>, width: f32, height: f32, nyquist: f32) {
-    let line = Colors::with_alpha(Colors::text_faint(), 0.18);
-    for db in [-72.0, -48.0, -24.0, -12.0, 0.0] {
-        let y = db_y(db, height);
-        quad(window, bounds, 0.0, y, width, 1.0, line);
-    }
-    for hz in [100.0, 1_000.0, 10_000.0] {
-        if hz >= nyquist {
-            continue;
-        }
-        let x = log_x(hz, 20.0, nyquist, width);
-        quad(window, bounds, x, 0.0, 1.0, height, line);
-    }
-}
-
-fn paint_spectrum_series(
-    window: &mut Window,
-    bounds: Bounds<Pixels>,
-    width: f32,
-    height: f32,
-    magnitudes_db: &[f32],
-    sample_rate: u32,
-    color: Rgba,
-    thickness: f32,
-) {
-    if magnitudes_db.is_empty() || width < 2.0 || height < 2.0 {
-        return;
-    }
-    let bins = magnitudes_db.len();
-    let fft = (bins * 2).max(2) as f32;
-    let sr = sample_rate.max(1) as f32;
-    let nyquist = sr * 0.5;
-    let cols = width.max(1.0) as usize;
-    for col in 0..cols {
-        let x0 = col as f32;
-        let x1 = (col + 1) as f32;
-        let hz0 = 20.0 * (nyquist / 20.0).powf(x0 / width);
-        let hz1 = 20.0 * (nyquist / 20.0).powf(x1 / width);
-        let b0 = ((hz0 * fft / sr).floor() as usize).min(bins.saturating_sub(1));
-        let b1 = ((hz1 * fft / sr).ceil() as usize).min(bins).max(b0 + 1);
-        let mut peak = DB_FLOOR;
-        for mag in magnitudes_db.iter().take(b1).skip(b0) {
-            peak = peak.max(*mag);
-        }
-        let y = db_y(peak, height);
-        quad(
-            window,
-            bounds,
-            x0,
-            y,
-            1.0,
-            (height - y).max(thickness),
-            color,
-        );
-    }
-}
-
 pub fn spectrum_view(
     magnitudes_db: &[f32],
+    averaged_db: &[f32],
     peak_hold_db: &[f32],
     sample_rate: u32,
+    draw: GraphDraw,
 ) -> impl IntoElement {
-    let mag = magnitudes_db.to_vec();
-    let hold = peak_hold_db.to_vec();
-    canvas(
-        |_bounds, _window, _cx| {},
-        move |bounds, (), window, _cx| {
-            let (width, height) = canvas_size(bounds);
-            if width < 2.0 || height < 2.0 {
-                return;
-            }
-            quad(
-                window,
-                bounds,
-                0.0,
-                0.0,
-                width,
-                height,
-                Colors::surface_canvas(),
-            );
-            let nyquist = sample_rate.max(1) as f32 * 0.5;
-            paint_grid(window, bounds, width, height, nyquist);
-            if !hold.is_empty() {
-                paint_spectrum_series(
-                    window,
-                    bounds,
-                    width,
-                    height,
-                    &hold,
-                    sample_rate,
-                    Colors::with_alpha(Colors::status_warning(), 0.55),
-                    1.0,
-                );
-            }
-            paint_spectrum_series(
-                window,
-                bounds,
-                width,
-                height,
-                &mag,
-                sample_rate,
-                Colors::with_alpha(Colors::accent_primary(), 0.9),
-                1.0,
-            );
-        },
-    )
-    .size_full()
+    let overlay = matches!(draw.style, GraphStyle::Overlay);
+    let mut layers = Vec::new();
+    if !peak_hold_db.is_empty() {
+        layers.push(SpectrumLayer {
+            label: "Hold",
+            db: peak_hold_db.to_vec(),
+            color: Colors::status_warning(),
+            fill_alpha: 0.0,
+            line: true,
+            fill: false,
+        });
+    }
+    if overlay && !averaged_db.is_empty() {
+        layers.push(SpectrumLayer {
+            label: "Avg",
+            db: averaged_db.to_vec(),
+            color: Colors::status_success(),
+            fill_alpha: 0.12,
+            line: true,
+            fill: true,
+        });
+    }
+    layers.push(SpectrumLayer {
+        label: "In",
+        db: magnitudes_db.to_vec(),
+        color: Colors::accent_primary(),
+        fill_alpha: 0.22,
+        line: true,
+        fill: true,
+    });
+    plot_canvas(AnalyzerPlot {
+        sample_rate,
+        layers,
+        draw,
+        ..AnalyzerPlot::default()
+    })
 }
 
 pub fn noise_profile_view(
@@ -184,67 +124,47 @@ pub fn noise_profile_view(
     profile: &[f32],
     sample_rate: u32,
     reduction_db: f32,
+    threshold_db: f32,
+    draw: GraphDraw,
 ) -> impl IntoElement {
-    let mag = magnitudes_db.to_vec();
-    let profile = profile.to_vec();
-    canvas(
-        |_bounds, _window, _cx| {},
-        move |bounds, (), window, _cx| {
-            let (width, height) = canvas_size(bounds);
-            if width < 2.0 || height < 2.0 {
-                return;
-            }
-            quad(
-                window,
-                bounds,
-                0.0,
-                0.0,
-                width,
-                height,
-                Colors::surface_canvas(),
-            );
-            let nyquist = sample_rate.max(1) as f32 * 0.5;
-            paint_grid(window, bounds, width, height, nyquist);
-            paint_spectrum_series(
-                window,
-                bounds,
-                width,
-                height,
-                &mag,
-                sample_rate,
-                Colors::with_alpha(Colors::accent_primary(), 0.55),
-                1.0,
-            );
-            if !profile.is_empty() {
-                let profile_db: Vec<f32> = profile.iter().copied().map(lin_to_db).collect();
-                paint_spectrum_series(
-                    window,
-                    bounds,
-                    width,
-                    height,
-                    &profile_db,
-                    sample_rate,
-                    Colors::with_alpha(Colors::status_warning(), 0.95),
-                    2.0,
-                );
-                let reduced: Vec<f32> = profile_db
-                    .iter()
-                    .map(|db| db - reduction_db.max(0.0))
-                    .collect();
-                paint_spectrum_series(
-                    window,
-                    bounds,
-                    width,
-                    height,
-                    &reduced,
-                    sample_rate,
-                    Colors::with_alpha(Colors::status_success(), 0.7),
-                    1.0,
-                );
-            }
-        },
-    )
-    .size_full()
+    let mut layers = vec![SpectrumLayer {
+        label: "In",
+        db: magnitudes_db.to_vec(),
+        color: Colors::accent_primary(),
+        fill_alpha: 0.20,
+        line: true,
+        fill: true,
+    }];
+    if !profile.is_empty() {
+        let profile_db: Vec<f32> = profile.iter().copied().map(lin_to_db).collect();
+        let reduced: Vec<f32> = profile_db
+            .iter()
+            .map(|db| db - reduction_db.max(0.0))
+            .collect();
+        layers.push(SpectrumLayer {
+            label: "Profile",
+            db: profile_db,
+            color: Colors::status_warning(),
+            fill_alpha: 0.10,
+            line: true,
+            fill: true,
+        });
+        layers.push(SpectrumLayer {
+            label: "Floor",
+            db: reduced,
+            color: Colors::status_success(),
+            fill_alpha: 0.0,
+            line: true,
+            fill: false,
+        });
+    }
+    plot_canvas(AnalyzerPlot {
+        sample_rate,
+        layers,
+        threshold_db: Some(threshold_db),
+        draw,
+        ..AnalyzerPlot::default()
+    })
 }
 
 pub fn hum_harmonics_view(
@@ -252,48 +172,23 @@ pub fn hum_harmonics_view(
     sample_rate: u32,
     base_hz: f32,
     harmonics: u8,
+    draw: GraphDraw,
 ) -> impl IntoElement {
-    let mag = magnitudes_db.to_vec();
-    canvas(
-        |_bounds, _window, _cx| {},
-        move |bounds, (), window, _cx| {
-            let (width, height) = canvas_size(bounds);
-            if width < 2.0 || height < 2.0 {
-                return;
-            }
-            quad(
-                window,
-                bounds,
-                0.0,
-                0.0,
-                width,
-                height,
-                Colors::surface_canvas(),
-            );
-            let nyquist = sample_rate.max(1) as f32 * 0.5;
-            paint_grid(window, bounds, width, height, nyquist);
-            paint_spectrum_series(
-                window,
-                bounds,
-                width,
-                height,
-                &mag,
-                sample_rate,
-                Colors::with_alpha(Colors::accent_primary(), 0.85),
-                1.0,
-            );
-            let harm_color = Colors::with_alpha(Colors::status_warning(), 0.9);
-            for n in 1..=harmonics.max(1) {
-                let hz = base_hz * n as f32;
-                if hz >= nyquist {
-                    break;
-                }
-                let x = log_x(hz, 20.0, nyquist, width);
-                quad(window, bounds, x, 0.0, 2.0, height, harm_color);
-            }
-        },
-    )
-    .size_full()
+    let harmonic_hz = (1..=harmonics.max(1)).map(|n| base_hz * n as f32).collect();
+    plot_canvas(AnalyzerPlot {
+        sample_rate,
+        layers: vec![SpectrumLayer {
+            label: "In",
+            db: magnitudes_db.to_vec(),
+            color: Colors::accent_primary(),
+            fill_alpha: 0.20,
+            line: true,
+            fill: true,
+        }],
+        harmonic_hz,
+        draw,
+        ..AnalyzerPlot::default()
+    })
 }
 
 pub fn spectral_gain_view(
@@ -302,60 +197,23 @@ pub fn spectral_gain_view(
     min_hz: f32,
     max_hz: f32,
     gain_db: f32,
+    draw: GraphDraw,
 ) -> impl IntoElement {
-    let mag = magnitudes_db.to_vec();
-    canvas(
-        |_bounds, _window, _cx| {},
-        move |bounds, (), window, _cx| {
-            let (width, height) = canvas_size(bounds);
-            if width < 2.0 || height < 2.0 {
-                return;
-            }
-            quad(
-                window,
-                bounds,
-                0.0,
-                0.0,
-                width,
-                height,
-                Colors::surface_canvas(),
-            );
-            let nyquist = sample_rate.max(1) as f32 * 0.5;
-            paint_grid(window, bounds, width, height, nyquist);
-            paint_spectrum_series(
-                window,
-                bounds,
-                width,
-                height,
-                &mag,
-                sample_rate,
-                Colors::with_alpha(Colors::accent_primary(), 0.7),
-                1.0,
-            );
-            let x0 = log_x(min_hz.max(20.0), 20.0, nyquist, width);
-            let x1 = log_x(max_hz.min(nyquist), 20.0, nyquist, width).max(x0 + 2.0);
-            let y = db_y(gain_db, height);
-            quad(
-                window,
-                bounds,
-                x0,
-                0.0,
-                x1 - x0,
-                height,
-                Colors::with_alpha(Colors::accent_primary(), 0.12),
-            );
-            quad(
-                window,
-                bounds,
-                x0,
-                y,
-                x1 - x0,
-                2.0,
-                Colors::status_warning(),
-            );
-        },
-    )
-    .size_full()
+    plot_canvas(AnalyzerPlot {
+        sample_rate,
+        layers: vec![SpectrumLayer {
+            label: "In",
+            db: magnitudes_db.to_vec(),
+            color: Colors::accent_primary(),
+            fill_alpha: 0.20,
+            line: true,
+            fill: true,
+        }],
+        threshold_db: Some(gain_db),
+        band: Some((min_hz.max(20.0), max_hz)),
+        draw,
+        ..AnalyzerPlot::default()
+    })
 }
 
 pub fn loudness_view(
@@ -414,21 +272,23 @@ pub fn loudness_view(
                     );
                 }
                 if !history.is_empty() {
-                    let n = history.len().max(1);
-                    let col_w = (hist_w / n as f32).max(1.0);
-                    for (i, level) in history.iter().enumerate() {
-                        let db = lin_to_db(*level);
-                        let y = db_y(db, height);
-                        quad(
-                            window,
-                            bounds,
-                            hist_x + i as f32 * col_w,
-                            y,
-                            col_w.max(1.0),
-                            (height - y).max(1.0),
-                            Colors::with_alpha(Colors::accent_primary(), 0.75),
-                        );
-                    }
+                    let hist_bounds = Bounds::new(
+                        bounds.origin + point(px(hist_x), px(0.0)),
+                        size(px(hist_w), px(height)),
+                    );
+                    let db_series: Vec<f32> = history
+                        .iter()
+                        .map(|level| {
+                            ((lin_to_db(*level) - DB_FLOOR) / (DB_CEIL - DB_FLOOR)).clamp(0.0, 1.0)
+                        })
+                        .collect();
+                    graph::paint_series_contour(
+                        window,
+                        hist_bounds,
+                        &db_series,
+                        Colors::accent_primary(),
+                        0.22,
+                    );
                 }
             }
         },
@@ -436,7 +296,11 @@ pub fn loudness_view(
     .size_full()
 }
 
-pub fn envelope_markers_view(envelope: &[f32], marker_norm: &[(f32, f32)]) -> impl IntoElement {
+pub fn envelope_markers_view(
+    envelope: &[f32],
+    marker_norm: &[(f32, f32)],
+    highlight: Option<usize>,
+) -> impl IntoElement {
     let envelope = envelope.to_vec();
     let markers = marker_norm.to_vec();
     canvas(
@@ -455,32 +319,30 @@ pub fn envelope_markers_view(envelope: &[f32], marker_norm: &[(f32, f32)]) -> im
                 height,
                 Colors::surface_canvas(),
             );
-            if !envelope.is_empty() {
-                let n = envelope.len();
-                let col_w = (width / n as f32).max(1.0);
-                let peak = envelope.iter().copied().fold(1.0e-6, f32::max);
-                for (i, level) in envelope.iter().enumerate() {
-                    let h = (*level / peak).clamp(0.0, 1.0) * height * 0.9;
-                    quad(
-                        window,
-                        bounds,
-                        i as f32 * col_w,
-                        height - h,
-                        col_w.max(1.0),
-                        h.max(1.0),
-                        Colors::with_alpha(Colors::accent_primary(), 0.7),
-                    );
-                }
+            if envelope.len() >= 2 {
+                graph::paint_series_contour(
+                    window,
+                    bounds,
+                    &envelope,
+                    Colors::accent_primary(),
+                    0.22,
+                );
             }
-            for (pos, strength) in &markers {
+            for (i, (pos, strength)) in markers.iter().enumerate() {
                 let x = pos.clamp(0.0, 1.0) * width;
-                let alpha = 0.35 + strength.clamp(0.0, 1.0) * 0.65;
+                let selected = highlight == Some(i);
+                let alpha = if selected {
+                    0.95
+                } else {
+                    0.35 + strength.clamp(0.0, 1.0) * 0.5
+                };
+                let w = if selected { 2.0 } else { 1.0 };
                 quad(
                     window,
                     bounds,
                     x,
                     0.0,
-                    1.5,
+                    w,
                     height,
                     Colors::with_alpha(Colors::status_warning(), alpha),
                 );
@@ -921,60 +783,26 @@ pub fn channel_matrix_view(mode_index: usize) -> impl IntoElement {
     .size_full()
 }
 
-pub fn resample_view(current_hz: f32, target_hz: f32, magnitudes_db: &[f32]) -> impl IntoElement {
-    let mag = magnitudes_db.to_vec();
-    canvas(
-        |_bounds, _window, _cx| {},
-        move |bounds, (), window, _cx| {
-            let (width, height) = canvas_size(bounds);
-            if width < 2.0 || height < 2.0 {
-                return;
-            }
-            quad(
-                window,
-                bounds,
-                0.0,
-                0.0,
-                width,
-                height,
-                Colors::surface_canvas(),
-            );
-            let nyquist = current_hz.max(1.0) * 0.5;
-            paint_grid(window, bounds, width, height, nyquist.max(target_hz * 0.5));
-            paint_spectrum_series(
-                window,
-                bounds,
-                width,
-                height,
-                &mag,
-                current_hz.max(1.0) as u32,
-                Colors::with_alpha(Colors::accent_primary(), 0.8),
-                1.0,
-            );
-            let max_hz = current_hz.max(target_hz) * 0.5;
-            let cur_x = log_x(current_hz * 0.5, 20.0, max_hz.max(40.0), width);
-            let tgt_x = log_x(target_hz * 0.5, 20.0, max_hz.max(40.0), width);
-            quad(
-                window,
-                bounds,
-                cur_x,
-                0.0,
-                2.0,
-                height,
-                Colors::text_muted(),
-            );
-            quad(
-                window,
-                bounds,
-                tgt_x,
-                0.0,
-                2.0,
-                height,
-                Colors::status_warning(),
-            );
-        },
-    )
-    .size_full()
+pub fn resample_view(
+    current_hz: f32,
+    target_hz: f32,
+    magnitudes_db: &[f32],
+    draw: GraphDraw,
+) -> impl IntoElement {
+    plot_canvas(AnalyzerPlot {
+        sample_rate: current_hz.max(1.0) as u32,
+        layers: vec![SpectrumLayer {
+            label: "In",
+            db: magnitudes_db.to_vec(),
+            color: Colors::accent_primary(),
+            fill_alpha: 0.20,
+            line: true,
+            fill: true,
+        }],
+        harmonic_hz: vec![current_hz.max(1.0) * 0.5, target_hz.max(1.0) * 0.5],
+        draw,
+        ..AnalyzerPlot::default()
+    })
 }
 
 pub fn time_pitch_view(stretch: f32, semitones: f32) -> impl IntoElement {

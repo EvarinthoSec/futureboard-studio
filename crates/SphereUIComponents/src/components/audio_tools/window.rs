@@ -5,34 +5,40 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use SphereAudioProcessor::{
-    AudioClipProcessor, ChannelTransform, DcOffsetProcessor, DeclickParams, DehumParams,
-    DehumProcessor, FftSize, FrequencyFocus, KeyEstimate, LoudnessMeasurement,
-    NormalizeMeasurement, NormalizeMode, NormalizeParams, PhaseMeasurement, SpectralDenoiseParams,
-    SpectralGainParams, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot, SpectrumWindow,
-    StftSettings, StretchAlgorithm, StretchMode, StretchParams, TempoCandidate,
-    TransientDetectParams, TransientMarker, analyze_loudness, analyze_spectrum,
-    apply_channel_transform_interleaved, apply_gain_interleaved, apply_spectral_gain, db_to_lin,
-    declick_interleaved, detect_transients, downmix_interleaved, estimate_bpm_candidates,
-    estimate_key_ranked, learn_noise_profile, measure_dc_offset, measure_normalize, measure_phase,
-    reduce_noise_stft, render_stretch_interleaved, replace_frame_range, resample_interleaved,
-    semitone_to_pitch_ratio, slice_frames, write_wav_f32,
-};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
-use sphere_audio_editor::{AudioRepairModule, AudioToolKind, AudioToolSession, AudioToolTarget};
+use sphere_audio_editor::{
+    AudioRangeSelection, AudioRepairModule, AudioToolKind, AudioToolSession, AudioToolTarget,
+    SpectralSelection,
+};
+use SphereAudioProcessor::{
+    analyze_loudness, analyze_spectrum, apply_channel_transform_interleaved,
+    apply_gain_interleaved, apply_spectral_gain, db_to_lin, declick_interleaved, detect_transients,
+    downmix_interleaved, estimate_bpm_candidates, estimate_key_ranked, learn_noise_profile,
+    measure_dc_offset, measure_normalize, measure_phase, reduce_noise_stft,
+    render_stretch_interleaved, replace_frame_range, resample_interleaved, semitone_to_pitch_ratio,
+    slice_frames, write_wav_f32, AudioClipProcessor, ChannelTransform, DcOffsetProcessor,
+    DeclickParams, DehumParams, DehumProcessor, FftSize, FrequencyFocus, KeyEstimate,
+    LoudnessMeasurement, NormalizeMeasurement, NormalizeMode, NormalizeParams, PhaseMeasurement,
+    SpectralDenoiseParams, SpectralGainParams, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot,
+    SpectrumWindow, StftSettings, StretchAlgorithm, StretchMode, StretchParams, TempoCandidate,
+    TransientDetectParams, TransientMarker,
+};
 
 use crate::components::inspector::inspector_mini_button;
 use crate::components::timeline::Timeline;
 use crate::components::title_bar::external_window_titlebar;
-use crate::theme::{Colors, space};
+use crate::theme::{space, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 use super::preview::ClipPreviewOverride;
-use super::{viz, workspace};
+use super::repair::RepairSurface;
+use super::viz::{self, DisplaySmoothing, GraphDraw, GraphStyle};
+use super::workspace;
 
 pub const AUDIO_TOOL_WINDOW_MIN_WIDTH: f32 = 480.0;
 pub const AUDIO_TOOL_WINDOW_MIN_HEIGHT: f32 = 320.0;
@@ -171,16 +177,17 @@ struct AbSnapshot {
 
 pub struct AudioToolWindow {
     pub(crate) session: AudioToolSession,
-    timeline: Entity<Timeline>,
+    pub(super) timeline: Entity<Timeline>,
     callbacks: AudioToolWindowCallbacks,
-    status: String,
+    pub(super) status: String,
     // Spectrum
     spectrum_mode: SpectrumMode,
-    fft_size: FftSize,
+    pub(super) fft_size: FftSize,
     spectrum_window: SpectrumWindow,
     smoothing: SpectrumSmoothing,
     peak_hold: bool,
-    spectrum: Option<SpectrumSnapshot>,
+    pub(super) spectrum: Option<SpectrumSnapshot>,
+    pub(super) spectrum_avg: Option<Vec<f32>>,
     // Loudness / normalize / dc / bpm / key / transients
     loudness: Option<LoudnessMeasurement>,
     normalize: NormalizeParams,
@@ -191,8 +198,8 @@ pub struct AudioToolWindow {
     bpm: Vec<TempoCandidate>,
     keys: Vec<KeyEstimate>,
     user_key: Option<KeyEstimate>,
-    transients: Vec<TransientMarker>,
-    transient_params: TransientDetectParams,
+    pub(super) transients: Vec<TransientMarker>,
+    pub(super) transient_params: TransientDetectParams,
     freq_focus: FrequencyFocus,
     // Time/pitch
     time_mode: TimePitchMode,
@@ -211,13 +218,25 @@ pub struct AudioToolWindow {
     ab_bank: Option<AbSnapshot>,
     ab_showing_b: bool,
     resample_target: u32,
-    repair_module: AudioRepairModule,
-    denoise: SpectralDenoiseParams,
-    learned_noise: Option<Vec<f32>>,
-    declick: DeclickParams,
-    dehum: DehumParams,
-    spectral_gain_db: f32,
+    pub(super) denoise: SpectralDenoiseParams,
+    pub(super) learned_noise: Option<Vec<f32>>,
+    pub(super) declick: DeclickParams,
+    pub(super) dehum: DehumParams,
+    pub(super) spectral_gain_db: f32,
     spectrum_busy: bool,
+    pub(super) display_smoothing: DisplaySmoothing,
+    pub(super) graph_style: GraphStyle,
+    pub(super) graph_hover: Option<Point<Pixels>>,
+    /// Interleaved PCM of the analyzed window.
+    ///
+    /// Held for the lifetime of the window so the repair canvas can draw peaks
+    /// and the preview worker can re-run a processor on every parameter change
+    /// without decoding the file again. It costs one clip's PCM, which the
+    /// analysis pass already materialized, and is released when the window
+    /// closes.
+    pub(super) source_pcm: Option<Arc<[f32]>>,
+    pub(super) source_channels: usize,
+    pub(super) repair: RepairSurface,
 }
 
 impl AudioToolWindow {
@@ -228,18 +247,16 @@ impl AudioToolWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         DirectAudio::analysis_tap().set_target_clip(Some(&session.target.clip_id));
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(REFRESH).await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.tick_realtime(cx);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REFRESH).await;
+            if this
+                .update(cx, |this, cx| {
+                    this.tick_realtime(cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -257,6 +274,7 @@ impl AudioToolWindow {
             smoothing: SpectrumSmoothing::None,
             peak_hold: false,
             spectrum: None,
+            spectrum_avg: None,
             loudness: None,
             normalize: NormalizeParams::default(),
             measurement: None,
@@ -284,13 +302,18 @@ impl AudioToolWindow {
             ab_bank: None,
             ab_showing_b: false,
             resample_target: if target_sr == 44_100 { 48_000 } else { 44_100 },
-            repair_module: AudioRepairModule::Denoise,
             denoise: SpectralDenoiseParams::default(),
             learned_noise: None,
             declick: DeclickParams::default(),
             dehum: DehumParams::default(),
             spectral_gain_db: 0.0,
             spectrum_busy: false,
+            display_smoothing: DisplaySmoothing::Light,
+            graph_style: GraphStyle::FillAndLine,
+            graph_hover: None,
+            source_pcm: None,
+            source_channels: 1,
+            repair: RepairSurface::new(cx),
         };
         if !matches!(kind, AudioToolKind::SpectrogramSettings) {
             window.spawn_analyze(cx);
@@ -337,8 +360,8 @@ impl AudioToolWindow {
                             .await;
                         let _ = host.update(cx, |this, cx| {
                             this.spectrum_busy = false;
-                            if snap.is_some() {
-                                this.spectrum = snap;
+                            if let Some(snap) = snap {
+                                this.absorb_spectrum(snap);
                             }
                             cx.notify();
                         });
@@ -354,6 +377,9 @@ impl AudioToolWindow {
                     let m = measure_phase(&left[..n], &right[..n], self.phase_ms);
                     self.push_phase(m);
                 }
+            }
+            AudioToolKind::AudioRepair if self.session.preview_enabled => {
+                self.tick_audition_level();
             }
             _ => {}
         }
@@ -410,13 +436,17 @@ impl AudioToolWindow {
                         this.status.clear();
                         this.envelope = viz::hop_levels(&mono, LEVEL_HOPS);
                         this.level_history = this.envelope.clone();
+                        this.source_channels = channels;
+                        if kind == AudioToolKind::AudioRepair {
+                            this.source_pcm = Some(Arc::from(samples.as_slice()));
+                        }
                         match kind {
                             AudioToolKind::SpectrumAnalyzer
                             | AudioToolKind::AudioRepair
                             | AudioToolKind::SpectralProcessor
                             | AudioToolKind::Resample
                             | AudioToolKind::SpectrogramSettings => {
-                                this.spectrum = analyze_spectrum(
+                                if let Some(snap) = analyze_spectrum(
                                     &mono,
                                     sr,
                                     fft_size,
@@ -424,7 +454,9 @@ impl AudioToolWindow {
                                     smoothing,
                                     peak,
                                     peak_hold.as_deref(),
-                                );
+                                ) {
+                                    this.absorb_spectrum(snap);
+                                }
                             }
                             AudioToolKind::Loudness | AudioToolKind::Normalize => {
                                 this.loudness = analyze_loudness(&samples, channels, sr);
@@ -466,6 +498,9 @@ impl AudioToolWindow {
                                 spectral.map(|s| s.max_hz).unwrap_or(sr as f32 * 0.5)
                             );
                         }
+                        if kind == AudioToolKind::AudioRepair {
+                            this.on_repair_source_ready(cx);
+                        }
                     }
                     Err(error) => this.status = error,
                 }
@@ -475,34 +510,44 @@ impl AudioToolWindow {
         .detach();
     }
 
-    fn spawn_learn_noise(&mut self, cx: &mut Context<Self>) {
-        let path = self.session.target.source_path.clone();
-        let selection = self.session.target.time_selection;
+    /// Learn the noise profile from the canvas region when one is drawn, and
+    /// from the whole analyzed window otherwise.
+    ///
+    /// Uses the buffer analysis already decoded, so learning a profile while
+    /// auditioning never touches the filesystem.
+    pub(super) fn spawn_learn_noise(&mut self, cx: &mut Context<Self>) {
+        let Some(pcm) = self.source_pcm.clone() else {
+            self.status = "Analyze the source first".to_string();
+            cx.notify();
+            return;
+        };
+        let channels = self.source_channels.max(1);
+        let (start, end) = self.repair_learn_range(pcm.len() / channels);
+        if end.saturating_sub(start) < 2048 {
+            self.status = "Select at least 2048 frames of noise".to_string();
+            cx.notify();
+            return;
+        }
+        let learned_frames = end - start;
+        let sample_rate = self.session.target.sample_rate.max(1);
         self.status = "Learning noise profile…".to_string();
         let host = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let result = cx
+            let profile = cx
                 .background_executor()
                 .spawn(async move {
-                    let path = path.ok_or_else(|| "clip has no source file".to_string())?;
-                    let buffer = DirectAudio::load_audio_file(&path)?;
-                    let channels = buffer.channels.max(1);
-                    let mut samples = buffer.samples;
-                    if let Some(sel) = selection {
-                        samples = slice_frames(&samples, channels, sel.start_frame, sel.end_frame);
-                    }
-                    let mono = downmix_interleaved(&samples, channels);
-                    Ok::<_, String>(learn_noise_profile(&mono, 2048, 512))
+                    let region = &pcm[start * channels..(end * channels).min(pcm.len())];
+                    learn_noise_profile(&downmix_interleaved(region, channels), 2048, 512)
                 })
                 .await;
             let _ = host.update(cx, |this, cx| {
-                match result {
-                    Ok(profile) => {
-                        this.learned_noise = Some(profile);
-                        this.status = "Noise profile learned".to_string();
-                    }
-                    Err(error) => this.status = error,
-                }
+                this.learned_noise = Some(profile);
+                this.repair.profile_frames = learned_frames as u64;
+                this.status = format!(
+                    "Noise profile learned from {:.2} s",
+                    learned_frames as f32 / sample_rate as f32
+                );
+                this.invalidate_repair_preview(cx);
                 cx.notify();
             });
         })
@@ -513,7 +558,7 @@ impl AudioToolWindow {
         (self.callbacks.on_command)(command, cx);
     }
 
-    fn emit_preview(&mut self, cx: &mut App) {
+    pub(super) fn emit_preview(&mut self, cx: &mut App) {
         if !self.session.preview_enabled {
             self.dispatch(
                 AudioToolCommand::ClearPreview(self.session.target.clip_id.clone()),
@@ -539,15 +584,84 @@ impl AudioToolWindow {
                 preview.stretch_ratio = Some((self.stretch_percent / 100.0).clamp(0.05, 20.0));
                 preview.pitch_semitones = Some(self.pitch_semi + self.pitch_cents / 100.0);
             }
-            AudioToolKind::AudioRepair if self.repair_module == AudioRepairModule::DeHum => {
+            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::DeHum => {
                 preview.dehum = Some(self.dehum);
             }
-            AudioToolKind::AudioRepair if self.repair_module == AudioRepairModule::Denoise => {
+            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::Denoise => {
                 preview.denoise_amount = Some((self.denoise.reduction_db / 24.0).clamp(0.0, 1.0));
             }
             _ => {}
         }
         self.dispatch(AudioToolCommand::Preview(preview), cx);
+    }
+
+    fn absorb_spectrum(&mut self, snap: SpectrumSnapshot) {
+        const LIVE: f32 = 0.38;
+        const AVG: f32 = 0.10;
+        let live = self.spectrum_mode == SpectrumMode::RealtimePlayback
+            && self
+                .spectrum
+                .as_ref()
+                .is_some_and(|prev| prev.magnitudes_db.len() == snap.magnitudes_db.len());
+        if live {
+            if let Some(prev) = self.spectrum.as_mut() {
+                for (dst, src) in prev.magnitudes_db.iter_mut().zip(&snap.magnitudes_db) {
+                    *dst = *dst * (1.0 - LIVE) + *src * LIVE;
+                }
+                if prev.peak_hold_db.len() == snap.peak_hold_db.len() {
+                    for (dst, src) in prev.peak_hold_db.iter_mut().zip(&snap.peak_hold_db) {
+                        *dst = dst.max(*src);
+                    }
+                } else {
+                    prev.peak_hold_db = snap.peak_hold_db.clone();
+                }
+                prev.sample_rate = snap.sample_rate;
+                prev.fft_size = snap.fft_size;
+            }
+        } else {
+            self.spectrum = Some(snap);
+        }
+        let src = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.magnitudes_db.as_slice())
+            .unwrap_or(&[]);
+        match self.spectrum_avg.as_mut() {
+            Some(avg) if avg.len() == src.len() && live => {
+                for (dst, v) in avg.iter_mut().zip(src) {
+                    *dst = *dst * (1.0 - AVG) + *v * AVG;
+                }
+            }
+            _ => self.spectrum_avg = Some(src.to_vec()),
+        }
+    }
+
+    fn graph_draw(&self) -> GraphDraw {
+        GraphDraw {
+            smoothing: self.display_smoothing,
+            style: self.graph_style,
+            hover: self.graph_hover,
+        }
+    }
+
+    fn tracked_plot(&self, plot: impl IntoElement, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("analyzer-plot")
+            .size_full()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let pos = event.position;
+                if this.graph_hover != Some(pos) {
+                    this.graph_hover = Some(pos);
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered && this.graph_hover.is_some() {
+                    this.graph_hover = None;
+                    cx.notify();
+                }
+            }))
+            .child(plot)
     }
 
     fn push_phase(&mut self, measured: PhaseMeasurement) {
@@ -573,7 +687,7 @@ impl AudioToolWindow {
             normalize: self.normalize,
             channel: self.channel,
             resample_target: self.resample_target,
-            repair_module: self.repair_module,
+            repair_module: self.repair.module,
             denoise: self.denoise,
             declick: self.declick,
             dehum: self.dehum,
@@ -599,7 +713,7 @@ impl AudioToolWindow {
         self.normalize = snap.normalize;
         self.channel = snap.channel;
         self.resample_target = snap.resample_target;
-        self.repair_module = snap.repair_module;
+        self.repair.module = snap.repair_module;
         self.denoise = snap.denoise;
         self.declick = snap.declick;
         self.dehum = snap.dehum;
@@ -699,7 +813,7 @@ impl AudioToolWindow {
                 });
                 return;
             }
-            AudioToolKind::AudioRepair if self.repair_module == AudioRepairModule::DeHum => {
+            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::DeHum => {
                 let params = self.dehum;
                 self.apply_offline_pcm(cx, move |samples, _channels, sr| {
                     let mut processor = DehumProcessor::new(sr, params);
@@ -710,7 +824,7 @@ impl AudioToolWindow {
                 });
                 return;
             }
-            AudioToolKind::AudioRepair if self.repair_module == AudioRepairModule::Denoise => {
+            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::Denoise => {
                 if let Some(profile) = self.learned_noise.clone() {
                     let params = self.denoise;
                     self.apply_offline_pcm(cx, move |samples, channels, sr| {
@@ -730,7 +844,7 @@ impl AudioToolWindow {
                 self.dispatch(
                     AudioToolCommand::MutateClip {
                         clip_id: clip_id.clone(),
-                        label: "De-Noise",
+                        label: "Noise Reduction",
                         mutate: Box::new(move |clip| {
                             clip.stretch.denoise_amount = amount;
                         }),
@@ -738,41 +852,21 @@ impl AudioToolWindow {
                     cx,
                 );
             }
-            AudioToolKind::AudioRepair if self.repair_module == AudioRepairModule::DeClick => {
+            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::DeClick => {
                 let params = self.declick;
                 self.apply_offline_pcm(cx, move |samples, channels, _sr| {
                     Ok(declick_interleaved(samples, channels, params).0)
                 });
                 return;
             }
+            AudioToolKind::AudioRepair
+                if self.repair.module == AudioRepairModule::SpectralRepair =>
+            {
+                self.apply_spectral_region(cx);
+                return;
+            }
             AudioToolKind::SpectralProcessor => {
-                let gain = db_to_lin(self.spectral_gain_db);
-                let sel = self.session.target.spectral_selection;
-                let (window_start, _) = self.clip_source_window(cx);
-                let window_start = window_start as i64;
-                self.apply_offline_pcm(cx, move |samples, channels, sr| {
-                    let mono = downmix_interleaved(samples, channels);
-                    let params = SpectralGainParams {
-                        start_frame: sel
-                            .map(|s| (s.start_frame - window_start).max(0))
-                            .unwrap_or(0),
-                        end_frame: sel
-                            .map(|s| (s.end_frame - window_start).max(0))
-                            .unwrap_or(i64::MAX),
-                        min_hz: sel.map(|s| s.min_hz).unwrap_or(0.0),
-                        max_hz: sel.map(|s| s.max_hz).unwrap_or(f32::MAX),
-                        gain,
-                        fade_bins: 4,
-                    };
-                    let out_mono = apply_spectral_gain(&mono, sr, params, StftSettings::default());
-                    let mut out = Vec::with_capacity(out_mono.len() * channels);
-                    for sample in out_mono {
-                        for _ in 0..channels {
-                            out.push(sample);
-                        }
-                    }
-                    Ok(out)
-                });
+                self.apply_spectral_region(cx);
                 return;
             }
             AudioToolKind::Resample => {
@@ -787,6 +881,86 @@ impl AudioToolWindow {
         self.dispatch(AudioToolCommand::ClearPreview(clip_id), cx);
         self.session.preview_enabled = false;
         self.session.dirty = false;
+    }
+
+    /// Spectral gain over the targeted time-frequency region. Shared by the
+    /// standalone Spectral Processing tool and the repair surface's Spectral
+    /// Repair module so both commit identical audio.
+    fn apply_spectral_region(&mut self, cx: &mut Context<Self>) {
+        let gain = db_to_lin(self.spectral_gain_db);
+        let Some(sel) = self.spectral_region() else {
+            self.status = "Select a time-frequency region first".to_string();
+            return;
+        };
+        let (window_start, _) = self.clip_source_window(cx);
+        let window_start = window_start as i64;
+        self.apply_offline_pcm(cx, move |samples, channels, sr| {
+            let mono = downmix_interleaved(samples, channels);
+            let params = SpectralGainParams {
+                start_frame: (sel.start_frame - window_start).max(0),
+                end_frame: (sel.end_frame - window_start).max(0),
+                min_hz: sel.min_hz,
+                max_hz: sel.max_hz,
+                gain,
+                fade_bins: 4,
+            };
+            let out_mono = apply_spectral_gain(&mono, sr, params, StftSettings::default());
+            let mut out = Vec::with_capacity(out_mono.len() * channels);
+            for sample in out_mono {
+                for _ in 0..channels {
+                    out.push(sample);
+                }
+            }
+            Ok(out)
+        });
+    }
+
+    /// The time-frequency region a spectral commit writes into. The repair
+    /// surface prefers its own canvas region so the drawn box is what gets
+    /// processed.
+    fn spectral_region(&self) -> Option<SpectralSelection> {
+        if self.session.tool_kind == AudioToolKind::AudioRepair {
+            if let Some(region) = self.repair.region {
+                return Some(SpectralSelection {
+                    start_frame: region.start_frame,
+                    end_frame: region.end_frame,
+                    min_hz: region.min_hz,
+                    max_hz: region.max_hz,
+                });
+            }
+        }
+        self.session.target.spectral_selection
+    }
+
+    /// The time range a commit writes into.
+    ///
+    /// On the repair surface a canvas drag defines the range, so what the user
+    /// framed on screen is exactly what gets processed. Everything else keeps
+    /// using the host's time selection.
+    fn processing_range(&self) -> Option<AudioRangeSelection> {
+        if self.session.tool_kind == AudioToolKind::AudioRepair {
+            if let Some(region) = self.repair.region {
+                return Some(AudioRangeSelection {
+                    start_frame: region.start_frame,
+                    end_frame: region.end_frame,
+                });
+            }
+        }
+        self.session.target.time_selection
+    }
+
+    /// Whether the active processor reframes the whole clip rather than
+    /// replacing a range inside it.
+    fn processes_whole_clip(&self) -> bool {
+        match self.session.tool_kind {
+            AudioToolKind::TimePitch
+            | AudioToolKind::Resample
+            | AudioToolKind::SpectralProcessor => true,
+            // Spectral gain addresses absolute frames itself, so handing it a
+            // pre-sliced region would shift its own window.
+            AudioToolKind::AudioRepair => self.repair.module == AudioRepairModule::SpectralRepair,
+            _ => false,
+        }
     }
 
     fn clip_source_window(&self, cx: &App) -> (u64, u64) {
@@ -813,8 +987,9 @@ impl AudioToolWindow {
     ) {
         let clip_id = self.session.target.clip_id.clone();
         let path = self.session.target.source_path.clone();
-        let selection = self.session.target.time_selection;
+        let selection = self.processing_range();
         let tool_kind = self.session.tool_kind;
+        let process_whole_clip = self.processes_whole_clip();
         let (source_start, source_end) = self.clip_source_window(cx);
         let target_rate = if tool_kind == AudioToolKind::Resample {
             self.resample_target
@@ -851,12 +1026,6 @@ impl AudioToolWindow {
                     if clip_samples.is_empty() {
                         return Err("clip source window is empty".to_string());
                     }
-                    let process_whole_clip = matches!(
-                        tool_kind,
-                        AudioToolKind::TimePitch
-                            | AudioToolKind::Resample
-                            | AudioToolKind::SpectralProcessor
-                    );
                     if process_whole_clip {
                         clip_samples = process(&clip_samples, channels, buffer.sample_rate)?;
                     } else if let Some(sel) = selection {
@@ -1003,6 +1172,18 @@ impl Render for AudioToolWindow {
         } else {
             "A"
         };
+        // The repair surface is a workspace, not a dialog: it auditions
+        // continuously and commits, where the single-purpose tools preview and
+        // apply. Same controls, vocabulary matched to the interaction.
+        let repair = kind == AudioToolKind::AudioRepair;
+        let (audition_label, discard_label, commit_label) = if repair {
+            ("Audition", "Discard", "Commit")
+        } else {
+            ("Preview", "Cancel", "Apply")
+        };
+        // Offline-only repair modules have no realtime path in the engine, so
+        // the latch stays disabled rather than implying playback changed.
+        let audition_available = !repair || self.repair_audition_enabled();
         div()
             .size_full()
             .flex()
@@ -1045,9 +1226,6 @@ impl Render for AudioToolWindow {
                     }),
                 ),
             ))
-            .when(kind == AudioToolKind::AudioRepair, |this| {
-                this.child(self.repair_nav(cx))
-            })
             .child(
                 div()
                     .flex_1()
@@ -1069,9 +1247,9 @@ impl Render for AudioToolWindow {
                     .when(!analysis, |row| {
                         row.child(workspace::latch(
                             "preview",
-                            "Preview",
+                            audition_label,
                             self.session.preview_enabled,
-                            true,
+                            audition_available,
                             cx.listener(|this, _, _, cx| {
                                 this.session.preview_enabled = !this.session.preview_enabled;
                                 this.emit_preview(cx);
@@ -1082,7 +1260,7 @@ impl Render for AudioToolWindow {
                             "bypass",
                             "Bypass",
                             self.session.preview_bypassed,
-                            self.session.preview_enabled,
+                            self.session.preview_enabled && audition_available,
                             cx.listener(|this, _, _, cx| {
                                 this.session.preview_bypassed = !this.session.preview_bypassed;
                                 this.emit_preview(cx);
@@ -1100,11 +1278,14 @@ impl Render for AudioToolWindow {
                             }),
                         ))
                     })
+                    .when(repair && self.session.preview_enabled, |row| {
+                        row.child(self.audition_meter())
+                    })
                     .child(div().flex_1())
                     .when(!analysis, |row| {
                         row.child(workspace::ghost_action(
                             "cancel",
-                            "Cancel",
+                            discard_label,
                             true,
                             cx.listener(|this, _, window, cx| {
                                 this.cancel(cx);
@@ -1118,7 +1299,7 @@ impl Render for AudioToolWindow {
                         ))
                         .child(workspace::apply_action(
                             "apply",
-                            "Apply",
+                            commit_label,
                             true,
                             cx.listener(|this, _, _, cx| {
                                 this.apply(cx);
@@ -1144,7 +1325,7 @@ impl AudioToolWindow {
             AudioToolKind::DcOffset => self.dc_body(cx).into_any_element(),
             AudioToolKind::BpmAnalysis => self.bpm_body(cx).into_any_element(),
             AudioToolKind::KeyAnalysis => self.key_body(cx).into_any_element(),
-            AudioToolKind::AudioRepair => self.repair_body(cx).into_any_element(),
+            AudioToolKind::AudioRepair => self.repair_surface(cx).into_any_element(),
             AudioToolKind::SpectralProcessor => self.spectral_body(cx).into_any_element(),
             AudioToolKind::SpectrogramSettings => {
                 self.spectrogram_settings_body(cx).into_any_element()
@@ -1152,31 +1333,15 @@ impl AudioToolWindow {
         }
     }
 
-    fn repair_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = AVAILABLE_REPAIR.len();
-        workspace::nav_strip(
-            workspace::segment_track().children(AVAILABLE_REPAIR.into_iter().enumerate().map(
-                |(index, module)| {
-                    workspace::compact_segment(
-                        format!("repair-nav-{}", module.label()),
-                        module.label(),
-                        self.repair_module == module,
-                        workspace::segment_position(index, count),
-                        cx.listener(move |this, _, _, cx| {
-                            this.repair_module = module;
-                            this.emit_preview(cx);
-                            cx.notify();
-                        }),
-                    )
-                },
-            )),
-        )
-    }
-
     fn spectrum_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.spectrum.as_ref();
         let mag = snap.map(|s| s.magnitudes_db.as_slice()).unwrap_or(&[]);
-        let hold = snap.map(|s| s.peak_hold_db.as_slice()).unwrap_or(&[]);
+        let hold = if self.peak_hold || self.graph_style == GraphStyle::Overlay {
+            snap.map(|s| s.peak_hold_db.as_slice()).unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let avg = self.spectrum_avg.as_deref().unwrap_or(&[]);
         let sr = snap
             .map(|s| s.sample_rate)
             .unwrap_or(self.session.target.sample_rate);
@@ -1201,7 +1366,13 @@ impl AudioToolWindow {
             stack
         };
         workspace::stage(
-            workspace::viz_frame(viz::spectrum_view(mag, hold, sr), overlay),
+            workspace::viz_frame(
+                self.tracked_plot(
+                    viz::spectrum_view(mag, avg, hold, sr, self.graph_draw()),
+                    cx,
+                ),
+                overlay,
+            ),
             workspace::control_strip(
                 div()
                     .flex()
@@ -1225,7 +1396,8 @@ impl AudioToolWindow {
                                     cx.notify();
                                 }),
                             )),
-                    ),
+                    )
+                    .child(self.graph_draw_tracks(cx)),
             ),
         )
     }
@@ -1297,8 +1469,9 @@ impl AudioToolWindow {
     fn smooth_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let options = [
             (SpectrumSmoothing::None, "Off"),
-            (SpectrumSmoothing::SixthOctave, "1/6"),
             (SpectrumSmoothing::TwelfthOctave, "1/12"),
+            (SpectrumSmoothing::SixthOctave, "1/6"),
+            (SpectrumSmoothing::ThirdOctave, "1/3"),
         ];
         let count = options.len();
         workspace::segment_track().children(options.into_iter().enumerate().map(
@@ -1310,6 +1483,50 @@ impl AudioToolWindow {
                     workspace::segment_position(index, count),
                     cx.listener(move |this, _, _, cx| {
                         this.smoothing = value;
+                        cx.notify();
+                    }),
+                )
+            },
+        ))
+    }
+
+    fn graph_draw_tracks(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .gap(px(space::TIGHT))
+            .child(self.display_smooth_track(cx))
+            .child(self.graph_style_track(cx))
+    }
+
+    fn display_smooth_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = DisplaySmoothing::ALL.len();
+        workspace::segment_track().children(DisplaySmoothing::ALL.into_iter().enumerate().map(
+            |(index, value)| {
+                workspace::compact_segment(
+                    format!("ds-{}", value.label()),
+                    value.label(),
+                    self.display_smoothing == value,
+                    workspace::segment_position(index, count),
+                    cx.listener(move |this, _, _, cx| {
+                        this.display_smoothing = value;
+                        cx.notify();
+                    }),
+                )
+            },
+        ))
+    }
+
+    fn graph_style_track(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = GraphStyle::ALL.len();
+        workspace::segment_track().children(GraphStyle::ALL.into_iter().enumerate().map(
+            |(index, value)| {
+                workspace::compact_segment(
+                    format!("gs-{}", value.label()),
+                    value.label(),
+                    self.graph_style == value,
+                    workspace::segment_position(index, count),
+                    cx.listener(move |this, _, _, cx| {
+                        this.graph_style = value;
                         cx.notify();
                     }),
                 )
@@ -1491,7 +1708,7 @@ impl AudioToolWindow {
         let count = foci.len();
         workspace::stage(
             workspace::viz_frame(
-                viz::envelope_markers_view(&self.envelope, &markers),
+                viz::envelope_markers_view(&self.envelope, &markers, None),
                 overlay,
             ),
             workspace::control_strip(
@@ -1764,7 +1981,13 @@ impl AudioToolWindow {
         let rates = [44_100u32, 48_000, 88_200, 96_000, 176_400, 192_000];
         let count = rates.len();
         workspace::stage(
-            workspace::viz_frame(viz::resample_view(current, target, mag), overlay),
+            workspace::viz_frame(
+                self.tracked_plot(
+                    viz::resample_view(current, target, mag, self.graph_draw()),
+                    cx,
+                ),
+                overlay,
+            ),
             workspace::control_strip(workspace::segment_track().children(
                 rates.into_iter().enumerate().map(|(index, rate)| {
                     workspace::compact_segment(
@@ -2018,259 +2241,6 @@ impl AudioToolWindow {
         )
     }
 
-    fn repair_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.repair_module {
-            AudioRepairModule::Denoise => self.denoise_body(cx).into_any_element(),
-            AudioRepairModule::DeClick => self.declick_body(cx).into_any_element(),
-            AudioRepairModule::DeHum => self.dehum_body(cx).into_any_element(),
-            AudioRepairModule::SpectralRepair => self.spectral_body(cx).into_any_element(),
-            _ => workspace::stage(
-                workspace::viz_frame(
-                    viz::spectrum_view(&[], &[], self.session.target.sample_rate),
-                    workspace::overlay_line("This module is not available yet."),
-                ),
-                workspace::control_strip(div()),
-            )
-            .into_any_element(),
-        }
-    }
-
-    fn denoise_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mag = self
-            .spectrum
-            .as_ref()
-            .map(|s| s.magnitudes_db.as_slice())
-            .unwrap_or(&[]);
-        let profile = self.learned_noise.as_deref().unwrap_or(&[]);
-        let sr = self
-            .spectrum
-            .as_ref()
-            .map(|s| s.sample_rate)
-            .unwrap_or(self.session.target.sample_rate);
-        let overlay = workspace::overlay_stack()
-            .child(workspace::overlay_line(format!(
-                "Reduction {:.1} dB",
-                self.denoise.reduction_db
-            )))
-            .child(workspace::overlay_line(if self.learned_noise.is_some() {
-                "Noise profile learned"
-            } else {
-                "Learn a profile from the selection"
-            }));
-        workspace::stage(
-            workspace::viz_frame(
-                viz::noise_profile_view(mag, profile, sr, self.denoise.reduction_db),
-                overlay,
-            ),
-            workspace::control_strip(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::TIGHT))
-                    .child(workspace::param_row(
-                        "Reduction",
-                        workspace::unipolar_slider(
-                            "dn-red",
-                            self.denoise.reduction_db,
-                            0.0,
-                            24.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.denoise.reduction_db = value;
-                                this.emit_preview(cx);
-                                cx.notify();
-                            }),
-                            Some(12.0),
-                        ),
-                        format!("{:.1} dB", self.denoise.reduction_db),
-                    ))
-                    .child(workspace::param_row(
-                        "Threshold",
-                        workspace::unipolar_slider(
-                            "dn-thr",
-                            self.denoise.threshold_db,
-                            -80.0,
-                            -12.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.denoise.threshold_db = value;
-                                this.emit_preview(cx);
-                                cx.notify();
-                            }),
-                            Some(-48.0),
-                        ),
-                        format!("{:.0} dB", self.denoise.threshold_db),
-                    ))
-                    .child(inspector_mini_button(
-                        "dn-learn",
-                        "Learn Noise Profile",
-                        true,
-                        cx.listener(|this, _, _, cx| this.spawn_learn_noise(cx)),
-                    )),
-            ),
-        )
-    }
-
-    fn declick_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let markers: Vec<(f32, f32)> = {
-            let env = &self.envelope;
-            if env.len() < 3 {
-                Vec::new()
-            } else {
-                let mean = env.iter().sum::<f32>() / env.len() as f32;
-                let thresh = mean * (2.5 - self.declick.sensitivity).max(0.4);
-                env.iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        if *v > thresh {
-                            Some((
-                                i as f32 / env.len() as f32,
-                                (*v / (thresh + 1.0e-6)).min(1.0),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            }
-        };
-        let overlay = workspace::overlay_stack()
-            .child(workspace::overlay_line(format!(
-                "{} candidate clicks",
-                markers.len()
-            )))
-            .child(workspace::overlay_line(format!(
-                "Sens {:.0}%  Width {}",
-                self.declick.sensitivity * 100.0,
-                self.declick.max_click_width
-            )));
-        workspace::stage(
-            workspace::viz_frame(
-                viz::envelope_markers_view(&self.envelope, &markers),
-                overlay,
-            ),
-            workspace::control_strip(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::TIGHT))
-                    .child(workspace::param_row(
-                        "Sensitivity",
-                        workspace::unipolar_slider(
-                            "dc-sens",
-                            self.declick.sensitivity,
-                            0.05,
-                            1.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.declick.sensitivity = value;
-                                cx.notify();
-                            }),
-                            Some(0.65),
-                        ),
-                        format!("{:.0}%", self.declick.sensitivity * 100.0),
-                    ))
-                    .child(workspace::param_row(
-                        "Width",
-                        workspace::unipolar_slider(
-                            "dc-width",
-                            self.declick.max_click_width as f32,
-                            2.0,
-                            64.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.declick.max_click_width = value.round() as usize;
-                                cx.notify();
-                            }),
-                            Some(12.0),
-                        ),
-                        format!("{} smp", self.declick.max_click_width),
-                    )),
-            ),
-        )
-    }
-
-    fn dehum_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mag = self
-            .spectrum
-            .as_ref()
-            .map(|s| s.magnitudes_db.as_slice())
-            .unwrap_or(&[]);
-        let sr = self
-            .spectrum
-            .as_ref()
-            .map(|s| s.sample_rate)
-            .unwrap_or(self.session.target.sample_rate);
-        let overlay = workspace::overlay_stack()
-            .child(workspace::overlay_line(format!(
-                "{:.0} Hz × {} harmonics",
-                self.dehum.base_hz, self.dehum.harmonics
-            )))
-            .child(workspace::overlay_line(format!(
-                "Reduction {:.1} dB",
-                self.dehum.reduction_db
-            )));
-        workspace::stage(
-            workspace::viz_frame(
-                viz::hum_harmonics_view(mag, sr, self.dehum.base_hz, self.dehum.harmonics),
-                overlay,
-            ),
-            workspace::control_strip(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::TIGHT))
-                    .child({
-                        let options = [(50.0f32, "50 Hz"), (60.0, "60 Hz")];
-                        let count = options.len();
-                        workspace::segment_track().children(options.into_iter().enumerate().map(
-                            |(index, (hz, label))| {
-                                workspace::compact_segment(
-                                    format!("dh-{label}"),
-                                    label,
-                                    (self.dehum.base_hz - hz).abs() < 1.0,
-                                    workspace::segment_position(index, count),
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.dehum.base_hz = hz;
-                                        this.emit_preview(cx);
-                                        cx.notify();
-                                    }),
-                                )
-                            },
-                        ))
-                    })
-                    .child(workspace::param_row(
-                        "Harmonics",
-                        workspace::unipolar_slider(
-                            "dh-harm",
-                            self.dehum.harmonics as f32,
-                            1.0,
-                            10.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.dehum.harmonics = value.round().clamp(1.0, 10.0) as u8;
-                                this.emit_preview(cx);
-                                cx.notify();
-                            }),
-                            Some(4.0),
-                        ),
-                        format!("{}", self.dehum.harmonics),
-                    ))
-                    .child(workspace::param_row(
-                        "Reduction",
-                        workspace::unipolar_slider(
-                            "dh-red",
-                            self.dehum.reduction_db,
-                            0.0,
-                            48.0,
-                            bind_f32(cx, |this, value, cx| {
-                                this.dehum.reduction_db = value;
-                                this.emit_preview(cx);
-                                cx.notify();
-                            }),
-                            Some(18.0),
-                        ),
-                        format!("{:.1} dB", self.dehum.reduction_db),
-                    )),
-            ),
-        )
-    }
-
     fn spectral_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mag = self
             .spectrum
@@ -2295,7 +2265,17 @@ impl AudioToolWindow {
             )));
         workspace::stage(
             workspace::viz_frame(
-                viz::spectral_gain_view(mag, sr, min_hz, max_hz, self.spectral_gain_db),
+                self.tracked_plot(
+                    viz::spectral_gain_view(
+                        mag,
+                        sr,
+                        min_hz,
+                        max_hz,
+                        self.spectral_gain_db,
+                        self.graph_draw(),
+                    ),
+                    cx,
+                ),
                 overlay,
             ),
             workspace::control_strip(
@@ -2326,7 +2306,8 @@ impl AudioToolWindow {
                             this.spectral_gain_db = -120.0;
                             cx.notify();
                         }),
-                    )),
+                    ))
+                    .child(self.graph_draw_tracks(cx)),
             ),
         )
     }
@@ -2342,10 +2323,14 @@ impl AudioToolWindow {
             .as_ref()
             .map(|s| s.peak_hold_db.as_slice())
             .unwrap_or(&[]);
+        let avg = self.spectrum_avg.as_deref().unwrap_or(&[]);
         let sr = self.session.target.sample_rate;
         workspace::stage(
             workspace::viz_frame(
-                viz::spectrum_view(mag, hold, sr),
+                self.tracked_plot(
+                    viz::spectrum_view(mag, avg, hold, sr, self.graph_draw()),
+                    cx,
+                ),
                 workspace::overlay_line("FFT window for Spectrum Analyzer"),
             ),
             workspace::control_strip(
@@ -2354,7 +2339,8 @@ impl AudioToolWindow {
                     .flex_col()
                     .gap(px(space::TIGHT))
                     .child(self.fft_track(cx))
-                    .child(self.window_track(cx)),
+                    .child(self.window_track(cx))
+                    .child(self.graph_draw_tracks(cx)),
             ),
         )
     }

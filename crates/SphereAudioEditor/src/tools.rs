@@ -98,7 +98,10 @@ impl AudioToolKind {
             Self::DcOffset => (560.0, 360.0),
             Self::BpmAnalysis => (560.0, 400.0),
             Self::KeyAnalysis => (560.0, 400.0),
-            Self::AudioRepair => (720.0, 480.0),
+            // The repair surface is a canvas workspace, not a dialog: it needs
+            // room for the labeled module navigator, the time-frequency canvas,
+            // and the contextual inspector side by side.
+            Self::AudioRepair => (1232.0, 660.0),
             Self::SpectralProcessor => (720.0, 440.0),
             Self::SpectrogramSettings => (560.0, 360.0),
         }
@@ -184,9 +187,22 @@ pub enum AudioRepairModule {
 }
 
 impl AudioRepairModule {
+    /// Navigator order. Available modules lead; unimplemented ones stay visible
+    /// and disabled so the list does not silently change length between builds.
+    pub const ALL: [Self; 8] = [
+        Self::Denoise,
+        Self::DeClick,
+        Self::DeHum,
+        Self::SpectralRepair,
+        Self::DeReverb,
+        Self::DeBleed,
+        Self::DeFeedback,
+        Self::DrumSilencer,
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Denoise => "De-Noise",
+            Self::Denoise => "Noise Reduction",
             Self::DeClick => "De-Click",
             Self::DeHum => "De-Hum",
             Self::DeReverb => "De-Reverb",
@@ -197,11 +213,48 @@ impl AudioRepairModule {
         }
     }
 
+    /// One-word label for space-constrained chrome.
+    ///
+    /// Still a word, never an initialism: the navigator must be recognizable at
+    /// a glance rather than decoded.
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Denoise => "Noise",
+            Self::DeClick => "Click",
+            Self::DeHum => "Hum",
+            Self::DeReverb => "Reverb",
+            Self::DeBleed => "Bleed",
+            Self::DeFeedback => "Feedback",
+            Self::DrumSilencer => "Drum",
+            Self::SpectralRepair => "Spectral",
+        }
+    }
+
+    /// What the module draws on the processing canvas. Shown in the inspector
+    /// so the overlay is self-describing.
+    pub const fn canvas_hint(self) -> &'static str {
+        match self {
+            Self::Denoise => "Gated time-frequency cells are shaded on the canvas.",
+            Self::DeClick => "Detected impulses are marked at their source frame.",
+            Self::DeHum => "Notch bands track the fundamental and its harmonics.",
+            Self::SpectralRepair => "Draw a time-frequency region on the canvas to target it.",
+            Self::DeReverb | Self::DeBleed | Self::DeFeedback | Self::DrumSilencer => {
+                "No processor is connected yet."
+            }
+        }
+    }
+
     pub const fn is_available(self) -> bool {
         matches!(
             self,
             Self::Denoise | Self::DeClick | Self::DeHum | Self::SpectralRepair
         )
+    }
+
+    /// Whether the module's result depends on a time-frequency region the user
+    /// draws on the canvas.
+    pub const fn uses_spectral_selection(self) -> bool {
+        matches!(self, Self::SpectralRepair)
     }
 }
 
@@ -219,5 +272,19 @@ mod tests {
     fn unavailable_repair_modules_are_marked() {
         assert!(AudioRepairModule::Denoise.is_available());
         assert!(!AudioRepairModule::DeReverb.is_available());
+    }
+
+    #[test]
+    fn the_rail_lists_every_module_once_with_available_ones_first() {
+        let all = AudioRepairModule::ALL;
+        for module in all {
+            assert_eq!(all.iter().filter(|other| **other == module).count(), 1);
+        }
+        let first_unavailable = all
+            .iter()
+            .position(|module| !module.is_available())
+            .unwrap_or(all.len());
+        assert!(all[..first_unavailable].iter().all(|m| m.is_available()));
+        assert!(all[first_unavailable..].iter().all(|m| !m.is_available()));
     }
 }
