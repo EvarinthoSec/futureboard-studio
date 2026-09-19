@@ -11,8 +11,6 @@
 //! - `new()` — calls `restore_workspace_layout` with the loaded layout.
 //! - Shutdown path — calls `save_workspace_layout`.
 
-use gpui::Context;
-
 use crate::layout::studio_state::RightDockTab;
 use crate::workspace_layout::{
     load_or_default_workspace_layout, save_workspace_layout as persist_to_disk,
@@ -189,5 +187,35 @@ impl StudioLayout {
     pub fn load_and_restore_workspace_layout(&mut self) {
         let layout = load_or_default_workspace_layout();
         self.restore_workspace_layout(&layout);
+        // Stash the secondary window state so the deferred open can read it.
+        self.pending_secondary_window_restore = layout.secondary_windows;
+    }
+
+    /// Open any secondary windows that were visible on last shutdown.
+    ///
+    /// Called via `cx.defer` from `new()` so the entity is fully initialised.
+    pub(super) fn restore_secondary_windows_from_layout(&mut self, cx: &mut gpui::Context<Self>) {
+        use crate::components::clock_window::ClockKind;
+
+        // Clone the pending state out — we must not hold a borrow while calling open methods.
+        let pending = std::mem::take(&mut self.pending_secondary_window_restore);
+
+        // Mixer window.
+        if let Some(ref saved) = pending.mixer {
+            let owner = Some(saved.to_gpui());
+            self.open_mixer_external_window(owner, cx);
+        }
+
+        // Big clock window.
+        if let Some(ref saved) = pending.big_clock {
+            let owner = Some(saved.to_gpui());
+            self.open_clock_window(ClockKind::BigClock, owner, cx);
+        }
+
+        // Timecode window.
+        if let Some(ref saved) = pending.timecode {
+            let owner = Some(saved.to_gpui());
+            self.open_clock_window(ClockKind::Timecode, owner, cx);
+        }
     }
 }

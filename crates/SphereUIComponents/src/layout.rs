@@ -717,6 +717,10 @@ pub struct StudioLayout {
     /// immediately via [`Self::push_mixer_snapshot_to_window`] and are never
     /// throttled. See [`Self::push_mixer_meter_snapshot_throttled`].
     last_external_mixer_meter_push: std::time::Instant,
+    /// Secondary window bounds loaded from the layout file, waiting to be
+    /// opened during the first deferred tick after `new()`. Cleared immediately
+    /// after `restore_secondary_windows_from_layout` runs.
+    pending_secondary_window_restore: crate::workspace_layout::SavedSecondaryWindows,
 }
 
 impl StudioLayout {
@@ -1284,6 +1288,7 @@ impl StudioLayout {
             autosave_in_flight: false,
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
+            pending_secondary_window_restore: crate::workspace_layout::SavedSecondaryWindows::default(),
         };
 
         layout.ensure_mixer_tree_defaults_once(cx);
@@ -1303,6 +1308,15 @@ impl StudioLayout {
         let self_entity = cx.entity();
         cx.defer(move |app| {
             let _ = self_entity.update(app, |this, cx| this.spawn_audio_engine_warmup(cx));
+        });
+
+        // Restore secondary windows (mixer, clock) that were open on last shutdown.
+        // Deferred so the layout entity exists fully before we try to open windows into it.
+        let self_entity2 = cx.entity();
+        cx.defer(move |app| {
+            let _ = self_entity2.update(app, |this, cx| {
+                this.restore_secondary_windows_from_layout(cx);
+            });
         });
         layout.sync_timeline_chrome_metrics(cx);
 
