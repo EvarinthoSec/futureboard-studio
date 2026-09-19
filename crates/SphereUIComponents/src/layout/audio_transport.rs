@@ -3244,13 +3244,34 @@ impl StudioLayout {
         );
     }
 
-    /// Open the inline numeric BPM editor, seeded with the current effective
-    /// BPM at the playhead. Keys are routed by the layout's key handler while
-    /// `bpm_editing` is set, so no separate focus grab is needed.
-    pub(super) fn begin_bpm_edit(&mut self, cx: &mut Context<Self>) {
+    /// Open the inline numeric BPM editor. `point_id` targets one tempo
+    /// marker's value (opened via double-click on that marker in the Tempo
+    /// Track); `None` seeds from the current effective BPM at the playhead,
+    /// same as the transport-bar BPM display. Keys are routed by the
+    /// layout's key handler while `bpm_editing` is set, so no separate focus
+    /// grab is needed.
+    pub(super) fn begin_bpm_edit(&mut self, point_id: Option<String>, cx: &mut Context<Self>) {
         // A drag and an edit are mutually exclusive.
         self.end_bpm_drag();
-        let bpm = self.timeline.read(cx).state.effective_bpm_at_playhead();
+        let bpm = point_id
+            .as_deref()
+            .and_then(|id| {
+                self.timeline
+                    .read(cx)
+                    .state
+                    .tempo_map
+                    .points
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.bpm)
+            })
+            .unwrap_or_else(|| self.timeline.read(cx).state.effective_bpm_at_playhead());
+        if let Some(id) = point_id.as_deref() {
+            self.timeline.update(cx, |timeline, cx| {
+                timeline.state.select_tempo_point(id);
+                cx.notify();
+            });
+        }
         // The typed editor and the scrub drag both resolve through the effective
         // BPM at the playhead, so they share one value source. The session owns
         // range/format/commit policy; the draft text stays in `bpm_input.value`.
@@ -3267,6 +3288,7 @@ impl StudioLayout {
         self.tempo_edit.bpm_input.set_value(session.original_text());
         self.tempo_edit.bpm_input.select_all();
         self.tempo_edit.bpm_session = Some(session);
+        self.tempo_edit.bpm_edit_point_id = point_id;
         self.tempo_edit.bpm_editing = true;
         cx.notify();
     }
@@ -3301,8 +3323,9 @@ impl StudioLayout {
             .map(|bpm| bpm as f32);
         self.tempo_edit.bpm_editing = false;
         self.tempo_edit.bpm_session = None;
+        let explicit_point_id = self.tempo_edit.bpm_edit_point_id.take();
         if let Some(bpm) = parsed {
-            let target_point_id = {
+            let target_point_id = explicit_point_id.or_else(|| {
                 let state = &self.timeline.read(cx).state;
                 if state.tempo_has_automation() {
                     let beat = state.transport.playhead_beats as f64;
@@ -3313,7 +3336,7 @@ impl StudioLayout {
                 } else {
                     None
                 }
-            };
+            });
             let prev = self.capture_tempo_state(cx);
             self.apply_bpm_value(bpm, target_point_id.as_deref(), true, cx);
             self.record_tempo_edit("Set Tempo", prev, cx);
@@ -3328,6 +3351,7 @@ impl StudioLayout {
         }
         self.tempo_edit.bpm_editing = false;
         self.tempo_edit.bpm_session = None;
+        self.tempo_edit.bpm_edit_point_id = None;
         cx.notify();
     }
 
