@@ -25,7 +25,11 @@ impl std::error::Error for WireError {}
 
 impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.as_str(), self.message)
+        write!(f, "{}: {}", self.code.as_str(), self.message)?;
+        if !self.request_id.trim().is_empty() {
+            write!(f, " (request id {})", self.request_id)?;
+        }
+        Ok(())
     }
 }
 
