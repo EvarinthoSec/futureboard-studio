@@ -23,9 +23,9 @@ use super::StudioLayout;
 // ── Tab conversions ───────────────────────────────────────────────────────────
 
 fn bottom_tab_to_saved(
-    tab: crate::components::bottom_panel::BottomTab,
+    tab: crate::components::BottomTab,
 ) -> SavedBottomTab {
-    use crate::components::bottom_panel::BottomTab;
+    use crate::components::BottomTab;
     match tab {
         BottomTab::Mixer => SavedBottomTab::Mixer,
         BottomTab::Editor => SavedBottomTab::Editor,
@@ -35,8 +35,8 @@ fn bottom_tab_to_saved(
 
 fn bottom_tab_from_saved(
     tab: SavedBottomTab,
-) -> crate::components::bottom_panel::BottomTab {
-    use crate::components::bottom_panel::BottomTab;
+) -> crate::components::BottomTab {
+    use crate::components::BottomTab;
     match tab {
         SavedBottomTab::Mixer => BottomTab::Mixer,
         SavedBottomTab::Editor => BottomTab::Editor,
