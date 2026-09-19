@@ -15,8 +15,8 @@ use gpui::{
 use crate::audio_editor_state::AudioEditorState;
 use crate::audio_ruler::{audio_ruler, ruler_height};
 use crate::editing::{
-    AudioChannelMode, AudioEditorSnap, AudioEditorTool, AudioFadeEdge, ClipEnvelope,
-    SpectralSelection,
+    AudioChannelMode, AudioEditorSnap, AudioEditorTool, AudioFadeEdge, ClipChannelMode,
+    ClipEnvelope, DisplaySmoothing, SpectralSelection, WarpMarkerView,
 };
 use crate::spectrogram::{
     AmplitudeScale, AudioEditorViewMode, FrequencyScale, SpectrogramViewModel, frequency_position,
@@ -48,9 +48,11 @@ pub enum AudioEditorEvent {
     SetTool(AudioEditorTool),
     SetSnap(AudioEditorSnap),
     SetChannelMode(AudioChannelMode),
+    SetClipChannel(ClipChannelMode),
     SetViewMode(AudioEditorViewMode),
     SetAmplitudeScale(AmplitudeScale),
     SetFrequencyScale(FrequencyScale),
+    SetDisplaySmoothing(DisplaySmoothing),
     AdjustVerticalZoom { factor: f32 },
     ResetVerticalZoom,
     ZoomBy { factor: f32, anchor_x: Option<f32> },
@@ -80,6 +82,7 @@ pub enum AudioEditorDropdown {
     Amplitude,
     Frequency,
     Snap,
+    Smooth,
     Channel,
     FollowTempo,
     Reverse,
@@ -148,6 +151,10 @@ pub struct AudioEditorViewModel {
     pub channel_mode: AudioChannelMode,
     pub fade_in_beats: f32,
     pub fade_out_beats: f32,
+    pub warp_markers: Vec<WarpMarkerView>,
+    pub clip_channel: ClipChannelMode,
+    pub display_smoothing: DisplaySmoothing,
+    pub sample_rate: u32,
     pub selection_start_label: String,
     pub selection_end_label: String,
     pub selection_duration_label: String,
@@ -253,7 +260,9 @@ fn tool_options(active: AudioEditorTool) -> Vec<DropdownOption> {
         AudioEditorTool::Fade,
         AudioEditorTool::Marker,
         AudioEditorTool::Draw,
+        AudioEditorTool::Warp,
         AudioEditorTool::Scrub,
+        AudioEditorTool::Audition,
     ]
     .into_iter()
     .map(|tool| {
@@ -881,6 +890,41 @@ fn playhead_overlay(x: f32, view_h: f32, theme: &AudioEditorTheme) -> impl IntoE
         .bg(theme.playhead)
 }
 
+fn warp_markers_layer(
+    view_h: f32,
+    ppb: f32,
+    scroll_x: f32,
+    vm: &AudioEditorViewModel,
+) -> impl IntoElement {
+    let markers = vm
+        .warp_markers
+        .iter()
+        .map(|marker| {
+            let x = marker.rel_beat * ppb - scroll_x;
+            div()
+                .absolute()
+                .left(px(x - 0.5))
+                .top_0()
+                .w(px(1.0))
+                .h(px(view_h))
+                .bg(with_alpha(
+                    vm.theme.accent,
+                    if marker.locked { 0.95 } else { 0.7 },
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-3.0))
+                        .top(px(2.0))
+                        .w(px(7.0))
+                        .h(px(7.0))
+                        .bg(vm.theme.accent),
+                )
+        })
+        .collect::<Vec<_>>();
+    div().absolute().inset_0().children(markers)
+}
+
 fn toolbar(
     state: &AudioEditorState,
     vm: &AudioEditorViewModel,
@@ -952,6 +996,11 @@ fn toolbar(
                     vm.view_mode == AudioEditorViewMode::Spectrum,
                     AudioEditorEvent::SetViewMode(AudioEditorViewMode::Spectrum),
                 ),
+                dropdown_option(
+                    "Samples",
+                    vm.view_mode == AudioEditorViewMode::Samples,
+                    AudioEditorEvent::SetViewMode(AudioEditorViewMode::Samples),
+                ),
             ],
         ))
         .child(dropdown_button(
@@ -1019,7 +1068,32 @@ fn toolbar(
                     state.snap == AudioEditorSnap::Grid,
                     AudioEditorEvent::SetSnap(AudioEditorSnap::Grid),
                 ),
+                dropdown_option(
+                    "Zero Cross",
+                    state.snap == AudioEditorSnap::ZeroCrossing,
+                    AudioEditorEvent::SetSnap(AudioEditorSnap::ZeroCrossing),
+                ),
             ],
+        ))
+        .child(dropdown_button(
+            "audio-smooth-dropdown",
+            "Smooth",
+            vm.display_smoothing.label(),
+            state.open_dropdown == Some(AudioEditorDropdown::Smooth),
+            78.0,
+            &vm.theme,
+            callbacks,
+            AudioEditorDropdown::Smooth,
+            DisplaySmoothing::ALL
+                .into_iter()
+                .map(|mode| {
+                    dropdown_option(
+                        mode.label(),
+                        vm.display_smoothing == mode,
+                        AudioEditorEvent::SetDisplaySmoothing(mode),
+                    )
+                })
+                .collect(),
         ))
         .child(div().flex_1())
         .child(tiny_action(
@@ -1092,13 +1166,17 @@ fn inspector(
     callbacks: &AudioEditorCallbacks,
 ) -> impl IntoElement {
     div()
+        .id("audio-editor-inspector")
         .flex_none()
         .w(px(INSPECTOR_W))
+        .h_full()
+        .min_h_0()
         .px(px(10.0))
         .py(px(8.0))
         .border_r(px(1.0))
         .border_color(vm.theme.border_subtle)
         .bg(vm.theme.surface_panel)
+        .overflow_y_scroll()
         .child(
             div()
                 .pb(px(5.0))
@@ -1219,6 +1297,34 @@ fn inspector(
         )
         .child(
             div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h(px(26.0))
+                .child(inspector_label("Channel", &vm.theme))
+                .child(dropdown_button(
+                    "audio-channel-dropdown",
+                    "Mode",
+                    vm.clip_channel.label(),
+                    state.open_dropdown == Some(AudioEditorDropdown::Channel),
+                    88.0,
+                    &vm.theme,
+                    callbacks,
+                    AudioEditorDropdown::Channel,
+                    ClipChannelMode::INSPECTOR
+                        .into_iter()
+                        .map(|mode| {
+                            dropdown_option(
+                                mode.label(),
+                                vm.clip_channel == mode,
+                                AudioEditorEvent::SetClipChannel(mode),
+                            )
+                        })
+                        .collect(),
+                )),
+        )
+        .child(
+            div()
                 .pt(px(7.0))
                 .text_size(px(9.0))
                 .text_color(vm.theme.text_muted)
@@ -1328,6 +1434,18 @@ fn status_bar(vm: &AudioEditorViewModel) -> impl IntoElement {
             &vm.theme,
         ))
         .child(status_item("Peak", vm.peak_label.clone(), &vm.theme))
+        .children(
+            (!vm.warp_markers.is_empty())
+                .then(|| status_item("Warp", format!("{}", vm.warp_markers.len()), &vm.theme)),
+        )
+        .children({
+            let first = vm.waveform.samples.first().map(|s| s.frame);
+            let last = vm.waveform.samples.last().map(|s| s.frame);
+            match (first, last) {
+                (Some(a), Some(b)) => Some(status_item("Samples", format!("{a}–{b}"), &vm.theme)),
+                _ => None,
+            }
+        })
         .child(div().flex_1())
         .child(status_item("Source", vm.source_summary.clone(), &vm.theme))
 }
@@ -1460,28 +1578,31 @@ fn visualization_ruler(
     vm: &AudioEditorViewModel,
     mode: AudioEditorViewMode,
 ) -> impl IntoElement {
-    let labels: Vec<(f32, String)> =
-        if matches!(mode, AudioEditorViewMode::Spectrogram) || vm.spectral_selection.is_some() {
-            [0.0_f32, 0.25, 0.5, 0.75, 1.0]
-                .into_iter()
-                .map(|position| {
-                    let hz = vm.spectrogram.max_frequency_hz * (1.0 - position);
-                    (
-                        position,
-                        if hz >= 1000.0 {
-                            format!("{:.1}k", hz / 1000.0)
-                        } else {
-                            format!("{hz:.0}")
-                        },
-                    )
-                })
-                .collect()
-        } else {
-            [(0.0, "+1.0"), (0.5, "0"), (1.0, "−1.0")]
-                .into_iter()
-                .map(|(position, label)| (position, label.to_string()))
-                .collect()
-        };
+    let labels: Vec<(f32, String)> = if matches!(
+        mode,
+        AudioEditorViewMode::Spectrogram | AudioEditorViewMode::WaveformOverlay
+    ) || vm.spectral_selection.is_some()
+    {
+        [0.0_f32, 0.25, 0.5, 0.75, 1.0]
+            .into_iter()
+            .map(|position| {
+                let hz = vm.spectrogram.max_frequency_hz * (1.0 - position);
+                (
+                    position,
+                    if hz >= 1000.0 {
+                        format!("{:.1}k", hz / 1000.0)
+                    } else {
+                        format!("{hz:.0}")
+                    },
+                )
+            })
+            .collect()
+    } else {
+        [(0.0, "+1.0"), (0.5, "0"), (1.0, "−1.0")]
+            .into_iter()
+            .map(|(position, label)| (position, label.to_string()))
+            .collect()
+    };
     let labels = labels
         .into_iter()
         .map(|(position, label)| {
@@ -1536,12 +1657,14 @@ pub fn audio_editor_panel(
         vm.track_color,
         state.amplitude_scale,
         state.viewport.vertical_zoom,
+        vm.display_smoothing,
     );
     let selection = vm
         .selection_range
         .map(|(a, b)| selection_overlay(a * ppb - scroll_x, b * ppb - scroll_x, view_h, &vm.theme));
     let spectral_selection = spectral_selection_overlay(view_h, viewport_width, ppb, scroll_x, vm);
     let gain_envelope = gain_envelope_layer(view_h, ppb, scroll_x, vm);
+    let warp_markers = warp_markers_layer(view_h, ppb, scroll_x, vm);
     let playhead = vm
         .playhead_in_clip
         .map(|rel| playhead_overlay(rel * ppb - scroll_x, view_h, &vm.theme));
@@ -1674,25 +1797,16 @@ pub fn audio_editor_panel(
                 .relative()
                 .w(px(viewport_width))
                 .h(px(view_h))
-                .when(
-                    matches!(
-                        vm.view_mode,
-                        AudioEditorViewMode::Spectrogram | AudioEditorViewMode::WaveformOverlay
-                    ),
-                    |this| this.child(spectrogram),
-                )
+                .when(vm.view_mode.shows_spectrogram(), |this| {
+                    this.child(spectrogram)
+                })
                 .when(vm.view_mode == AudioEditorViewMode::Spectrum, |this| {
                     this.child(spectrum)
                 })
                 .children(grid)
-                .when(
-                    matches!(
-                        vm.view_mode,
-                        AudioEditorViewMode::Waveform | AudioEditorViewMode::WaveformOverlay
-                    ),
-                    |this| this.child(waveform),
-                )
+                .when(vm.view_mode.shows_waveform(), |this| this.child(waveform))
                 .child(gain_envelope)
+                .child(warp_markers)
                 .child(visualization_ruler(view_h, vm, vm.view_mode))
                 .children(fade_in)
                 .children(fade_out)

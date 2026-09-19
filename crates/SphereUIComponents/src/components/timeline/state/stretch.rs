@@ -946,7 +946,8 @@ pub struct AudioClipStretchState {
 
     pub dirty: bool,
 
-    /// Warp markers (spec §2 Warp). Stored and rendered; warp DSP pending.
+    /// Warp markers (spec §2 Warp). Stored, rendered, and mapped into
+    /// per-segment playback stretch by the engine.
     pub warp_markers: Vec<WarpMarker>,
 
     /// Non-destructive clip gain envelope. The source file is never rewritten;

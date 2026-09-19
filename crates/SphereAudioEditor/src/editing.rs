@@ -19,8 +19,10 @@ pub enum AudioEditorTool {
     /// Non-destructive gain envelope.
     Draw,
     Scrub,
-    /// Warp marker editing. Hidden until the warp DSP path is wired.
+    /// Warp marker editing. Playback uses the per-segment source map.
     Warp,
+    /// Preview from the pointer or the current selection.
+    Audition,
 }
 
 impl AudioEditorTool {
@@ -33,14 +35,15 @@ impl AudioEditorTool {
             Self::Trim => "Trim",
             Self::Fade => "Fade",
             Self::Marker => "Marker",
-            Self::Draw => "Gain Envelope",
+            Self::Draw => "Envelope",
             Self::Scrub => "Scrub",
             Self::Warp => "Warp",
+            Self::Audition => "Audition",
         }
     }
 
     pub const fn is_available(self) -> bool {
-        !matches!(self, Self::Warp)
+        true
     }
 }
 
@@ -68,8 +71,157 @@ impl AudioEditorSnap {
     }
 
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::Off | Self::Grid)
+        matches!(self, Self::Off | Self::Grid | Self::ZeroCrossing)
     }
+}
+
+/// Display-only waveform smoothing. Never mutates DSP or cache data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplaySmoothing {
+    Off,
+    #[default]
+    Light,
+    Medium,
+    Heavy,
+}
+
+impl DisplaySmoothing {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Light, Self::Medium, Self::Heavy];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Light => "Light",
+            Self::Medium => "Medium",
+            Self::Heavy => "Heavy",
+        }
+    }
+
+    /// Odd tap count for a centered box filter. `0` means pass-through.
+    pub const fn taps(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Light => 3,
+            Self::Medium => 5,
+            Self::Heavy => 7,
+        }
+    }
+}
+
+/// Clip-level channel transform tags. Must stay aligned with
+/// `SphereAudioProcessor::ChannelTransform::to_tag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipChannelMode {
+    #[default]
+    Stereo,
+    Left,
+    Right,
+    MonoSum,
+    Swap,
+    InvertL,
+    InvertR,
+    InvertBoth,
+    Mid,
+    Side,
+}
+
+impl ClipChannelMode {
+    pub const INSPECTOR: [Self; 6] = [
+        Self::Stereo,
+        Self::Left,
+        Self::Right,
+        Self::MonoSum,
+        Self::Swap,
+        Self::InvertBoth,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::MonoSum => "Mono Sum",
+            Self::Swap => "Swap L/R",
+            Self::InvertL => "Invert L",
+            Self::InvertR => "Invert R",
+            Self::InvertBoth => "Invert Both",
+            Self::Mid => "Mid",
+            Self::Side => "Side",
+        }
+    }
+
+    pub const fn to_tag(self) -> u8 {
+        match self {
+            Self::Stereo => 0,
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::MonoSum => 3,
+            Self::Swap => 4,
+            Self::InvertL => 5,
+            Self::InvertR => 6,
+            Self::InvertBoth => 7,
+            Self::Mid => 8,
+            Self::Side => 9,
+        }
+    }
+
+    pub const fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => Self::Left,
+            2 => Self::Right,
+            3 => Self::MonoSum,
+            4 => Self::Swap,
+            5 => Self::InvertL,
+            6 => Self::InvertR,
+            7 => Self::InvertBoth,
+            8 => Self::Mid,
+            9 => Self::Side,
+            _ => Self::Stereo,
+        }
+    }
+}
+
+/// Canvas-side warp marker. `rel_beat` is clip-relative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WarpMarkerView {
+    pub id: u64,
+    pub rel_beat: f32,
+    pub source_sample: u64,
+    pub locked: bool,
+}
+
+/// Search a limited radius of mono PCM for the nearest sign change.
+///
+/// `origin` is an index into `samples`. The scan never walks the whole buffer,
+/// so pointer motion stays cheap at any file length.
+pub fn nearest_zero_crossing(samples: &[f32], origin: usize, radius: usize) -> Option<usize> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let origin = origin.min(samples.len() - 1);
+    let radius = radius.max(1);
+    let start = origin.saturating_sub(radius);
+    let end = (origin + radius).min(samples.len() - 1);
+    let mut best_index = None;
+    let mut best_dist = usize::MAX;
+    for i in start..end {
+        let a = samples[i];
+        let b = samples[i + 1];
+        if !a.is_finite() || !b.is_finite() {
+            continue;
+        }
+        let crossed = a == 0.0 || (a > 0.0) != (b > 0.0);
+        if !crossed {
+            continue;
+        }
+        let idx = if a.abs() <= b.abs() { i } else { i + 1 };
+        let dist = idx.abs_diff(origin);
+        if dist < best_dist {
+            best_dist = dist;
+            best_index = Some(idx);
+        }
+    }
+    best_index
 }
 
 /// How channel data is presented.  The renderer may add arbitrary channel
@@ -378,8 +530,22 @@ mod tests {
     #[test]
     fn tool_and_snap_labels_are_stable() {
         assert_eq!(AudioEditorTool::Pointer.label(), "Pointer");
+        assert_eq!(AudioEditorTool::Draw.label(), "Envelope");
+        assert_eq!(AudioEditorTool::Warp.label(), "Warp");
         assert_eq!(AudioEditorSnap::ZeroCrossing.label(), "Zero Cross");
         assert_eq!(AudioFadeCurve::EqualPower.label(), "Equal Power");
+        assert!(AudioEditorSnap::ZeroCrossing.is_available());
+        assert!(AudioEditorTool::Warp.is_available());
+        assert_eq!(ClipChannelMode::from_tag(3), ClipChannelMode::MonoSum);
+        assert_eq!(ClipChannelMode::Swap.to_tag(), 4);
+    }
+
+    #[test]
+    fn zero_crossing_picks_the_nearest_sign_change() {
+        let samples = [0.2, 0.4, 0.1, -0.2, -0.5, 0.3];
+        assert_eq!(nearest_zero_crossing(&samples, 1, 8), Some(2));
+        assert_eq!(nearest_zero_crossing(&samples, 5, 8), Some(5));
+        assert_eq!(nearest_zero_crossing(&[0.1, 0.2, 0.3], 1, 8), None);
     }
 
     #[test]

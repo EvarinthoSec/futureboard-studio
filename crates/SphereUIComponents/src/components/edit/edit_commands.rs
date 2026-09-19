@@ -464,8 +464,7 @@ impl EditCommand {
                 state.delete_clip(&snapshot.clip.id);
             }
             EditCommand::UpdateClip { previous, next } => {
-                state.delete_clip(&previous.clip.id);
-                restore_clip_snapshot(state, next);
+                replace_clip_snapshot(state, &previous.clip.id, next);
             }
             EditCommand::BatchDeleteClips { snapshots } => {
                 for snap in snapshots {
@@ -633,8 +632,7 @@ impl EditCommand {
                 restore_clip_snapshot(state, snapshot);
             }
             EditCommand::UpdateClip { previous, next } => {
-                state.delete_clip(&next.clip.id);
-                restore_clip_snapshot(state, previous);
+                replace_clip_snapshot(state, &next.clip.id, previous);
             }
             EditCommand::BatchDeleteClips { snapshots } => {
                 for snap in snapshots {
@@ -806,6 +804,22 @@ fn restore_clip_snapshot(state: &mut TimelineState, snapshot: &ClipSnapshot) {
     }
 }
 
+/// Replace a clip snapshot without making an already-selected Audio Editor
+/// target disappear from selection. `TimelineState::delete_clip` quite
+/// correctly clears selection for a real deletion, but UpdateClip is an
+/// in-place property/gesture edit and undoing it must leave the same clip
+/// active so the editor can keep showing the restored Project State.
+fn replace_clip_snapshot(state: &mut TimelineState, clip_id: &str, snapshot: &ClipSnapshot) {
+    let selected_clip_ids = state.selection.selected_clip_ids.clone();
+    let was_selected = selected_clip_ids.iter().any(|id| id == clip_id);
+    state.delete_clip(clip_id);
+    restore_clip_snapshot(state, snapshot);
+    if was_selected {
+        state.selection.selected_clip_ids = selected_clip_ids;
+        state.selection.selected_track_id = Some(snapshot.track_id.clone());
+    }
+}
+
 #[cfg(test)]
 mod mixer_control_impact_tests {
     use super::*;
@@ -949,6 +963,76 @@ mod song_text_command_tests {
 #[cfg(test)]
 mod inspector_gesture_command_tests {
     use super::*;
+    use crate::components::timeline::timeline_state::{AudioImportState, ClipType};
+
+    fn selected_audio_state() -> (TimelineState, String, ClipState) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track_id = state.create_audio_track();
+        let clip = ClipState {
+            id: "audio-editor-clip".to_string(),
+            name: "clip.wav".to_string(),
+            start_beat: 0.0,
+            duration_beats: 4.0,
+            source_duration_seconds: Some(2.0),
+            offset_beats: 0.0,
+            gain: 1.0,
+            clip_type: ClipType::Audio {
+                file_id: "asset-1".to_string(),
+                source_path: Some("/tmp/clip.wav".to_string()),
+            },
+            muted: false,
+            audio_import: AudioImportState::Ready,
+            stretch: AudioClipStretchState::default(),
+        };
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .expect("audio track")
+            .clips
+            .push(clip.clone());
+        state.selection.selected_track_id = Some(track_id.clone());
+        state.selection.selected_clip_ids = vec![clip.id.clone()];
+        (state, track_id, clip)
+    }
+
+    #[test]
+    fn update_clip_undo_redo_keeps_the_audio_editor_target_selected() {
+        let (mut state, track_id, previous_clip) = selected_audio_state();
+        let mut next_clip = previous_clip.clone();
+        next_clip.gain = 2.0;
+        let command = EditCommand::UpdateClip {
+            previous: ClipSnapshot {
+                track_id: track_id.clone(),
+                clip: previous_clip.clone(),
+            },
+            next: ClipSnapshot {
+                track_id,
+                clip: next_clip,
+            },
+        };
+        let mut history = EditHistory::new(8);
+
+        command.execute(&mut state);
+        history.push(command);
+        assert_eq!(
+            state.selection.selected_clip_ids,
+            vec![previous_clip.id.clone()]
+        );
+        assert_eq!(state.find_clip(&previous_clip.id).unwrap().1.gain, 2.0);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(
+            state.selection.selected_clip_ids,
+            vec![previous_clip.id.clone()]
+        );
+        assert_eq!(state.find_clip(&previous_clip.id).unwrap().1.gain, 1.0);
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.selection.selected_clip_ids, vec![previous_clip.id]);
+        assert_eq!(state.find_clip("audio-editor-clip").unwrap().1.gain, 2.0);
+    }
 
     #[test]
     fn pan_preview_commits_as_one_undoable_command() {

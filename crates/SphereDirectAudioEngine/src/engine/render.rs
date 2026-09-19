@@ -107,28 +107,44 @@ pub fn render_project_sample(
             continue;
         }
 
-        let source_pos_seconds = clip_source_pos_seconds(
-            clip_offset_seconds,
-            rel,
-            clip_duration_samples,
-            runtime.sample_rate,
-            if matches!(processor, ClipDspProcessor::PhaseVocoderBasic) {
-                1.0 / effective_time_ratio.max(0.01)
+        let (source_pos, dry_source_pos, processor) = {
+            let clip = &runtime.clips[clip_index];
+            let warped = !clip.warp_segments.is_empty();
+            let source_pos = resolved_clip_source_frame(
+                rel,
+                clip_duration_samples,
+                clip_offset_seconds,
+                runtime.sample_rate,
+                source.sample_rate() as f64,
+                if matches!(processor, ClipDspProcessor::PhaseVocoderBasic) && !warped {
+                    1.0 / effective_time_ratio.max(0.01)
+                } else {
+                    clip_source_read_rate
+                },
+                clip_reverse,
+                &clip.warp_segments,
+            );
+            let dry_source_pos = if warped {
+                source_pos
             } else {
-                clip_source_read_rate
-            },
-            clip_reverse,
-        );
-        let source_pos = source_pos_seconds * source.sample_rate() as f64;
-        let dry_pos_seconds = clip_source_pos_seconds(
-            clip_offset_seconds,
-            rel,
-            clip_duration_samples,
-            runtime.sample_rate,
-            clip_source_read_rate,
-            clip_reverse,
-        );
-        let dry_source_pos = dry_pos_seconds * source.sample_rate() as f64;
+                resolved_clip_source_frame(
+                    rel,
+                    clip_duration_samples,
+                    clip_offset_seconds,
+                    runtime.sample_rate,
+                    source.sample_rate() as f64,
+                    clip_source_read_rate,
+                    clip_reverse,
+                    &clip.warp_segments,
+                )
+            };
+            let processor = if warped {
+                ClipDspProcessor::Resample
+            } else {
+                processor
+            };
+            (source_pos, dry_source_pos, processor)
+        };
         let (mut l, mut r) = sample_clip_processor_stereo(
             &source,
             source_pos,
@@ -325,6 +341,36 @@ fn sample_to_beat(runtime: &RuntimeProject, sample: u64) -> f64 {
 /// Map an in-clip output offset `rel` to a source position in **seconds**,
 /// honoring the clip's resample `speed_ratio` and reverse flag.
 ///
+/// Map a clip-relative output sample to a source frame.
+///
+/// Warp segments, when present, replace the global read rate so marker
+/// positions stay monotonic and allocation-free on the audio thread.
+#[inline]
+fn resolved_clip_source_frame(
+    rel: u64,
+    duration_samples: u64,
+    offset_seconds: f64,
+    output_sample_rate: u32,
+    source_sample_rate: f64,
+    speed_ratio: f32,
+    reverse: bool,
+    warp_segments: &[crate::runtime::RuntimeWarpSegment],
+) -> f64 {
+    if let Some(frame) =
+        crate::runtime::map_warp_source_frame(rel, duration_samples, reverse, warp_segments)
+    {
+        return frame;
+    }
+    clip_source_pos_seconds(
+        offset_seconds,
+        rel,
+        duration_samples,
+        output_sample_rate,
+        speed_ratio,
+        reverse,
+    ) * source_sample_rate
+}
+
 /// Forward playback reads from `offset_seconds` and advances at `speed_ratio`
 /// source-seconds per output-second. Reverse reads the same source window from
 /// its end backward, so output sample 0 maps to the last source frame and the
@@ -1382,7 +1428,9 @@ fn render_project_block_interleaved_core(
                 let segment_render_frames = render_end.saturating_sub(render_start);
                 let project_render_start = segment_sample + render_start as u64;
                 let rel_start = project_render_start - clip_start;
+                let warped = !runtime.clips[clip_index].warp_segments.is_empty();
                 if clip_stretch_backend == StretchBackend::Signalsmith
+                    && !warped
                     && render_signalsmith_clip_segment(
                         runtime,
                         clip_index,
@@ -1400,34 +1448,49 @@ fn render_project_block_interleaved_core(
                         let frame_idx = callback_offset + frame_in_segment;
                         let project_sample = segment_sample + frame_in_segment as u64;
                         let rel = project_sample - clip_start;
-                        let source_pos_seconds = clip_source_pos_seconds(
-                            clip_offset_seconds,
+                        let warp_segments = runtime.clips[clip_index].warp_segments.as_slice();
+                        let warped = !warp_segments.is_empty();
+                        let source_pos = resolved_clip_source_frame(
                             rel,
                             clip_duration,
+                            clip_offset_seconds,
                             runtime.sample_rate,
-                            if matches!(clip_processor, ClipDspProcessor::PhaseVocoderBasic) {
+                            source.sample_rate() as f64,
+                            if matches!(clip_processor, ClipDspProcessor::PhaseVocoderBasic)
+                                && !warped
+                            {
                                 1.0 / clip_effective_time_ratio.max(0.01)
                             } else {
                                 clip_source_read_rate
                             },
                             clip_reverse,
+                            warp_segments,
                         );
-                        let source_pos = source_pos_seconds * source.sample_rate() as f64;
-                        let dry_pos_seconds = clip_source_pos_seconds(
-                            clip_offset_seconds,
-                            rel,
-                            clip_duration,
-                            runtime.sample_rate,
-                            clip_source_read_rate,
-                            clip_reverse,
-                        );
-                        let dry_source_pos = dry_pos_seconds * source.sample_rate() as f64;
+                        let dry_source_pos = if warped {
+                            source_pos
+                        } else {
+                            resolved_clip_source_frame(
+                                rel,
+                                clip_duration,
+                                clip_offset_seconds,
+                                runtime.sample_rate,
+                                source.sample_rate() as f64,
+                                clip_source_read_rate,
+                                clip_reverse,
+                                warp_segments,
+                            )
+                        };
+                        let processor = if warped {
+                            ClipDspProcessor::Resample
+                        } else {
+                            clip_processor
+                        };
                         let (mut l, mut r) = sample_clip_processor_stereo(
                             &source,
                             source_pos,
                             dry_source_pos,
                             clip_effective_time_ratio,
-                            clip_processor,
+                            processor,
                         );
                         let fade = clip_fade_gain_with_curves(
                             rel,

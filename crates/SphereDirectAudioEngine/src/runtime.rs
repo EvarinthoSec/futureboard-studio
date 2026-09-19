@@ -1627,6 +1627,9 @@ pub struct RuntimeClip {
     pub source_start_samples: u64,
     pub source_end_samples: u64,
     pub warp_markers: Vec<RuntimeWarpMarker>,
+    /// Precomputed output→source segments. Empty means the clip uses the
+    /// global `source_read_rate`. Built on the control thread.
+    pub warp_segments: Vec<RuntimeWarpSegment>,
     pub processor: ClipDspProcessor,
     /// Play the source window backwards (resolved from the snapshot's
     /// `audio_process.reverse`). The render maps output → source from the clip
@@ -1726,6 +1729,7 @@ impl Clone for RuntimeClip {
             source_start_samples: self.source_start_samples,
             source_end_samples: self.source_end_samples,
             warp_markers: self.warp_markers.clone(),
+            warp_segments: self.warp_segments.clone(),
             processor: self.processor,
             reverse: self.reverse,
             denoise: DenoiseProcessor::new(self.denoise.sample_rate(), self.denoise.amount()),
@@ -1789,6 +1793,163 @@ pub struct RuntimeWarpMarker {
     pub source_sample: u64,
     pub timeline_beat: f64,
     pub locked: bool,
+}
+
+/// One monotonic warp segment in the output-sample domain.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeWarpSegment {
+    pub out_start: u64,
+    pub out_end: u64,
+    pub src_start: f64,
+    pub src_end: f64,
+}
+
+pub(crate) fn build_warp_segments(
+    markers: &[RuntimeWarpMarker],
+    clip_start_beat: f64,
+    duration_beats: f64,
+    duration_samples: u64,
+    source_start: u64,
+    source_end: u64,
+) -> Vec<RuntimeWarpSegment> {
+    if markers.is_empty() || duration_samples == 0 || duration_beats <= 0.0 {
+        return Vec::new();
+    }
+    let source_start_f = source_start as f64;
+    let source_end_f = source_end.max(source_start + 1) as f64;
+    let beat_to_out = |beat: f64| -> u64 {
+        let t = ((beat - clip_start_beat) / duration_beats).clamp(0.0, 1.0);
+        (t * duration_samples as f64).round() as u64
+    };
+
+    let mut points: Vec<(u64, f64)> = Vec::with_capacity(markers.len() + 2);
+    points.push((0, source_start_f));
+    for marker in markers {
+        let out = beat_to_out(marker.timeline_beat);
+        let src = (marker.source_sample as f64).clamp(source_start_f, source_end_f);
+        if points
+            .last()
+            .is_some_and(|(prev_out, prev_src)| out > *prev_out && src > *prev_src)
+        {
+            points.push((out, src));
+        }
+    }
+    let end = (duration_samples, source_end_f);
+    if points
+        .last()
+        .is_some_and(|(prev_out, prev_src)| end.0 > *prev_out && end.1 > *prev_src)
+    {
+        points.push(end);
+    }
+
+    let mut segments = Vec::new();
+    for pair in points.windows(2) {
+        let (out_a, src_a) = pair[0];
+        let (out_b, src_b) = pair[1];
+        if out_b <= out_a || src_b <= src_a {
+            continue;
+        }
+        segments.push(RuntimeWarpSegment {
+            out_start: out_a,
+            out_end: out_b,
+            src_start: src_a,
+            src_end: src_b,
+        });
+    }
+    segments
+}
+
+/// Map a clip-relative output sample to a source frame through warp segments.
+/// `None` means the caller should use the clip's global read rate.
+#[inline]
+pub(crate) fn map_warp_source_frame(
+    rel: u64,
+    duration_samples: u64,
+    reverse: bool,
+    segments: &[RuntimeWarpSegment],
+) -> Option<f64> {
+    if segments.is_empty() {
+        return None;
+    }
+    let out = if reverse {
+        duration_samples.saturating_sub(1).saturating_sub(rel)
+    } else {
+        rel
+    };
+    let mut lo = 0usize;
+    let mut hi = segments.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if segments[mid].out_end <= out {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let seg = segments.get(lo).or_else(|| segments.last())?;
+    let span = seg.out_end.saturating_sub(seg.out_start).max(1) as f64;
+    let t = (out.saturating_sub(seg.out_start) as f64 / span).clamp(0.0, 1.0);
+    Some(seg.src_start + (seg.src_end - seg.src_start) * t)
+}
+
+#[cfg(test)]
+mod warp_map_tests {
+    use super::*;
+
+    #[test]
+    fn empty_markers_do_not_build_segments() {
+        assert!(build_warp_segments(&[], 0.0, 4.0, 48_000, 0, 48_000).is_empty());
+    }
+
+    #[test]
+    fn midpoint_interpolates_source_between_markers() {
+        let markers = [
+            RuntimeWarpMarker {
+                id: 1,
+                source_sample: 0,
+                timeline_beat: 0.0,
+                locked: false,
+            },
+            RuntimeWarpMarker {
+                id: 2,
+                source_sample: 1_000,
+                timeline_beat: 2.0,
+                locked: false,
+            },
+        ];
+        let segments = build_warp_segments(&markers, 0.0, 4.0, 4_000, 0, 2_000);
+        assert!(!segments.is_empty());
+        let mid = map_warp_source_frame(1_000, 4_000, false, &segments).unwrap();
+        assert!((mid - 500.0).abs() < 1.5, "mid={mid}");
+        assert!(map_warp_source_frame(0, 4_000, false, &[]).is_none());
+    }
+
+    #[test]
+    fn zero_length_and_crossing_segments_are_dropped() {
+        let markers = [
+            RuntimeWarpMarker {
+                id: 1,
+                source_sample: 800,
+                timeline_beat: 1.0,
+                locked: false,
+            },
+            RuntimeWarpMarker {
+                id: 2,
+                source_sample: 200,
+                timeline_beat: 2.0,
+                locked: false,
+            },
+        ];
+        let segments = build_warp_segments(&markers, 0.0, 4.0, 4_000, 0, 1_000);
+        for pair in segments.windows(2) {
+            assert!(pair[1].out_start >= pair[0].out_end);
+            assert!(pair[1].src_start >= pair[0].src_end);
+        }
+        for segment in &segments {
+            assert!(segment.out_end > segment.out_start);
+            assert!(segment.src_end > segment.src_start);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5796,6 +5957,20 @@ fn build_clip_runtime(
         .map(|p| p.seek_input_len(1.0 / effective_time_ratio.max(0.01)))
         .unwrap_or(0);
 
+    let warp_source_end = if source_end_samples > source_start_samples {
+        source_end_samples.min(source.frames() as u64)
+    } else {
+        source.frames() as u64
+    };
+    let warp_segments = build_warp_segments(
+        &warp_markers,
+        clip.start_beat.max(0.0),
+        clip.duration_beats.max(0.0),
+        duration_samples,
+        source_start_samples.min(source.frames() as u64),
+        warp_source_end,
+    );
+
     Some(RuntimeClip {
         id: clip.id.clone(),
         track_id: clip.track_id.clone(),
@@ -5816,6 +5991,7 @@ fn build_clip_runtime(
         source_start_samples,
         source_end_samples,
         warp_markers,
+        warp_segments,
         processor,
         reverse,
         denoise: DenoiseProcessor::new(output_sample_rate, denoise_amount),

@@ -16,14 +16,16 @@ pub enum AudioEditorViewMode {
     Spectrogram,
     WaveformOverlay,
     Spectrum,
+    Samples,
 }
 
 impl AudioEditorViewMode {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Waveform,
         Self::Spectrogram,
         Self::WaveformOverlay,
         Self::Spectrum,
+        Self::Samples,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -32,7 +34,20 @@ impl AudioEditorViewMode {
             Self::Spectrogram => "Spectrogram",
             Self::WaveformOverlay => "Waveform Overlay",
             Self::Spectrum => "Spectrum",
+            Self::Samples => "Samples",
         }
+    }
+
+    pub const fn shows_waveform(self) -> bool {
+        matches!(self, Self::Waveform | Self::WaveformOverlay | Self::Samples)
+    }
+
+    pub const fn shows_spectrogram(self) -> bool {
+        matches!(self, Self::Spectrogram | Self::WaveformOverlay)
+    }
+
+    pub const fn prefers_sample_view(self) -> bool {
+        matches!(self, Self::Samples)
     }
 }
 
@@ -122,7 +137,7 @@ impl Default for SpectrogramSettings {
             hop_size: 512, // Hann window with 75% overlap.
             tile_width: 256,
             tile_height: 128,
-            min_db: -120.0,
+            min_db: -100.0,
             max_db: 0.0,
             frequency_scale: FrequencyScale::Logarithmic,
         }

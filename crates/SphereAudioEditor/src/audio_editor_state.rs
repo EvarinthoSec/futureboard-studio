@@ -2,7 +2,8 @@
 
 use crate::{
     AmplitudeScale, AudioChannelMode, AudioEditorDrag, AudioEditorDropdown, AudioEditorSnap,
-    AudioEditorTool, AudioEditorViewMode, AudioEditorViewport, FrequencyScale, SpectralSelection,
+    AudioEditorTool, AudioEditorViewMode, AudioEditorViewport, DisplaySmoothing, FrequencyScale,
+    SpectralSelection,
 };
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct AudioEditorState {
     pub view_mode: AudioEditorViewMode,
     pub amplitude_scale: AmplitudeScale,
     pub frequency_scale: FrequencyScale,
+    pub display_smoothing: DisplaySmoothing,
     /// At most one compact dropdown can be open at a time.
     pub open_dropdown: Option<AudioEditorDropdown>,
     pub zero_crossing_snap: bool,
@@ -45,6 +47,7 @@ impl Default for AudioEditorState {
             view_mode: AudioEditorViewMode::WaveformOverlay,
             amplitude_scale: AmplitudeScale::Decibels,
             frequency_scale: FrequencyScale::Logarithmic,
+            display_smoothing: DisplaySmoothing::Light,
             open_dropdown: None,
             zero_crossing_snap: false,
             selection_range: None,

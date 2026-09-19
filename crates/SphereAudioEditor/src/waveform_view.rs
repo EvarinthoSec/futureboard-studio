@@ -1,12 +1,13 @@
-//! Waveform peak drawing — min/max columns only, no PCM buffers.
+//! Waveform peak drawing — min/max columns, plus sample-accurate points.
 
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, IntoElement, ParentElement, Pixels, Styled, Window, canvas, div, fill, point, px, size,
+    Bounds, IntoElement, ParentElement, PathBuilder, PathStyle, Pixels, StrokeOptions, Styled,
+    Window, canvas, div, fill, point, px, size,
 };
 
-use crate::{AmplitudeScale, AudioEditorTheme};
+use crate::{AmplitudeScale, AudioEditorTheme, DisplaySmoothing};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WaveformColumn {
@@ -15,9 +16,18 @@ pub struct WaveformColumn {
     pub max: f32,
 }
 
+/// One decoded source frame mapped into canvas X.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaveformSample {
+    pub x: f32,
+    pub value: f32,
+    pub frame: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct WaveformViewModel {
     pub columns: Vec<WaveformColumn>,
+    pub samples: Vec<WaveformSample>,
     pub ready: bool,
     pub status_label: String,
     pub is_error: bool,
@@ -28,6 +38,7 @@ impl WaveformViewModel {
     pub fn loading(label: impl Into<String>) -> Self {
         Self {
             columns: Vec::new(),
+            samples: Vec::new(),
             ready: false,
             status_label: label.into(),
             is_error: false,
@@ -38,11 +49,16 @@ impl WaveformViewModel {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             columns: Vec::new(),
+            samples: Vec::new(),
             ready: false,
             status_label: message.into(),
             is_error: true,
             show_progress: false,
         }
+    }
+
+    pub fn shows_samples(&self) -> bool {
+        !self.samples.is_empty()
     }
 }
 
@@ -54,8 +70,10 @@ pub fn waveform_view(
     waveform_color: gpui::Rgba,
     amplitude_scale: AmplitudeScale,
     vertical_zoom: f32,
+    smoothing: DisplaySmoothing,
 ) -> impl IntoElement {
-    let columns = Arc::new(waveform.columns.clone());
+    let columns = Arc::new(smoothed_columns(&waveform.columns, smoothing));
+    let samples = Arc::new(waveform.samples.clone());
     let mut color = waveform_color;
     color.a = 0.9;
     let fill_color = gpui::Rgba {
@@ -71,22 +89,31 @@ pub fn waveform_view(
         ..theme.border_subtle
     };
     let view_h = view_h.max(1.0);
-    let amplitude_scale = amplitude_scale;
-    let vertical_zoom = vertical_zoom;
+    let show_samples = waveform.shows_samples();
     let waveform_canvas = canvas(
         |_bounds, _window, _cx| {},
         move |bounds: Bounds<Pixels>, (), window, _cx| {
-            paint_waveform(
-                bounds,
-                columns.as_ref(),
-                fill_color,
-                edge_color,
-                amplitude_scale,
-                vertical_zoom,
-                window,
-            );
-            // A single crisp zero crossing makes low-level material readable
-            // without washing out the min/max envelope.
+            if show_samples {
+                paint_samples(
+                    bounds,
+                    samples.as_ref(),
+                    fill_color,
+                    edge_color,
+                    amplitude_scale,
+                    vertical_zoom,
+                    window,
+                );
+            } else {
+                paint_waveform(
+                    bounds,
+                    columns.as_ref(),
+                    fill_color,
+                    edge_color,
+                    amplitude_scale,
+                    vertical_zoom,
+                    window,
+                );
+            }
             let center = bounds.size.height / 2.0;
             let zero = Bounds::new(
                 bounds.origin + point(px(0.0), center - px(0.5)),
@@ -162,6 +189,37 @@ pub fn waveform_view(
         .children(status_overlay)
 }
 
+fn smoothed_columns(
+    columns: &[WaveformColumn],
+    smoothing: DisplaySmoothing,
+) -> Vec<WaveformColumn> {
+    let taps = smoothing.taps();
+    if taps < 3 || columns.len() < taps {
+        return columns.to_vec();
+    }
+    let radius = taps / 2;
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(columns.len());
+            let n = (end - start) as f32;
+            let mut min_sum = 0.0;
+            let mut max_sum = 0.0;
+            for neighbour in &columns[start..end] {
+                min_sum += neighbour.min;
+                max_sum += neighbour.max;
+            }
+            WaveformColumn {
+                x: column.x,
+                min: min_sum / n,
+                max: max_sum / n,
+            }
+        })
+        .collect()
+}
+
 fn paint_waveform(
     bounds: Bounds<Pixels>,
     columns: &[WaveformColumn],
@@ -191,10 +249,6 @@ fn paint_waveform(
             size(px(1.0), px(bar_height)),
         );
         window.paint_quad(fill(bar, fill_color));
-
-        // Cap both extrema with an opaque pixel. This keeps transient peaks
-        // sharp at 100% and above instead of letting alpha blending soften the
-        // top/bottom edge of every one-pixel column.
         let top_cap = Bounds::new(
             bounds.origin + point(px(x), px(top.round())),
             size(px(1.0), px(1.0)),
@@ -208,6 +262,59 @@ fn paint_waveform(
     }
 }
 
+fn paint_samples(
+    bounds: Bounds<Pixels>,
+    samples: &[WaveformSample],
+    fill_color: gpui::Rgba,
+    edge_color: gpui::Rgba,
+    amplitude_scale: AmplitudeScale,
+    vertical_zoom: f32,
+    window: &mut Window,
+) {
+    let height: f32 = bounds.size.height.into();
+    if height < 1.0 || samples.is_empty() {
+        return;
+    }
+    let center = height * 0.5;
+    let mut points = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let amp = amplitude_coordinate(sample.value, amplitude_scale, vertical_zoom);
+        let y = center - amp * center;
+        points.push((sample.x, y));
+    }
+
+    if points.len() >= 2 {
+        let options = StrokeOptions::default();
+        let mut line = PathBuilder::stroke(px(1.25)).with_style(PathStyle::Stroke(options));
+        line.move_to(bounds.origin + point(px(points[0].0), px(points[0].1)));
+        for &(x, y) in &points[1..] {
+            line.line_to(bounds.origin + point(px(x), px(y)));
+        }
+        if let Ok(path) = line.build() {
+            window.paint_path(path, fill_color);
+        }
+    }
+
+    for &(x, y) in &points {
+        let stem = Bounds::new(
+            bounds.origin + point(px(x.round()), px(y.min(center))),
+            size(px(1.0), px((y - center).abs().max(1.0))),
+        );
+        window.paint_quad(fill(
+            stem,
+            gpui::Rgba {
+                a: fill_color.a * 0.45,
+                ..fill_color
+            },
+        ));
+        let dot = Bounds::new(
+            bounds.origin + point(px(x.round() - 1.0), px(y.round() - 1.0)),
+            size(px(3.0), px(3.0)),
+        );
+        window.paint_quad(fill(dot, edge_color));
+    }
+}
+
 fn amplitude_coordinate(value: f32, scale: AmplitudeScale, vertical_zoom: f32) -> f32 {
     let signed = value.signum();
     let magnitude = value.abs().clamp(0.0, 1.0);
@@ -218,4 +325,35 @@ fn amplitude_coordinate(value: f32, scale: AmplitudeScale, vertical_zoom: f32) -
         }
     };
     (signed * normalized * vertical_zoom.clamp(0.25, 16.0)).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoothing_averages_neighbours_without_shifting_x() {
+        let columns = vec![
+            WaveformColumn {
+                x: 0.0,
+                min: -1.0,
+                max: 1.0,
+            },
+            WaveformColumn {
+                x: 1.0,
+                min: 0.0,
+                max: 0.0,
+            },
+            WaveformColumn {
+                x: 2.0,
+                min: -1.0,
+                max: 1.0,
+            },
+        ];
+        let smoothed = smoothed_columns(&columns, DisplaySmoothing::Light);
+        assert_eq!(smoothed[1].x, 1.0);
+        assert!((smoothed[1].max - 2.0 / 3.0).abs() < 1.0e-5);
+        let raw = smoothed_columns(&columns, DisplaySmoothing::Off);
+        assert_eq!(raw[1].max, 0.0);
+    }
 }

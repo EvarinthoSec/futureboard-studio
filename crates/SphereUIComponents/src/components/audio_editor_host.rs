@@ -11,11 +11,11 @@ use gpui::{
     ParentElement, Render, ScrollWheelEvent, Styled, Subscription, Window,
 };
 use sphere_audio_editor::{
-    audio_editor_panel, default_wheel_handler_at, empty_audio_editor, AudioEditorCallbacks,
-    AudioEditorDrag, AudioEditorEvent, AudioEditorSnap, AudioEditorState, AudioEditorTool,
-    AudioEditorViewModel, AudioRangeSelection, AudioToolKind, AudioToolTarget, EnvelopeCurve,
-    EnvelopePoint, FrequencyScale, SpectralSelection, AUDIO_EDITOR_INSPECTOR_WIDTH,
-    AUDIO_EDITOR_TOOLS_WIDTH,
+    audio_editor_panel, default_wheel_handler_at, empty_audio_editor, nearest_zero_crossing,
+    AudioEditorCallbacks, AudioEditorDrag, AudioEditorEvent, AudioEditorSnap, AudioEditorState,
+    AudioEditorTool, AudioEditorViewModel, AudioRangeSelection, AudioToolKind, AudioToolTarget,
+    ClipChannelMode, EnvelopeCurve, EnvelopePoint, FrequencyScale, SpectralSelection,
+    WarpMarkerView, AUDIO_EDITOR_INSPECTOR_WIDTH, AUDIO_EDITOR_TOOLS_WIDTH,
 };
 
 use crate::components::audio_editor_adapter::{
@@ -27,9 +27,10 @@ use crate::components::audio_editor_spectrogram::{
 };
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
-    AudioClipStretchState, ClipEdge, ClipState, ClipType, StretchAlgorithm, StretchMode,
+    clip_output_local_to_source_sample, AudioClipStretchState, ClipEdge, ClipState, ClipType,
+    StretchAlgorithm, StretchMode, WarpMarker,
 };
-use crate::components::timeline::waveform_cache;
+use crate::components::timeline::{waveform_cache, waveform_samples};
 use crate::theme::Colors;
 
 const INSPECTOR_W: f32 = AUDIO_EDITOR_INSPECTOR_WIDTH;
@@ -50,6 +51,7 @@ pub struct AudioEditorHost {
     spectrogram_result: Option<Result<Arc<RenderedSpectrogram>, String>>,
     spectrogram_generation: u64,
     pending_open_tool: Option<(AudioToolKind, AudioToolTarget)>,
+    pending_audition: Option<(f32, bool)>,
     _timeline_observer: Subscription,
 }
 
@@ -113,6 +115,8 @@ impl AudioEditorHost {
             "y" => Some(AudioEditorTool::Trim),
             "z" => Some(AudioEditorTool::Scrub),
             "d" | "e" => Some(AudioEditorTool::Draw),
+            "w" => Some(AudioEditorTool::Warp),
+            "a" => Some(AudioEditorTool::Audition),
             _ => None,
         };
 
@@ -128,10 +132,15 @@ impl AudioEditorHost {
                 }
             }
             (_, Some(tool)) => {
+                self.commit_active_clip_gesture(cx);
                 self.state.active_tool = tool;
                 self.state.open_dropdown = None;
             }
             ("escape", None) => {
+                self.cancel_active_clip_gesture(cx);
+                if self.pending_audition.is_some() {
+                    self.pending_audition = Some((0.0, false));
+                }
                 self.state.selection_range = None;
                 self.state.spectral_selection = None;
                 self.state.drag = AudioEditorDrag::None;
@@ -176,6 +185,7 @@ impl AudioEditorHost {
             spectrogram_result: None,
             spectrogram_generation: 0,
             pending_open_tool: None,
+            pending_audition: None,
             _timeline_observer,
         }
     }
@@ -197,6 +207,10 @@ impl AudioEditorHost {
 
     pub fn take_pending_open_tool(&mut self) -> Option<(AudioToolKind, AudioToolTarget)> {
         self.pending_open_tool.take()
+    }
+
+    pub fn take_pending_audition(&mut self) -> Option<(f32, bool)> {
+        self.pending_audition.take()
     }
 
     pub fn current_tool_target(&self, cx: &Context<Self>) -> Option<AudioToolTarget> {
@@ -366,7 +380,14 @@ impl AudioEditorHost {
             beats_per_bar: tl.state.beats_per_bar(),
             bpm: tl.state.bpm,
             track_color: track.color,
-            waveform: build_waveform_view_model(clip, &tl.state, ppb, scroll_x, viewport_w),
+            waveform: build_waveform_view_model(
+                clip,
+                &tl.state,
+                ppb,
+                scroll_x,
+                viewport_w,
+                self.state.view_mode.prefers_sample_view(),
+            ),
             spectrogram,
             view_mode: self.state.view_mode,
             amplitude_scale: self.state.amplitude_scale,
@@ -387,6 +408,21 @@ impl AudioEditorHost {
             channel_mode: self.state.channel_mode,
             fade_in_beats: (clip.stretch.fade_in_ms.max(0.0) / 1000.0) / seconds_per_beat,
             fade_out_beats: (clip.stretch.fade_out_ms.max(0.0) / 1000.0) / seconds_per_beat,
+            warp_markers: clip
+                .stretch
+                .warp_markers
+                .iter()
+                .map(|marker| WarpMarkerView {
+                    id: marker.id,
+                    rel_beat: (marker.timeline_beat as f32 - clip.start_beat)
+                        .clamp(0.0, clip.duration_beats.max(0.0)),
+                    source_sample: marker.source_sample,
+                    locked: marker.locked,
+                })
+                .collect(),
+            clip_channel: ClipChannelMode::from_tag(clip.stretch.channel_transform),
+            display_smoothing: self.state.display_smoothing,
+            sample_rate: meta.as_ref().map(|m| m.sample_rate).unwrap_or(0),
             selection_start_label: selection_labels.0,
             selection_end_label: selection_labels.1,
             selection_duration_label: selection_labels.2,
@@ -422,14 +458,60 @@ impl AudioEditorHost {
     }
 
     fn snap_beat(&self, beat: f32, bypass: bool, cx: &Context<Self>) -> f32 {
-        if self.state.snap == AudioEditorSnap::Grid {
-            self.timeline
+        if bypass {
+            return beat;
+        }
+        match self.state.snap {
+            AudioEditorSnap::Off => beat,
+            AudioEditorSnap::Grid => self
+                .timeline
                 .read(cx)
                 .state
-                .snap_beats_with_bypass(beat, bypass)
-        } else {
-            beat
+                .snap_beats_with_bypass(beat, false),
+            AudioEditorSnap::ZeroCrossing => self.snap_zero_crossing(beat, cx).unwrap_or(beat),
+            AudioEditorSnap::Markers | AudioEditorSnap::Transients => beat,
         }
+    }
+
+    fn snap_zero_crossing(&self, beat: f32, cx: &Context<Self>) -> Option<f32> {
+        let vm = self.build_view_model(cx)?;
+        let tl = self.timeline.read(cx);
+        let (_, clip) = self.active_clip(&tl.state)?;
+        let asset_key = clip.audio_asset_key()?;
+        let rel = (beat - vm.start_beat).clamp(0.0, vm.duration_beats.max(0.0));
+        let frame = self.frame_for_rel_beat(&vm, rel).max(0) as u64;
+        let radius = 2_048_u64;
+        let window = waveform_samples::get_window(
+            asset_key,
+            frame.saturating_sub(radius),
+            frame.saturating_add(radius),
+        );
+        let window = match window {
+            Some(window) => window,
+            None => {
+                if let Some(path) = vm.source_path.as_deref() {
+                    waveform_samples::note_needed(
+                        asset_key,
+                        path,
+                        frame.saturating_sub(radius),
+                        frame.saturating_add(radius),
+                        self.total_source_frames(&vm).max(0) as u64,
+                    );
+                }
+                return None;
+            }
+        };
+        let origin = frame.saturating_sub(window.start_frame) as usize;
+        let snapped = nearest_zero_crossing(&window.mono, origin, radius as usize)?;
+        let snapped_frame = window.start_frame as i64 + snapped as i64;
+        Some(vm.start_beat + self.rel_beat_for_frame(&vm, snapped_frame))
+    }
+
+    fn rel_beat_for_frame(&self, vm: &AudioEditorViewModel, frame: i64) -> f32 {
+        let start = vm.source_start_frame.max(0);
+        let end = vm.source_end_frame.max(start + 1);
+        let t = (frame - start) as f32 / (end - start) as f32;
+        (t.clamp(0.0, 1.0) * vm.duration_beats).clamp(0.0, vm.duration_beats.max(0.0))
     }
 
     fn handle_event(
@@ -445,6 +527,7 @@ impl AudioEditorHost {
                 cx.notify();
             }
             AudioEditorEvent::SetTool(tool) => {
+                self.commit_active_clip_gesture(cx);
                 self.state.drag = AudioEditorDrag::None;
                 self.state.active_tool = tool;
                 self.state.open_dropdown = None;
@@ -475,6 +558,14 @@ impl AudioEditorHost {
                 self.state.frequency_scale = scale;
                 self.state.open_dropdown = None;
                 cx.notify();
+            }
+            AudioEditorEvent::SetDisplaySmoothing(mode) => {
+                self.state.display_smoothing = mode;
+                self.state.open_dropdown = None;
+                cx.notify();
+            }
+            AudioEditorEvent::SetClipChannel(mode) => {
+                self.set_clip_channel(mode, cx);
             }
             AudioEditorEvent::AdjustVerticalZoom { factor } => {
                 self.state.adjust_vertical_zoom(factor);
@@ -661,8 +752,32 @@ impl AudioEditorHost {
                     anchor_beat: rel_beat,
                 };
             }
+            AudioEditorTool::Audition => {
+                let beat = if let Some((a, b)) = self.state.selection_range {
+                    vm.start_beat + a.min(b)
+                } else {
+                    vm.start_beat + rel_beat
+                };
+                self.seek_relative(beat, cx);
+                self.pending_audition = Some((beat, true));
+                self.state.drag = AudioEditorDrag::SelectingRange {
+                    anchor_beat: rel_beat,
+                };
+                cx.notify();
+            }
             AudioEditorTool::Warp => {
-                self.seek_relative(vm.start_beat + rel_beat, cx);
+                let hit_id = vm.warp_markers.iter().find_map(|marker| {
+                    let x = marker.rel_beat * self.state.viewport.pixels_per_beat
+                        - self.state.viewport.scroll_x;
+                    ((x - local_x).abs() <= 8.0).then_some(marker.id)
+                });
+                if let Some(marker_id) = hit_id {
+                    self.begin_clip_gesture(&vm.clip_id, cx);
+                    self.state.drag = AudioEditorDrag::MovingWarpMarker { marker_id };
+                } else {
+                    self.add_warp_marker(&vm.clip_id, vm.start_beat + rel_beat, cx);
+                }
+                cx.notify();
             }
             AudioEditorTool::Draw => {
                 let local_y = self.local_y(_y);
@@ -738,7 +853,9 @@ impl AudioEditorHost {
         match drag {
             AudioEditorDrag::None => {}
             AudioEditorDrag::SelectingRange { anchor_beat } => {
-                if self.state.active_tool == AudioEditorTool::Scrub {
+                if self.state.active_tool == AudioEditorTool::Scrub
+                    || self.state.active_tool == AudioEditorTool::Audition
+                {
                     self.seek_relative(vm.start_beat + rel_beat, cx);
                 } else {
                     self.state.selection_range = Some((anchor_beat, rel_beat));
@@ -791,7 +908,16 @@ impl AudioEditorHost {
                 let value_db = gain_db_for_local_y(local_y, self.viewport_height.get().max(180.0));
                 self.update_envelope_point(&vm.clip_id, point_id, time, value_db, cx);
             }
-            AudioEditorDrag::MovingWarpMarker { .. } => {}
+            AudioEditorDrag::MovingWarpMarker { marker_id } => {
+                self.move_warp_marker(
+                    &vm.clip_id,
+                    marker_id,
+                    vm.start_beat + rel_beat,
+                    vm.start_beat,
+                    vm.duration_beats,
+                    cx,
+                );
+            }
         }
     }
 
@@ -799,6 +925,9 @@ impl AudioEditorHost {
         let drag = std::mem::take(&mut self.state.drag);
         match drag {
             AudioEditorDrag::SelectingRange { .. } => {
+                if self.state.active_tool == AudioEditorTool::Audition {
+                    self.pending_audition = Some((0.0, false));
+                }
                 if let Some((start, end)) = self.state.selection_range {
                     if (end - start).abs() < 0.0001 {
                         self.state.selection_range = None;
@@ -820,36 +949,50 @@ impl AudioEditorHost {
             | AudioEditorDrag::TrimmingRight { .. }
             | AudioEditorDrag::AdjustingFadeIn { .. }
             | AudioEditorDrag::AdjustingFadeOut { .. } => {
-                let clip_id = self.active_clip_id.clone();
-                if let Some(clip_id) = clip_id {
-                    let _ = self.timeline.update(cx, |timeline, cx| {
-                        if timeline.commit_inspector_clip_gesture(&clip_id, cx) {
-                            timeline.mark_media_changed(cx);
-                        }
-                        cx.notify();
-                    });
-                }
+                self.commit_active_clip_gesture(cx);
             }
-            AudioEditorDrag::MovingEnvelopePoint { .. } => {
-                let clip_id = self.active_clip_id.clone();
-                if let Some(clip_id) = clip_id {
-                    let _ = self.timeline.update(cx, |timeline, cx| {
-                        if timeline.commit_inspector_clip_gesture(&clip_id, cx) {
-                            timeline.mark_media_changed(cx);
-                        }
-                        cx.notify();
-                    });
-                }
+            AudioEditorDrag::MovingEnvelopePoint { .. }
+            | AudioEditorDrag::MovingWarpMarker { .. } => {
+                self.commit_active_clip_gesture(cx);
             }
-            AudioEditorDrag::None | AudioEditorDrag::MovingWarpMarker { .. } => {}
+            AudioEditorDrag::None => {}
         }
     }
 
     fn begin_clip_gesture(&mut self, clip_id: &str, cx: &mut Context<Self>) {
+        if self.active_clip_id.as_deref() != Some(clip_id) {
+            self.commit_active_clip_gesture(cx);
+        }
         self.active_clip_id = Some(clip_id.to_string());
         let _ = self.timeline.update(cx, |timeline, _cx| {
             timeline.begin_inspector_clip_gesture(clip_id);
         });
+    }
+
+    fn commit_active_clip_gesture(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(clip_id) = self.active_clip_id.clone() else {
+            return false;
+        };
+        let mut changed = false;
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            if timeline.commit_inspector_clip_gesture(&clip_id, cx) {
+                timeline.mark_media_changed(cx);
+                changed = true;
+            }
+            cx.notify();
+        });
+        changed
+    }
+
+    fn cancel_active_clip_gesture(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut restored = false;
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            restored = timeline.cancel_inspector_clip_gesture(cx);
+        });
+        if restored {
+            cx.notify();
+        }
+        restored
     }
 
     fn seconds_per_beat(&self, cx: &Context<Self>) -> f32 {
@@ -1038,6 +1181,104 @@ impl AudioEditorHost {
         self.apply_clip_stretch_gesture(&clip_id, next, cx);
     }
 
+    fn set_clip_channel(&mut self, mode: ClipChannelMode, cx: &mut Context<Self>) {
+        let Some((_, clip)) = self.active_clip(&self.timeline.read(cx).state) else {
+            return;
+        };
+        let clip_id = clip.id.clone();
+        let mut next = clip.stretch.clone();
+        next.channel_transform = mode.to_tag();
+        next.dirty = true;
+        self.state.open_dropdown = None;
+        self.apply_clip_stretch_gesture(&clip_id, next, cx);
+    }
+
+    fn add_warp_marker(&mut self, clip_id: &str, timeline_beat: f32, cx: &mut Context<Self>) {
+        let Some((_, clip)) = self.active_clip(&self.timeline.read(cx).state) else {
+            return;
+        };
+        if clip.id != clip_id {
+            return;
+        }
+        let prev = clip.stretch.clone();
+        let start = clip.start_beat as f64;
+        let dur = clip.duration_beats.max(0.0) as f64;
+        if dur <= 0.0 {
+            return;
+        }
+        let bpm = self.timeline.read(cx).state.bpm as f64;
+        let playhead = timeline_beat as f64;
+        let local_frac = ((playhead - start) / dur).clamp(0.0, 1.0);
+        let output_len = (prev.source_len_samples() as f64) * prev.effective_time_ratio(bpm);
+        let source_sample = clip_output_local_to_source_sample(
+            local_frac * output_len,
+            prev.source_start_samples,
+            prev.source_end_samples,
+            prev.effective_time_ratio(bpm),
+            prev.reverse,
+        )
+        .round() as u64;
+        let id = prev.warp_markers.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+        let mut next = prev;
+        next.warp_markers.push(WarpMarker {
+            id,
+            source_sample,
+            timeline_beat: playhead,
+            locked: false,
+        });
+        next.warp_markers
+            .sort_by(|a, b| a.timeline_beat.total_cmp(&b.timeline_beat));
+        next.mode = StretchMode::Warp;
+        next.dirty = true;
+        self.apply_clip_stretch_gesture(clip_id, next, cx);
+    }
+
+    fn move_warp_marker(
+        &mut self,
+        clip_id: &str,
+        marker_id: u64,
+        timeline_beat: f32,
+        clip_start: f32,
+        duration_beats: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let clip_id = clip_id.to_string();
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            let Some(mut stretch) = timeline.state.clip_stretch(&clip_id).cloned() else {
+                return;
+            };
+            let Some(index) = stretch
+                .warp_markers
+                .iter()
+                .position(|marker| marker.id == marker_id)
+            else {
+                return;
+            };
+            if stretch.warp_markers[index].locked {
+                return;
+            }
+            let min_beat = if index == 0 {
+                clip_start as f64
+            } else {
+                stretch.warp_markers[index - 1].timeline_beat + 1.0e-4
+            };
+            let max_beat = if index + 1 >= stretch.warp_markers.len() {
+                (clip_start + duration_beats) as f64
+            } else {
+                stretch.warp_markers[index + 1].timeline_beat - 1.0e-4
+            };
+            if max_beat <= min_beat {
+                return;
+            }
+            stretch.warp_markers[index].timeline_beat =
+                (timeline_beat as f64).clamp(min_beat, max_beat);
+            stretch.dirty = true;
+            if timeline.state.set_clip_stretch(&clip_id, stretch) {
+                cx.notify();
+            }
+        });
+    }
+
     fn apply_clip_gesture(
         &mut self,
         clip_id: &str,
@@ -1081,26 +1322,21 @@ enum AudioFadeSide {
 
 impl Render for AudioEditorHost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_id = self
-            .timeline
-            .read(cx)
-            .state
-            .selection
-            .selected_clip_ids
-            .first()
-            .cloned()
-            .filter(|id| {
-                self.timeline
-                    .read(cx)
-                    .state
-                    .find_clip(id)
-                    .is_some_and(|(_, c)| matches!(c.clip_type, ClipType::Audio { .. }))
-            });
+        let selected_id =
+            selected_audio_clip(&self.timeline.read(cx).state).map(|(_, clip)| clip.id.clone());
 
+        let selection_changed = selected_id != self.last_editing_clip;
+        if selection_changed {
+            // The selection observer can repaint before the old clip emits a
+            // PointerUp. Treat that switch as a gesture boundary and roll back
+            // the live preview instead of leaving it outside Project State.
+            self.cancel_active_clip_gesture(cx);
+            self.state.drag = AudioEditorDrag::None;
+        }
         if selected_id.is_some() {
             self.active_clip_id = selected_id.clone();
         }
-        if selected_id != self.last_editing_clip {
+        if selection_changed {
             self.last_editing_clip = selected_id;
             if self.last_editing_clip.is_none() {
                 self.active_clip_id = None;

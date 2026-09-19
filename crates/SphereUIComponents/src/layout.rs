@@ -592,6 +592,7 @@ pub struct StudioLayout {
     stretch_tempo: stretch_tempo_ops::StretchTempoState,
     /// Floating audio-editor analysis/processing windows.
     audio_tools: crate::components::AudioToolWindowManager,
+    audio_editor_audition_owned: bool,
     /// Throttle / sync timestamps for engine ↔ UI bridging (playhead, snapshot
     /// sync, meter push, tempo commit). Grouped into
     /// [`audio_transport::EngineSyncState`] (decomposition slice).
@@ -1189,6 +1190,7 @@ impl StudioLayout {
             background_tasks: BackgroundTaskStore::default(),
             stretch_tempo: stretch_tempo_ops::StretchTempoState::default(),
             audio_tools: crate::components::AudioToolWindowManager::default(),
+            audio_editor_audition_owned: false,
             project_switcher: ProjectSwitcherState::default(),
             project_switcher_search_input: TextInputState::new(
                 "project-switcher-search-input",

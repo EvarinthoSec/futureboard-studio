@@ -490,6 +490,48 @@ impl Timeline {
         true
     }
 
+    /// Roll back a live Inspector/Audio Editor preview without creating an
+    /// undo entry. Pointer edits are applied to the project model while the
+    /// gesture is in flight so the canvas can render the preview; Escape,
+    /// selection changes, and focus loss must therefore restore the exact
+    /// pre-gesture clip rather than merely dropping the drag flag.
+    pub fn cancel_inspector_clip_gesture(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(previous) = self.inspector_clip_gesture_origin.take() else {
+            return false;
+        };
+
+        let mut restored = false;
+        for track in &mut self.state.tracks {
+            if let Some(clip) = track
+                .clips
+                .iter_mut()
+                .find(|clip| clip.id == previous.clip.id)
+            {
+                *clip = previous.clip.clone();
+                restored = true;
+                break;
+            }
+        }
+        if !restored {
+            // A clip should not disappear during an Audio Editor gesture, but
+            // restoring the snapshot is safer than leaving a half-applied
+            // preview behind if another command removed it concurrently.
+            if let Some(track) = self
+                .state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == previous.track_id)
+            {
+                track.clips.push(previous.clip);
+                restored = true;
+            }
+        }
+        if restored {
+            cx.notify();
+        }
+        restored
+    }
+
     /// Push the value a just-applied [`EditImpact::MixerControl`] command left in
     /// `state` straight down the realtime control path.
     ///

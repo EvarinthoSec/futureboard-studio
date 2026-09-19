@@ -9,7 +9,7 @@ use sphere_audio_editor::{AudioToolKind, AudioToolTarget};
 use crate::components::timeline::timeline_state::{
     AudioImportState, ClipType, StretchMode, WarpMarker, MIN_AUDIO_CLIP_BEATS,
 };
-use crate::components::timeline::{waveform_cache, waveform_detail};
+use crate::components::timeline::{waveform_cache, waveform_detail, waveform_samples};
 use crate::components::{
     apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand, AudioToolWindowCallbacks,
 };
@@ -33,6 +33,30 @@ impl StudioLayout {
                     layout.open_audio_tool(kind, target, Some(owner_bounds), cx);
                 });
             });
+        }
+
+        let audition = self
+            .audio_editor
+            .update(cx, |editor, _cx| editor.take_pending_audition());
+        if let Some((beat, start)) = audition {
+            let _ = self.timeline.update(cx, |timeline, cx| {
+                timeline.seek_to_exact_beat(beat, crate::layout::SeekReason::TimelineClick, cx);
+            });
+            if start {
+                let playing = self
+                    .audio_bridge
+                    .stats
+                    .as_ref()
+                    .map(|stats| stats.transport_playing)
+                    .unwrap_or(false);
+                if !playing {
+                    self.start_native_playback(cx);
+                    self.audio_editor_audition_owned = true;
+                }
+            } else if self.audio_editor_audition_owned {
+                self.stop_native_playback(cx);
+                self.audio_editor_audition_owned = false;
+            }
         }
 
         if !self.audio_tools.windows.is_empty() {
@@ -311,6 +335,7 @@ impl StudioLayout {
         // must be able to restore that cache instead of an empty waveform.
         waveform_cache::invalidate_file(&path_string);
         waveform_detail::forget_asset(&path_string);
+        waveform_samples::forget_asset(&path_string);
         self.audio_tools.previews.remove(clip_id);
         self.spawn_timeline_audio_import_jobs(cx, self.timeline.clone(), path, path_string.clone());
         self.refresh_audio_editor_visuals(Some(&path_string), cx);

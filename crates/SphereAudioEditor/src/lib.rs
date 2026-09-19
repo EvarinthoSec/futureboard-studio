@@ -19,8 +19,8 @@ pub use audio_editor::{
 pub use audio_editor_state::AudioEditorState;
 pub use editing::{
     AudioChannelMode, AudioEditorDrag, AudioEditorSnap, AudioEditorTool, AudioFadeCurve,
-    AudioFadeEdge, AudioRangeSelection, ClipEnvelope, EnvelopeCurve, EnvelopePoint,
-    SpectralSelection,
+    AudioFadeEdge, AudioRangeSelection, ClipChannelMode, ClipEnvelope, DisplaySmoothing,
+    EnvelopeCurve, EnvelopePoint, SpectralSelection, WarpMarkerView, nearest_zero_crossing,
 };
 pub use editor_kind::{ClipEditorKind, ClipTypeHint, editor_kind_for_clip};
 pub use spectrogram::{
@@ -30,4 +30,4 @@ pub use spectrogram::{
 };
 pub use tools::{AudioRepairModule, AudioToolKind, AudioToolSession, AudioToolTarget};
 pub use viewport::AudioEditorViewport;
-pub use waveform_view::{WaveformColumn, WaveformViewModel};
+pub use waveform_view::{WaveformColumn, WaveformSample, WaveformViewModel};
