@@ -82,6 +82,7 @@ mod transport_freeze_debug;
 mod transport_ops;
 mod video_ops;
 mod window_ops;
+mod workspace_layout_ops;
 
 pub use audio_transport::SeekReason;
 pub use context_menu_ops::{ContextMenuRequest, ContextMenuTarget};
@@ -1288,6 +1289,8 @@ impl StudioLayout {
         layout.ensure_mixer_tree_defaults_once(cx);
         layout.ensure_mixer_tree_ui_hooks(cx.entity().clone(), cx);
         layout.refresh_mixer_tree_sidebar_entity(cx);
+        // Restore saved panel visibility, sizes, and tab selections.
+        layout.load_and_restore_workspace_layout();
         // Audio-engine warm-up is preload, not mount work. The pre-studio
         // Loading Session dialog already builds + warms the engine and hands it
         // off during workspace install. Running the warm-up synchronously here
