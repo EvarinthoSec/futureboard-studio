@@ -224,6 +224,7 @@ impl Timeline {
             on_playhead_scrub_begin: None,
             on_playhead_scrub_end: None,
             on_open_editor: None,
+            on_tempo_point_edit: None,
             on_open_song_text_editor: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -294,6 +295,7 @@ impl Timeline {
             on_playhead_scrub_begin: None,
             on_playhead_scrub_end: None,
             on_open_editor: None,
+            on_tempo_point_edit: None,
             on_open_song_text_editor: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -670,6 +672,10 @@ impl Timeline {
 
     pub fn set_open_editor_callback(&mut self, callback: Option<TimelineOpenEditorCb>) {
         self.on_open_editor = callback;
+    }
+
+    pub fn set_tempo_point_edit_callback(&mut self, callback: Option<TempoPointEditCb>) {
+        self.on_tempo_point_edit = callback;
     }
 
     pub fn set_open_song_text_editor_callback(&mut self, callback: Option<TimelineOpenEditorCb>) {
@@ -1061,11 +1067,23 @@ impl Timeline {
         clip_id: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.erase_clip_drag = Some(HashSet::new());
-        if let Some(id) = clip_id {
-            self.erase_clip_drag.as_mut().unwrap().insert(id);
+        // A known clip (right-click erase) seeds the set with exactly that
+        // clip. Falling through to `update_erase_clip_drag` here would pull
+        // in every other clip on every track sharing that beat, deleting a
+        // whole stack instead of the one clicked.
+        match clip_id {
+            Some(id) => {
+                let mut set = HashSet::new();
+                set.insert(id);
+                self.erase_preview_ids = set.clone();
+                self.erase_clip_drag = Some(set);
+                cx.notify();
+            }
+            None => {
+                self.erase_clip_drag = Some(HashSet::new());
+                self.update_erase_clip_drag(beat, cx);
+            }
         }
-        self.update_erase_clip_drag(beat, cx);
     }
 
     // ── Automation lane interaction ──────────────────────────────────────────

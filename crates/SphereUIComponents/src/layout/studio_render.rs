@@ -188,6 +188,21 @@ impl Render for StudioLayout {
             timeline.set_context_menu_callback(Some(on_timeline_context));
         });
 
+        let on_tempo_point_edit: components::timeline::timeline::TempoPointEditCb = {
+            let this = cx.entity().clone();
+            std::sync::Arc::new(
+                move |point_id: &str, _window: &mut Window, cx: &mut gpui::App| {
+                    let point_id = point_id.to_string();
+                    let _ = this.update(cx, |this, cx| {
+                        this.begin_bpm_edit(Some(point_id), cx);
+                    });
+                },
+            )
+        };
+        let _ = self.timeline.update(cx, |timeline, _cx| {
+            timeline.set_tempo_point_edit_callback(Some(on_tempo_point_edit));
+        });
+
         let on_automation_control: components::timeline::automation_control_lane::AutomationControlCallback = {
             let this = cx.entity().clone();
             std::sync::Arc::new(

@@ -256,6 +256,10 @@ pub struct Timeline {
     /// Invoked when the user double-clicks a MIDI clip — `StudioLayout` uses it
     /// to switch the bottom panel to the piano-roll Editor tab.
     on_open_editor: Option<TimelineOpenEditorCb>,
+    /// Invoked when the user double-clicks an existing Tempo Track marker —
+    /// `StudioLayout` uses it to open the inline BPM editor targeting that
+    /// marker, instead of the playhead-effective tempo.
+    on_tempo_point_edit: Option<TempoPointEditCb>,
     /// Invoked when the user double-clicks a Song Text marker.
     on_open_song_text_editor: Option<TimelineOpenEditorCb>,
     chrome_metrics: TimelineChromeMetrics,
@@ -304,6 +308,9 @@ pub struct Timeline {
 }
 
 pub type TimelineOpenEditorCb = std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>;
+
+pub type TempoPointEditCb =
+    std::sync::Arc<dyn Fn(&str, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 #[derive(Clone, Debug)]
 pub enum TimelineContextTarget {

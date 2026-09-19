@@ -41,6 +41,9 @@ pub(crate) struct TempoEditState {
     /// range/format/commit policy so typed edits and drag adjustments resolve
     /// through one value source; the live draft stays in `bpm_input.value`.
     pub bpm_session: Option<NumericEditSession>,
+    /// `Some(id)` targets one tempo marker (opened via double-click on that
+    /// marker in the Tempo Track); `None` targets the playhead-effective BPM.
+    pub bpm_edit_point_id: Option<String>,
     /// Inline time-signature numerator field.
     pub ts_num_input: TextInputState,
     /// Inline time-signature denominator field.
@@ -60,6 +63,7 @@ impl TempoEditState {
                 .with_accessible_label("Tempo in BPM"),
             bpm_editing: false,
             bpm_session: None,
+            bpm_edit_point_id: None,
             ts_num_input: TextInputState::new("transport-ts-num-input", cx.focus_handle())
                 .with_accessible_label("Time signature numerator"),
             ts_den_input: TextInputState::new("transport-ts-den-input", cx.focus_handle())
@@ -516,7 +520,7 @@ impl StudioLayout {
             let this = cx.entity().clone();
             Arc::new(move |_: &(), _window: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |this, cx| {
-                    this.begin_bpm_edit(cx);
+                    this.begin_bpm_edit(None, cx);
                 });
             })
         };

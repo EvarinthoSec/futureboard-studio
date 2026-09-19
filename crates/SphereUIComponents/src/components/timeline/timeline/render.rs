@@ -1287,7 +1287,7 @@ impl Render for Timeline {
         let on_automation_control = self.on_automation_control.clone();
 
         let on_tempo_down = cx.listener(
-            |this, payload: &(f64, f64, Option<String>, bool, u32), _window, cx| {
+            |this, payload: &(f64, f64, Option<String>, bool, u32), window, cx| {
                 let (beat, bpm, point_id, _additive, click_count) = (
                     payload.0,
                     payload.1,
@@ -1295,6 +1295,17 @@ impl Render for Timeline {
                     payload.3,
                     payload.4,
                 );
+                // Double-click directly on an existing marker opens the
+                // inline BPM editor for that marker instead of the
+                // (previously dead) fallthrough that just re-selected it.
+                if click_count >= 2 {
+                    if let Some(id) = point_id.as_deref() {
+                        if let Some(cb) = this.on_tempo_point_edit.clone() {
+                            cb(id, window, cx);
+                            return;
+                        }
+                    }
+                }
                 this.begin_tempo_track_interaction(beat, bpm, point_id, click_count, cx);
             },
         );
