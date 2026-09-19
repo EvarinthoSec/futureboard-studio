@@ -244,9 +244,9 @@ pub fn build(
 }
 
 /// Remove only the generated CEF wrapper build when an older CMake cache still
-/// has the static MSVC CRT selected. This makes the new Crashpad/CEF runtime
-/// alignment self-healing for developers upgrading an existing target tree;
-/// clean checkouts simply skip this step.
+/// has the static MSVC CRT selected or GNU-style compiler/archiver tools cached.
+/// This keeps both the Crashpad/CEF runtime and the MSVC command-line tools
+/// aligned after developers update the wrapper toolchain.
 fn reset_stale_cef_wrapper(
     cargo: &str,
     workspace: &Path,
@@ -273,6 +273,7 @@ fn reset_stale_cef_wrapper(
     };
 
     let mut stale = false;
+    let mut cef_build_dirs = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| {
             format!(
@@ -289,8 +290,9 @@ fn reset_stale_cef_wrapper(
             continue;
         }
 
-        let cache = entry
-            .path()
+        let cef_build_dir = entry.path();
+        cef_build_dirs.push(cef_build_dir.clone());
+        let cache = cef_build_dir
             .join("out")
             .join("build")
             .join("CMakeCache.txt");
@@ -299,11 +301,8 @@ fn reset_stale_cef_wrapper(
         }
         let contents = fs::read_to_string(&cache)
             .with_context(|| format!("failed to read CEF CMake cache {}", cache.display()))?;
-        let crt = cmake_cache_value(&contents, "CMAKE_MSVC_RUNTIME_LIBRARY");
-        let cef_crt = cmake_cache_value(&contents, "CEF_RUNTIME_LIBRARY_FLAG");
-        if crt != Some("MultiThreadedDLL") || cef_crt != Some("/MD") {
+        if cef_wrapper_cache_is_stale(&contents) {
             stale = true;
-            break;
         }
     }
 
@@ -312,7 +311,7 @@ fn reset_stale_cef_wrapper(
     }
 
     eprintln!(
-        "[xtask] resetting stale CEF wrapper cache in {} to align with Crashpad (/MD)",
+        "[xtask] resetting stale CEF wrapper cache in {} to align the compiler and Crashpad CRT (/MD)",
         profile_dir.display()
     );
     let status = Command::new(cargo)
@@ -323,6 +322,36 @@ fn reset_stale_cef_wrapper(
         .with_context(|| "failed to reset the stale CEF wrapper build")?;
     if !status.success() {
         bail!("cargo clean for the stale CEF wrapper failed with {status}");
+    }
+
+    // `cargo clean --package` can leave a CMake/Ninja build tree behind when
+    // the build script failed before Cargo recorded its output. Remove only
+    // direct `cef-dll-sys-*` directories under this edition/profile cache so
+    // the next CMake configure regenerates compiler and archive rules.
+    for cef_build_dir in cef_build_dirs {
+        if cef_build_dir.parent() != Some(build_dir.as_path())
+            || !cef_build_dir
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("cef-dll-sys-"))
+        {
+            bail!(
+                "refusing to remove CEF build cache outside {}: {}",
+                build_dir.display(),
+                cef_build_dir.display()
+            );
+        }
+        match fs::remove_dir_all(&cef_build_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove stale CEF build cache {}",
+                        cef_build_dir.display()
+                    )
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -337,6 +366,44 @@ fn cmake_cache_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
         let name = name.split_once(':')?.0;
         (name == key).then_some(value.trim())
     })
+}
+
+fn cef_wrapper_cache_is_stale(contents: &str) -> bool {
+    let crt = cmake_cache_value(contents, "CMAKE_MSVC_RUNTIME_LIBRARY");
+    let cef_crt = cmake_cache_value(contents, "CEF_RUNTIME_LIBRARY_FLAG");
+    let c_compiler = cmake_cache_value(contents, "CMAKE_C_COMPILER");
+    let cxx_compiler = cmake_cache_value(contents, "CMAKE_CXX_COMPILER");
+    let archiver = cmake_cache_value(contents, "CMAKE_AR");
+    let c_archiver = cmake_cache_value(contents, "CMAKE_C_COMPILER_AR");
+    let cxx_archiver = cmake_cache_value(contents, "CMAKE_CXX_COMPILER_AR");
+    crt != Some("MultiThreadedDLL")
+        || cef_crt != Some("/MD")
+        || c_compiler.is_some_and(is_gnu_style_clang)
+        || cxx_compiler.is_some_and(is_gnu_style_clang)
+        || archiver.is_some_and(is_gnu_llvm_archiver)
+        || c_archiver.is_some_and(is_gnu_llvm_archiver)
+        || cxx_archiver.is_some_and(is_gnu_llvm_archiver)
+}
+
+fn is_gnu_style_clang(compiler: &str) -> bool {
+    let name = compiler
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(compiler)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "clang" | "clang.exe" | "clang++" | "clang++.exe"
+    )
+}
+
+fn is_gnu_llvm_archiver(archiver: &str) -> bool {
+    let name = archiver
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(archiver)
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "llvm-ar" | "llvm-ar.exe")
 }
 
 /// Comma-joined `--features` value combining edition features (if any) with the
@@ -391,5 +458,38 @@ mod tests {
             "futureboard_native/professional,sphere_directaudioengine/asio,\
 sphere-plugin-host/plugin-host-bin,sphere-plugin-host/plugin-scanner-bin"
         );
+    }
+
+    #[test]
+    fn stale_cef_cache_detects_gnu_style_clang_despite_matching_crt() {
+        let cache = "CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL\n\
+CEF_RUNTIME_LIBRARY_FLAG:STRING=/MD\n\
+CMAKE_C_COMPILER:FILEPATH=W:/LLVM/bin/clang.exe\n\
+CMAKE_CXX_COMPILER:FILEPATH=W:/LLVM/bin/clang++.exe\n";
+        assert!(cef_wrapper_cache_is_stale(cache));
+    }
+
+    #[test]
+    fn current_cef_cache_accepts_clang_cl() {
+        let cache = "CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL\n\
+CEF_RUNTIME_LIBRARY_FLAG:STRING=/MD\n\
+CMAKE_C_COMPILER:FILEPATH=W:/LLVM/bin/clang-cl.exe\n\
+CMAKE_CXX_COMPILER:FILEPATH=W:/LLVM/bin/clang-cl.exe\n\
+CMAKE_AR:FILEPATH=W:/LLVM/bin/llvm-lib.exe\n\
+CMAKE_C_COMPILER_AR:FILEPATH=W:/LLVM/bin/llvm-lib.exe\n\
+CMAKE_CXX_COMPILER_AR:FILEPATH=W:/LLVM/bin/llvm-lib.exe\n";
+        assert!(!cef_wrapper_cache_is_stale(cache));
+    }
+
+    #[test]
+    fn stale_cef_cache_detects_gnu_llvm_archiver() {
+        let cache = "CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL\n\
+CEF_RUNTIME_LIBRARY_FLAG:STRING=/MD\n\
+CMAKE_C_COMPILER:FILEPATH=W:/LLVM/bin/clang-cl.exe\n\
+CMAKE_CXX_COMPILER:FILEPATH=W:/LLVM/bin/clang-cl.exe\n\
+CMAKE_AR:FILEPATH=W:/LLVM/bin/llvm-lib.exe\n\
+CMAKE_C_COMPILER_AR:FILEPATH=W:/LLVM/bin/llvm-ar.exe\n\
+CMAKE_CXX_COMPILER_AR:FILEPATH=W:/LLVM/bin/llvm-ar.exe\n";
+        assert!(cef_wrapper_cache_is_stale(cache));
     }
 }

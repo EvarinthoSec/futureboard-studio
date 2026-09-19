@@ -39,9 +39,13 @@ function discoverPluginEditors(): PluginEditor[] {
     .sort((left, right) => left.plugin.localeCompare(right.plugin));
 }
 
-function runBun(editor: PluginEditor, args: string[]): void {
+function runBun(
+  editor: PluginEditor,
+  args: string[],
+  cwd = editor.directory,
+): void {
   const command = spawnSync(process.execPath, args, {
-    cwd: editor.directory,
+    cwd,
     stdio: "inherit",
   });
   if (command.error) {
@@ -61,7 +65,15 @@ if (editors.length === 0) {
 for (const editor of editors) {
   const relative = editor.directory.slice(workspaceRoot.length + 1);
   console.log(`[plugin-editors] installing ${editor.plugin}: ${relative}`);
-  runBun(editor, ["install", "--frozen-lockfile"]);
+  // Resolve the workspace lockfile from the root, but link only this editor's
+  // dependency graph. Installing every workspace for each selected editor can
+  // fail while linking unrelated workspace binaries on Windows.
+  const workspaceFilter = `./${relative.replaceAll("\\", "/")}`;
+  runBun(
+    editor,
+    ["install", "--frozen-lockfile", "--filter", workspaceFilter],
+    workspaceRoot,
+  );
 
   console.log(`[plugin-editors] building ${editor.plugin}: ${relative}`);
   runBun(editor, ["run", "build"]);

@@ -125,7 +125,11 @@ pub fn setup(cx: &mut App) {
     // CEF may synchronously dispatch Win32 messages while initializing; running
     // it as foreground work prevents those messages from re-entering a borrowed
     // AppCell. A failure stays non-fatal and is surfaced by the editor window.
-    #[cfg(not(all(feature = "builtin-plugin-editor", target_os = "macos")))]
+    #[cfg(all(
+        feature = "builtin-plugin-editor",
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
     cx.spawn(async move |cx| {
         use sphere_ui_components::components::builtin_plugin_editor;
         match builtin_plugin_editor::init_at_boot() {
@@ -138,18 +142,40 @@ pub fn setup(cx: &mut App) {
                 // Drive CEF briefly — with no editor window open nothing else
                 // pumps its message loop, and the warm-up needs it to finish
                 // launching those processes.
-                for _ in 0..150 {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(16))
-                        .await;
-                    builtin_plugin_editor::pump();
+                if !boot::has_flag("--disable-cef-warmup")
+                    && std::env::var_os("FUTUREBOARD_DISABLE_CEF_WARMUP").is_none()
+                {
+                    for _ in 0..150 {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(16))
+                            .await;
+                        builtin_plugin_editor::pump();
+                    }
+                    boot::log("builtin plugin editor warm-up pump finished");
+                } else {
+                    boot::log("builtin plugin editor warm-up pump skipped");
                 }
-                boot::log("builtin plugin editor warm-up pump finished");
             }
             Err(err) => boot::log(&format!("builtin plugin editor host unavailable: {err}")),
         }
     })
     .detach();
+
+    // Windows CEF initialization and CreateBrowserSync both run on the
+    // browser-process UI thread. Keep them out of the native app's boot path;
+    // the first built-in editor initializes CEF lazily after the Studio shell
+    // is already usable. This also removes the fixed 2.4 s boot-time message
+    // pump that existed solely for the hidden warm-up browser.
+    #[cfg(all(feature = "builtin-plugin-editor", target_os = "windows"))]
+    {
+        if boot::has_flag("--disable-cef") {
+            boot::log("CEF startup skipped by --disable-cef");
+        } else if boot::has_flag("--disable-cef-warmup") {
+            boot::log("CEF startup deferred; --disable-cef-warmup is active");
+        } else {
+            boot::log("CEF startup deferred until a built-in editor is requested");
+        }
+    }
 
     // macOS initialization and browser creation happened synchronously above
     // at the proven AppKit lifecycle point. Drive the warm-up after this App
@@ -157,13 +183,20 @@ pub fn setup(cx: &mut App) {
     #[cfg(all(feature = "builtin-plugin-editor", target_os = "macos"))]
     cx.spawn(async move |cx| {
         use sphere_ui_components::components::builtin_plugin_editor;
-        for _ in 0..150 {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(16))
-                .await;
-            builtin_plugin_editor::pump();
+        if !boot::has_flag("--disable-cef")
+            && !boot::has_flag("--disable-cef-warmup")
+            && std::env::var_os("FUTUREBOARD_DISABLE_CEF_WARMUP").is_none()
+        {
+            for _ in 0..150 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                builtin_plugin_editor::pump();
+            }
+            boot::log("builtin plugin editor warm-up pump finished");
+        } else {
+            boot::log("builtin plugin editor warm-up pump skipped");
         }
-        boot::log("builtin plugin editor warm-up pump finished");
     })
     .detach();
 
@@ -767,7 +800,8 @@ fn open_welcome_window(cx: &mut App) {
         },
     };
     let welcome_options = welcome_window_options(cx);
-    match cx.open_window(welcome_options, |_window, cx| {
+    match cx.open_window(welcome_options, |window, cx| {
+        window.on_next_frame(|_window, _cx| boot::complete_startup());
         cx.new(|cx| WelcomeWindow::new(callbacks, cx.focus_handle()))
     }) {
         Ok(handle) => {
@@ -1222,7 +1256,10 @@ fn open_studio_workspace(init: WorkspaceInit, cx: &mut App) -> Result<(), String
     // has painted — `activate_window` applies the stored initial placement and shows
     // the window with real content instead of a black flash.
     let _ = studio.update(cx, |_layout, window, _cx| {
-        window.on_next_frame(|window, _cx| window.activate_window());
+        window.on_next_frame(|window, _cx| {
+            boot::complete_startup();
+            window.activate_window();
+        });
     });
 
     boot::log("workspace entered");

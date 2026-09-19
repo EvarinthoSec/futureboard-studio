@@ -1091,6 +1091,9 @@ mod imp {
     }
 
     pub fn availability(plugin_id: &str) -> HostAvailability {
+        if crate::boot::has_flag("--disable-cef") {
+            return HostAvailability::RuntimeFailed("CEF is disabled by --disable-cef".to_owned());
+        }
         let Some(origin) = origin_for_plugin_id(plugin_id) else {
             return HostAvailability::NoEditorForPlugin(plugin_id.to_string());
         };
@@ -1125,6 +1128,11 @@ mod imp {
     fn ensure_runtime(slot: &mut Option<Host>) -> Result<(), HostAvailability> {
         if slot.is_some() {
             return Ok(());
+        }
+        if crate::boot::has_flag("--disable-cef") {
+            return Err(HostAvailability::RuntimeFailed(
+                "CEF is disabled by --disable-cef".to_owned(),
+            ));
         }
         if let Some(error) = RUNTIME_FAILURE.with(|failure| failure.borrow().clone()) {
             return Err(HostAvailability::RuntimeFailed(error));
@@ -1263,6 +1271,13 @@ mod imp {
     /// processes while the loading screen is still up — with no editor window
     /// open nothing else pumps CEF.
     pub fn preload() {
+        if crate::boot::has_flag("--disable-cef")
+            || crate::boot::has_flag("--disable-cef-warmup")
+            || std::env::var_os("FUTUREBOARD_DISABLE_CEF_WARMUP").is_some()
+        {
+            crate::boot::log("CEF warm-up skipped by runtime flag");
+            return;
+        }
         HOST.with(|cell| {
             let mut slot = cell.borrow_mut();
             if ensure_runtime(&mut slot).is_ok() {
@@ -1379,6 +1394,15 @@ mod imp {
         // supplied anyway is used only for monitor info and dialog ownership.
         WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
             .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
+
+        let accelerated_sink = if crate::boot::has_flag("--disable-shared-texture")
+            || std::env::var_os("FUTUREBOARD_DISABLE_SHARED_TEXTURE").is_some()
+        {
+            crate::boot::log("[GPU] shared-texture path disabled; using software OSR paint");
+            None
+        } else {
+            accelerated_sink
+        };
 
         COMMANDS.with(|commands| {
             let mut commands = commands.borrow_mut();

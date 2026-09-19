@@ -14,6 +14,10 @@ use sphere_ui_components::boot;
 use sphere_ui_components::embedded_assets::EmbeddedAssets;
 
 fn main() {
+    // A file-backed logger and startup marker must exist before CEF dispatch,
+    // DirectX device creation, settings I/O, or any window construction.
+    boot::init_process();
+
     // ── Phase -1 — CEF process dispatch ───────────────────────────────────────
     // CEF re-launches THIS executable for its own helper processes (renderer,
     // GPU, utility). Those launches must be detected and serviced before any
@@ -136,6 +140,9 @@ fn main() {
     }
 
     boot::log("process setup done");
+    boot::log(
+        "Initialize Win32/GPUI platform; Windows D3D11 device creation follows synchronously",
+    );
     let application = application().with_assets(EmbeddedAssets::new());
     // macOS hands a `fbrd://` link to the running app as an Apple event; the
     // shell drains this queue on the UI thread. Windows and Linux never call
@@ -168,6 +175,7 @@ fn dispatch_cef_process() {
     };
     match sphere_webview::runtime::execute_subprocess(Some(&mut scheme_app)) {
         Ok(ProcessDispatch::SubprocessExit(code)) => {
+            boot::log(&format!("CEF subprocess dispatch complete code={code}"));
             eprintln!(
                 "[cef-process] subprocess_exit pid={} code={} before_futureboard_startup=true",
                 std::process::id(),
@@ -176,6 +184,11 @@ fn dispatch_cef_process() {
             std::process::exit(code);
         }
         Ok(ProcessDispatch::BrowserProcess) => {
+            boot::log("CEF execute_process returned browser process");
+            if boot::has_flag("--disable-cef") {
+                boot::log("CEF disabled by --disable-cef; native application remains available");
+                return;
+            }
             #[cfg(target_os = "macos")]
             if let Err(error) = gpui_macos::configure_cef_application() {
                 eprintln!(

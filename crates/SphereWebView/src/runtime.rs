@@ -97,6 +97,12 @@ pub fn ensure_api_version() {
             cef::sys::CEF_API_VERSION_LAST,
             !hash.is_null()
         );
+        log::info!(
+            "process API version={} api_version_last={} api_hash_available={}",
+            cef::api_version(),
+            cef::sys::CEF_API_VERSION_LAST,
+            !hash.is_null()
+        );
     });
 }
 
@@ -107,18 +113,34 @@ pub fn ensure_api_version() {
 /// unambiguous whether a helper escaped into normal application startup.
 pub fn log_process_entry() {
     match ProcessIdentity::current() {
-        Ok(identity) => eprintln!(
-            "[cef-process] entry pid={} executable={} type={:?} utility_sub_type={:?} argument_count={}",
-            std::process::id(),
-            identity.executable.display(),
-            identity.process_type.as_deref().unwrap_or("<browser>"),
-            identity.utility_sub_type.as_deref().unwrap_or("<none>"),
-            identity.argument_count,
-        ),
-        Err(error) => eprintln!(
-            "[cef-process] entry pid={} executable=<unresolved> error={error}",
-            std::process::id()
-        ),
+        Ok(identity) => {
+            eprintln!(
+                "[cef-process] entry pid={} executable={} type={:?} utility_sub_type={:?} argument_count={}",
+                std::process::id(),
+                identity.executable.display(),
+                identity.process_type.as_deref().unwrap_or("<browser>"),
+                identity.utility_sub_type.as_deref().unwrap_or("<none>"),
+                identity.argument_count,
+            );
+            log::info!(
+                "process entry pid={} executable={} type={:?} utility_sub_type={:?} argument_count={}",
+                std::process::id(),
+                identity.executable.display(),
+                identity.process_type.as_deref().unwrap_or("<browser>"),
+                identity.utility_sub_type.as_deref().unwrap_or("<none>"),
+                identity.argument_count,
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[cef-process] entry pid={} executable=<unresolved> error={error}",
+                std::process::id()
+            );
+            log::error!(
+                "process entry pid={} executable unresolved: {error}",
+                std::process::id()
+            );
+        }
     }
 }
 
@@ -373,6 +395,18 @@ impl CefRuntime {
             config.remote_debugging_port.unwrap_or(0),
             thread::current().id(),
         );
+        log::info!(
+            "initialize begin executable={} process_type={:?} subprocess_model={} windowless={} remote_debugging_port={} thread={:?}",
+            identity.executable.display(),
+            identity.process_type.as_deref().unwrap_or("<browser>"),
+            match &config.browser_subprocess {
+                BrowserSubprocess::CurrentExecutable => "integrated",
+                BrowserSubprocess::SeparateExecutable(_) => "separate",
+            },
+            config.windowless_rendering,
+            config.remote_debugging_port.unwrap_or(0),
+            thread::current().id(),
+        );
         let settings = build_settings(
             &config,
             browser_subprocess_path,
@@ -389,11 +423,16 @@ impl CefRuntime {
         ) != 1
         {
             eprintln!("[cef-runtime] initialize result=false");
+            log::error!("initialize failed: cef_initialize returned false");
             return Err(CefRuntimeError::InitializeFailed);
         }
         log_local_ui_runtime_summary();
         eprintln!(
             "[cef-runtime] initialize result=true owner_thread={:?}",
+            thread::current().id()
+        );
+        log::info!(
+            "initialize result=true owner_thread={:?}",
             thread::current().id()
         );
 
@@ -465,6 +504,15 @@ impl CefRuntime {
                 accelerated,
                 std::thread::current().id()
             );
+            log::info!(
+                "CreateBrowserSync begin url={:?} parent={:?} bounds={:?} render_mode={:?} accelerated={} thread={:?}",
+                config.url,
+                parent.as_raw(),
+                config.bounds,
+                config.render_mode,
+                accelerated,
+                std::thread::current().id()
+            );
         }
         let browser_settings = cef::BrowserSettings {
             // A transparent windowless surface would composite the timeline
@@ -492,11 +540,22 @@ impl CefRuntime {
                 config.url,
                 std::thread::current().id()
             );
+            log::error!(
+                "CreateBrowserSync failed url={:?} render_mode={:?} accelerated={accelerated}",
+                config.url,
+                config.render_mode
+            );
             return Err(CefRuntimeError::CreateBrowserFailed);
         };
         if crate::scheme::cef_diagnostics_enabled() {
             eprintln!(
                 "[cef-lifecycle] event=CreateBrowserSync result=true browser_id={} url={:?} thread={:?}",
+                browser.identifier(),
+                config.url,
+                std::thread::current().id()
+            );
+            log::info!(
+                "CreateBrowserSync result=true browser_id={} url={:?} thread={:?}",
                 browser.identifier(),
                 config.url,
                 std::thread::current().id()

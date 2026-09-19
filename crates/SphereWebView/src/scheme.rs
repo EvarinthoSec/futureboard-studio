@@ -46,6 +46,18 @@ pub const PLUGIN_SCHEME: &str = "mikoplugin";
 /// ephemeral CEF renderer. The CEF API expects switch names without `--`.
 pub const MACOS_CEF_USE_MOCK_KEYCHAIN: &str = "use-mock-keychain";
 const CEF_DISABLE_PINCH: &str = "disable-pinch";
+const CEF_DISABLE_GPU: &str = "disable-gpu";
+
+fn runtime_flag_enabled(flag: &str) -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(flag))
+}
+
+fn cef_gpu_disabled() -> bool {
+    runtime_flag_enabled("--disable-cef-gpu")
+        || std::env::var_os("FUTUREBOARD_DISABLE_CEF_GPU").is_some()
+}
 
 fn local_ui_command_line_switches(target_os: &str) -> &'static [&'static str] {
     const COMMON: &[&str] = &[CEF_DISABLE_PINCH];
@@ -115,7 +127,10 @@ impl Drop for ObjectLifetimeInner {
 }
 
 pub(crate) fn cef_diagnostics_enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some()
+    cfg!(debug_assertions)
+        || std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some()
+        || std::env::var_os("FUTUREBOARD_GPU_DIAGNOSTICS").is_some()
+        || runtime_flag_enabled("--gpu-diagnostics")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +263,13 @@ wrap_app! {
                 // zoom must never resize their document.
                 for switch in local_ui_command_line_switches(std::env::consts::OS) {
                     command_line.append_switch(Some(&CefString::from(*switch)));
+                }
+                if cef_gpu_disabled() {
+                    // `disable-gpu` is Chromium's supported command-line
+                    // switch; CEF forwards it through this app callback for
+                    // both browser and child processes.
+                    command_line.append_switch(Some(&CefString::from(CEF_DISABLE_GPU)));
+                    log::info!("CEF GPU acceleration disabled by diagnostic/safe graphics mode");
                 }
             }
         }

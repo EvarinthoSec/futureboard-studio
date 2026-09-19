@@ -509,7 +509,13 @@ impl OsrSurface {
         if buffer.is_null() || width <= 0 || height <= 0 {
             return;
         }
-        self.0.software_paints.fetch_add(1, Ordering::Relaxed);
+        let previous = self.0.software_paints.fetch_add(1, Ordering::Relaxed);
+        if previous == 0 && crate::scheme::cef_diagnostics_enabled() {
+            log::info!(
+                "event=first_OnPaint mode=software element={element:?} width={width} height={height} thread={:?}",
+                std::thread::current().id()
+            );
+        }
         let Ok(mut state) = self.0.state.lock() else {
             return;
         };
@@ -576,7 +582,7 @@ impl OsrSurface {
         dirty_rects: &[Rect],
         info: Option<&AcceleratedPaintInfo>,
     ) {
-        self.0.accelerated_paints.fetch_add(1, Ordering::Relaxed);
+        let previous = self.0.accelerated_paints.fetch_add(1, Ordering::Relaxed);
         let (Some(sink), Some(info)) = (&self.0.accelerated_sink, info) else {
             return;
         };
@@ -587,6 +593,21 @@ impl OsrSurface {
         } else {
             (0, 0, coded.width, coded.height)
         };
+        if previous == 0 && crate::scheme::cef_diagnostics_enabled() {
+            log::info!(
+                "event=first_OnAcceleratedPaint element={element:?} handle_type={} dimensions={}x{} visible_rect=({}, {}) thread={:?}",
+                if info.shared_texture_handle.is_null() {
+                    "none"
+                } else {
+                    "shared"
+                },
+                width,
+                height,
+                source_x,
+                source_y,
+                std::thread::current().id()
+            );
+        }
         let (dirty_rect_count, dirty_pixels) = dirty_rect_coverage(dirty_rects, width, height);
         let frame = OsrAcceleratedFrame {
             plane: if element == PaintElementType::POPUP {
@@ -617,6 +638,9 @@ impl OsrSurface {
                     .swap(true, Ordering::AcqRel)
                 {
                     eprintln!("[cef-osr] accelerated texture copy failed: {error}");
+                    log::error!(
+                        "accelerated texture copy failed; software fallback requested: {error:#}"
+                    );
                 }
             }
         }
