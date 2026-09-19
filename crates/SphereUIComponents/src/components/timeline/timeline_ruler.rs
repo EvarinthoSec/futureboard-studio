@@ -101,15 +101,19 @@ pub struct TimelineLoopDrag {
 /// place they could not.
 ///
 /// Dragging the playhead is the ruler's primary gesture, so it is now the
-/// unmodified one, everywhere along the bar. Moving the loop is the deliberate,
-/// occasional one, so it takes a modifier: **Alt-drag**, on the loop's body to
-/// slide it or within [`LOOP_EDGE_GRAB_PX`] of an end to stretch it.
+/// unmodified one everywhere along the bar *except* within [`LOOP_EDGE_GRAB_PX`]
+/// of a loop end: those brace edges stay direct resize handles, the way every
+/// DAW does it, so the most common loop edit needs no modifier. Sliding the
+/// whole loop, or resizing from its body, is the deliberate, occasional one, so
+/// it takes a modifier: **Alt-drag**, on the loop's body to slide it or within
+/// [`LOOP_EDGE_GRAB_PX`] of an end to stretch it.
 ///
 /// Deciding this once at mouse-down, rather than letting two `on_drag` sources
 /// race, is what makes the rule hold: the loop overlay is now painted only, and
 /// a press it does not claim reaches the ruler underneath untouched.
-#[derive(Clone, Copy, Debug)]
-enum RulerGesture {
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RulerGesture {
+    #[default]
     Scrub,
     /// Sliding or stretching the loop that is already there.
     Loop(TimelineLoopDrag),
@@ -121,9 +125,7 @@ enum RulerGesture {
     /// works on one strip of the ruler and nowhere else is one the hand never
     /// learns. Now Alt-drag always means the loop — over it, move it; anywhere
     /// else, draw a new one.
-    LoopCreate {
-        anchor_beat: f32,
-    },
+    LoopCreate { anchor_beat: f32 },
 }
 
 /// How near an end of the loop counts as grabbing that end rather than the body.
@@ -279,6 +281,7 @@ pub fn timeline_ruler(
     on_playhead_scrub_end: Option<
         std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>,
     >,
+    gesture_kind: std::rc::Rc<std::cell::Cell<RulerGesture>>,
     origin_probe: LaneOriginProbe,
 ) -> impl IntoElement {
     let _s = crate::perf::PerfScope::enter("TimelineRuler");
@@ -324,8 +327,11 @@ pub fn timeline_ruler(
         (start, end, state.beats_to_x(start), state.beats_to_x(end))
     });
     // What the press in flight is doing. Set once at mouse-down and read by the
-    // one drag handler; see `RulerGesture`.
-    let gesture_kind = std::rc::Rc::new(std::cell::Cell::new(RulerGesture::Scrub));
+    // one drag handler; see `RulerGesture`. Owned by the `Timeline` component so
+    // it survives the re-render that GPUI's drag-arming triggers between the
+    // mouse-down that classifies the press and the first drag-move that acts on
+    // it — a per-frame `Cell` would be reset to `Scrub` in that gap, which is
+    // why loop edits silently fell through to scrubbing.
     let gesture_down = gesture_kind.clone();
     let gesture_move = gesture_kind.clone();
     let gesture_up = gesture_kind.clone();
@@ -550,6 +556,35 @@ pub fn timeline_ruler(
                             }));
                             // Alt-pressing the ruler must not also move the
                             // playhead: the press belongs to the loop now.
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        // Unmodified, the loop's END HANDLES are still direct
+                        // grab targets: dragging a brace edge resizes the loop
+                        // the way every DAW does, no modifier to learn. A press
+                        // on the loop *body* (or empty ruler) still scrubs, so
+                        // dropping the playhead anywhere — including inside the
+                        // loop — keeps working. Only the edges are claimed here;
+                        // the body falls through to the scrub below.
+                        let edge_grab = loop_span.and_then(|(start, end, left_x, right_x)| {
+                            loop_grab_mode(click_x, left_x, right_x).and_then(|mode| {
+                                matches!(
+                                    mode,
+                                    TimelineRegionDragMode::Start | TimelineRegionDragMode::End
+                                )
+                                .then_some(RulerGesture::Loop(
+                                    TimelineLoopDrag {
+                                        mode,
+                                        start_beat: start,
+                                        end_beat: end,
+                                        pointer_offset_x: click_x - left_x,
+                                    },
+                                ))
+                            })
+                        });
+                        if let Some(grab) = edge_grab {
+                            gesture_down.set(grab);
                             window.prevent_default();
                             cx.stop_propagation();
                             return;

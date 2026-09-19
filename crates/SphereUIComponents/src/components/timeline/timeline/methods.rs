@@ -227,6 +227,7 @@ impl Timeline {
             on_open_song_text_editor: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ruler_gesture: std::rc::Rc::new(std::cell::Cell::new(Default::default())),
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 crate::components::timeline::playhead::PlayheadFrame::default(),
             )),
@@ -296,6 +297,7 @@ impl Timeline {
             on_open_song_text_editor: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ruler_gesture: std::rc::Rc::new(std::cell::Cell::new(Default::default())),
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 crate::components::timeline::playhead::PlayheadFrame::default(),
             )),

@@ -264,6 +264,12 @@ pub struct Timeline {
     /// then resolves through the same origin the pixels were drawn at, instead
     /// of through chrome constants that go stale whenever a panel moves.
     lane_origin_probe: LaneOriginProbe,
+    /// The ruler press in flight (scrub / loop edit / loop create). Owned here,
+    /// not rebuilt per render, so the classification made at mouse-down survives
+    /// the re-render GPUI triggers before the first drag-move — see
+    /// [`timeline_ruler`] and `RulerGesture`.
+    ruler_gesture:
+        std::rc::Rc<std::cell::Cell<crate::components::timeline::timeline_ruler::RulerGesture>>,
     /// Where the playhead is this frame. Written by `render` (which is the only
     /// place that knows the current scroll and zoom) and by the playback poll
     /// between renders; read by the overlay entity below.

@@ -2423,6 +2423,7 @@ impl Render for Timeline {
                 on_ruler_context.clone(),
                 on_playhead_scrub_begin,
                 on_playhead_scrub_end,
+                self.ruler_gesture.clone(),
                 self.lane_origin_probe.clone(),
             ))
             // 1b. Conductor lanes, in `visible_global_lanes()` order: structure
