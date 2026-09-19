@@ -13,7 +13,6 @@
 
 use gpui::Context;
 
-use crate::components::BottomPanelState;
 use crate::layout::studio_state::RightDockTab;
 use crate::workspace_layout::{
     load_or_default_workspace_layout, save_workspace_layout as persist_to_disk,
@@ -72,8 +71,8 @@ fn right_dock_tab_from_saved(tab: SavedRightDockTab) -> RightDockTab {
 impl StudioLayout {
     /// Snapshot the current layout state into a `SavedWorkspaceLayout`.
     ///
-    /// Pure — no I/O, no `cx.notify()`. Call this from the shutdown path.
-    pub fn capture_workspace_layout(&self, cx: &gpui::App) -> SavedWorkspaceLayout {
+    /// Pure — no `cx.notify()`. Call this from the shutdown path.
+    pub fn capture_workspace_layout(&self, cx: &mut gpui::App) -> SavedWorkspaceLayout {
         let panels = SavedPanelVisibility {
             browser: self.panels.browser,
             inspector: self.panels.inspector,
@@ -108,7 +107,7 @@ impl StudioLayout {
     /// Collect open secondary window bounds.
     fn capture_secondary_window_bounds(
         &self,
-        cx: &gpui::App,
+        cx: &mut gpui::App,
     ) -> crate::workspace_layout::SavedSecondaryWindows {
         use crate::workspace_layout::{SavedSecondaryWindows, SavedWindowBounds};
 
@@ -118,11 +117,8 @@ impl StudioLayout {
             .as_ref()
             .and_then(|handle| {
                 handle
-                    .update_in(cx, |_, window, _| {
-                        Some(SavedWindowBounds::from_gpui(window.bounds()))
-                    })
+                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
                     .ok()
-                    .flatten()
             });
 
         let big_clock_bounds = self
@@ -131,11 +127,8 @@ impl StudioLayout {
             .as_ref()
             .and_then(|handle| {
                 handle
-                    .update_in(cx, |_, window, _| {
-                        Some(SavedWindowBounds::from_gpui(window.bounds()))
-                    })
+                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
                     .ok()
-                    .flatten()
             });
 
         let timecode_bounds = self
@@ -144,11 +137,8 @@ impl StudioLayout {
             .as_ref()
             .and_then(|handle| {
                 handle
-                    .update_in(cx, |_, window, _| {
-                        Some(SavedWindowBounds::from_gpui(window.bounds()))
-                    })
+                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
                     .ok()
-                    .flatten()
             });
 
         SavedSecondaryWindows {
@@ -161,7 +151,7 @@ impl StudioLayout {
     /// Capture and write the workspace layout to disk.
     ///
     /// Called at shutdown (project close + app quit). Non-fatal on I/O error.
-    pub fn save_workspace_layout(&self, cx: &gpui::App) {
+    pub fn save_workspace_layout(&self, cx: &mut gpui::App) {
         let layout = self.capture_workspace_layout(cx);
         persist_to_disk(&layout);
     }
