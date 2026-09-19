@@ -111,8 +111,9 @@ pub struct TimelineLoopDrag {
 /// Deciding this once at mouse-down, rather than letting two `on_drag` sources
 /// race, is what makes the rule hold: the loop overlay is now painted only, and
 /// a press it does not claim reaches the ruler underneath untouched.
-#[derive(Clone, Copy, Debug)]
-enum RulerGesture {
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RulerGesture {
+    #[default]
     Scrub,
     /// Sliding or stretching the loop that is already there.
     Loop(TimelineLoopDrag),
@@ -124,9 +125,7 @@ enum RulerGesture {
     /// works on one strip of the ruler and nowhere else is one the hand never
     /// learns. Now Alt-drag always means the loop — over it, move it; anywhere
     /// else, draw a new one.
-    LoopCreate {
-        anchor_beat: f32,
-    },
+    LoopCreate { anchor_beat: f32 },
 }
 
 /// How near an end of the loop counts as grabbing that end rather than the body.
@@ -282,6 +281,7 @@ pub fn timeline_ruler(
     on_playhead_scrub_end: Option<
         std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>,
     >,
+    gesture_kind: std::rc::Rc<std::cell::Cell<RulerGesture>>,
     origin_probe: LaneOriginProbe,
 ) -> impl IntoElement {
     let _s = crate::perf::PerfScope::enter("TimelineRuler");
@@ -327,8 +327,11 @@ pub fn timeline_ruler(
         (start, end, state.beats_to_x(start), state.beats_to_x(end))
     });
     // What the press in flight is doing. Set once at mouse-down and read by the
-    // one drag handler; see `RulerGesture`.
-    let gesture_kind = std::rc::Rc::new(std::cell::Cell::new(RulerGesture::Scrub));
+    // one drag handler; see `RulerGesture`. Owned by the `Timeline` component so
+    // it survives the re-render that GPUI's drag-arming triggers between the
+    // mouse-down that classifies the press and the first drag-move that acts on
+    // it — a per-frame `Cell` would be reset to `Scrub` in that gap, which is
+    // why loop edits silently fell through to scrubbing.
     let gesture_down = gesture_kind.clone();
     let gesture_move = gesture_kind.clone();
     let gesture_up = gesture_kind.clone();
