@@ -80,6 +80,8 @@ pub mod icons {
     pub const HARD_DRIVE: &str =
         include_str!("../../../packages/shared/lucide/icons/hard-drive.svg");
     pub const MUSIC: &str = include_str!("../../../packages/shared/lucide/icons/music.svg");
+    pub const KEYBOARD: &str =
+        include_str!("../../../packages/shared/lucide/icons/keyboard-music.svg");
     pub const GIT_MERGE: &str = include_str!("../../../packages/shared/lucide/icons/git-merge.svg");
     pub const GIT_FORK: &str = include_str!("../../../packages/shared/lucide/icons/git-fork.svg");
     pub const CORNER_DOWN_LEFT: &str =
@@ -157,6 +159,7 @@ pub const ICON_MEMORY_STICK_PATH: &str = "icons/memory-stick.svg";
 pub const ICON_AUDIO_LINES_PATH: &str = "icons/audio-lines.svg";
 pub const ICON_HARD_DRIVE_PATH: &str = "icons/hard-drive.svg";
 pub const ICON_MUSIC_PATH: &str = "icons/music.svg";
+pub const ICON_KEYBOARD_PATH: &str = "icons/keyboard-music.svg";
 pub const ICON_LAYERS_PATH: &str = "icons/layers.svg";
 pub const ICON_PALETTE_PATH: &str = "icons/palette.svg";
 pub const ICON_MOVE_HORIZONTAL_PATH: &str = "icons/move-horizontal.svg";

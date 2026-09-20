@@ -79,7 +79,7 @@ impl PianoRoll {
             .collect()
     }
 
-    pub(super) fn build_draw_note_preview(&self) -> Option<gpui::AnyElement> {
+    pub(super) fn build_draw_note_preview(&self) -> Vec<gpui::AnyElement> {
         let PianoDrag::DrawNote {
             pitch,
             start_beat,
@@ -88,7 +88,7 @@ impl PianoRoll {
             ..
         } = &self.drag
         else {
-            return None;
+            return Vec::new();
         };
         let (lo, hi) = normalize_range(*start_beat, *end_beat);
         let minimum = if self.snap_on && !self.grid_res.is_free() && !*unsnap {
@@ -99,21 +99,26 @@ impl PianoRoll {
         let duration = (hi - lo).max(minimum);
         let x = self.clip_beat_to_x(lo);
         let w = (duration * self.ppb).max(3.0);
-        let y = self.pitch_to_y(*pitch);
         let h = self.note_row_h() - 2.0;
-        Some(
-            div()
-                .absolute()
-                .left(px(x))
-                .top(px(y + 1.0))
-                .w(px(w))
-                .h(px(h))
-                .rounded(px(crate::theme::radius::MICRO))
-                .bg(Colors::with_alpha(Colors::accent_primary(), 0.35))
-                .border(px(1.0))
-                .border_color(Colors::with_alpha(Colors::accent_primary(), 0.85))
-                .into_any_element(),
-        )
+        self.chord_draw_pitches(*pitch)
+            .into_iter()
+            .enumerate()
+            .map(|(index, chord_pitch)| {
+                let y = self.pitch_to_y(chord_pitch);
+                let alpha = if index == 0 { 0.35 } else { 0.22 };
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y + 1.0))
+                    .w(px(w))
+                    .h(px(h))
+                    .rounded(px(crate::theme::radius::MICRO))
+                    .bg(Colors::with_alpha(Colors::accent_primary(), alpha))
+                    .border(px(1.0))
+                    .border_color(Colors::with_alpha(Colors::accent_primary(), 0.85))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     pub(super) fn build_erase_overlay(&self) -> Option<gpui::AnyElement> {
@@ -606,8 +611,11 @@ impl PianoRoll {
                 .top(px(26.0))
                 .left_0()
                 .w(px(
-                    if menu == PianoSelectMenu::Grid || menu == PianoSelectMenu::Channel {
-                        160.0
+                    if menu == PianoSelectMenu::Grid
+                        || menu == PianoSelectMenu::Channel
+                        || menu == PianoSelectMenu::ScaleKind
+                    {
+                        168.0
                     } else {
                         148.0
                     },
@@ -1209,6 +1217,7 @@ impl PianoRoll {
                         .on_click(cx.listener(move |this, _ev, _w, cx| {
                             cx.stop_propagation();
                             this.pitch_ctx.scale.kind = kind;
+                            this.pitch_ctx.constrain = kind != ScaleKind::Chromatic;
                             this.open_select_menu = None;
                             cx.notify();
                         }))
@@ -1324,6 +1333,16 @@ impl PianoRoll {
                         self.pitch_ctx.scale.kind.label().to_string(),
                         scale_options,
                         cx,
+                    ))
+                    .child(tool_btn(
+                        "pr-chord-insert",
+                        self.chord_kind.label(),
+                        self.chord_kind != ChordInsertKind::Off,
+                        cx.listener(|this, _, _w, cx| {
+                            this.chord_kind = this.chord_kind.cycle();
+                            this.open_select_menu = None;
+                            cx.notify();
+                        }),
                     ))
                     .child(tool_btn(
                         "pr-scale-constrain",
@@ -1542,35 +1561,49 @@ impl PianoRoll {
         let row_h = self.note_row_h();
         let show_all_labels = row_h >= 14.0;
         let pressed_pitch = self.key_lane_pressed_pitch;
+        let scale = self.pitch_ctx.scale;
+        let scale_active = scale.kind != ScaleKind::Chromatic;
         let keys: Vec<_> = (first_pitch..=last_pitch)
             .map(|p| {
                 let y = self.pitch_to_y(p as u8);
                 let black = is_black(p);
                 let is_c = p.rem_euclid(12) == 0;
-                let pressed = pressed_pitch == Some(p as u8);
-                let label_color = if is_c {
+                let pitch = p as u8;
+                let pressed = pressed_pitch == Some(pitch);
+                let in_scale = !scale_active || scale.contains_pitch(pitch);
+                let is_root = scale_active && pitch % 12 == scale.root.pitch_class();
+                let label_color = if !in_scale {
+                    Colors::text_faint()
+                } else if is_root || is_c {
                     Colors::text_primary()
                 } else if black {
                     Colors::text_muted()
                 } else {
                     Colors::text_secondary()
                 };
-                let show_label = is_c || show_all_labels;
+                let show_label = is_c || is_root || show_all_labels;
+                let key_bg = if pressed {
+                    Colors::accent_primary()
+                } else if !in_scale {
+                    if black {
+                        Colors::with_alpha(Colors::surface_base(), 0.42)
+                    } else {
+                        Colors::with_alpha(Colors::surface_raised(), 0.38)
+                    }
+                } else if is_root {
+                    Colors::with_alpha(Colors::accent_primary(), if black { 0.32 } else { 0.16 })
+                } else if black {
+                    Colors::surface_base()
+                } else {
+                    Colors::surface_raised()
+                };
                 div()
                     .absolute()
                     .top(px(y))
                     .left_0()
                     .w_full()
                     .h(px(row_h))
-                    // Pressed/auditioned key reads with the accent fill (both black
-                    // and white keys); otherwise the usual black/white surface.
-                    .bg(if pressed {
-                        Colors::accent_primary()
-                    } else if black {
-                        Colors::surface_base()
-                    } else {
-                        Colors::surface_raised()
-                    })
+                    .bg(key_bg)
                     .border_b(px(1.0))
                     .border_color(Colors::border_subtle())
                     .flex()
@@ -1578,19 +1611,16 @@ impl PianoRoll {
                     .justify_end()
                     .pr(px(5.0))
                     .cursor(gpui::CursorStyle::PointingHand)
-                    // Mouse-down starts a key-lane scrub. The matching note-off /
-                    // state reset happens centrally in `on_up` (wired to both
-                    // mouse-up and mouse-up-out on the root), and drag tracking
-                    // happens in `on_move` — so no per-key up/move handlers here.
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
+                            let pitch = this.pitch_ctx.constrain_pitch(p as u8);
                             if midi_debug_enabled() {
-                                eprintln!("[PianoKeyPreview] down note={p}");
+                                eprintln!("[PianoKeyPreview] down note={pitch}");
                             }
                             this.piano_key_drag_active = true;
-                            this.key_lane_pressed_pitch = Some(p as u8);
-                            this.begin_preview_note(p as u8, 100, "piano_key_down", cx);
+                            this.key_lane_pressed_pitch = Some(pitch);
+                            this.begin_preview_note(pitch, 100, "piano_key_down", cx);
                             cx.notify();
                         }),
                     )
@@ -1909,7 +1939,7 @@ impl PianoRoll {
                             .children(notes_geo)
                             .children(quantize_preview)
                             .when_some(marquee_overlay, |el, overlay| el.child(overlay))
-                            .when_some(draw_preview, |el, overlay| el.child(overlay))
+                            .children(draw_preview)
                             .when_some(erase_overlay, |el, overlay| el.child(overlay))
                             .children(note_menu)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_grid_down))
@@ -2580,10 +2610,37 @@ impl PianoRoll {
         let mut out: Vec<gpui::AnyElement> = Vec::new();
 
         let row_h = self.note_row_h();
-        // ── Pitch row backgrounds: shade black-key rows, highlight C rows ──
+        let scale = self.pitch_ctx.scale;
+        let scale_active = scale.kind != ScaleKind::Chromatic;
+        // ── Pitch row backgrounds: shade black-key rows, highlight C / scale ──
         for p in first_pitch..=last_pitch {
             let y = self.pitch_to_y(p as u8);
-            if is_black(p) {
+            let pitch = p as u8;
+            let in_scale = !scale_active || scale.contains_pitch(pitch);
+            let is_root = scale_active && pitch % 12 == scale.root.pitch_class();
+            if !in_scale {
+                out.push(
+                    div()
+                        .absolute()
+                        .top(px(y))
+                        .left_0()
+                        .w(px(view_w))
+                        .h(px(row_h))
+                        .bg(Colors::with_alpha(Colors::surface_canvas(), 0.55))
+                        .into_any_element(),
+                );
+            } else if is_root {
+                out.push(
+                    div()
+                        .absolute()
+                        .top(px(y))
+                        .left_0()
+                        .w(px(view_w))
+                        .h(px(row_h))
+                        .bg(Colors::with_alpha(Colors::accent_primary(), 0.08))
+                        .into_any_element(),
+                );
+            } else if is_black(p) {
                 out.push(
                     div()
                         .absolute()

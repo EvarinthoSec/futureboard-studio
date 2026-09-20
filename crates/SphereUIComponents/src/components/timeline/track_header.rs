@@ -5,6 +5,7 @@ use gpui::{
 };
 
 use crate::assets;
+use crate::components::controls::fb_tooltip;
 use crate::components::fader::{db_value_pill, horizontal_fader_with_drag_callbacks};
 use crate::components::knob::format_pan_label;
 use crate::components::spin_drag::SpinDrag;
@@ -60,6 +61,9 @@ pub struct TrackHeaderCallbacks {
     pub on_select_take: TrackTakeCallback,
     /// Delete a take and the clip it holds: `(track_id, take_id)`.
     pub on_delete_take: TrackTakeCallback,
+    /// Open the track's instrument plugin editor, or the instrument picker when
+    /// the slot is empty. `None` hides the header button.
+    pub on_open_instrument: Option<TrackCallback>,
 }
 
 pub struct TrackDragPreview {
@@ -513,6 +517,75 @@ fn take_sublane(
     )
 }
 
+/// Compact instrument affordance on an Instrument track header.
+///
+/// Click opens the loaded plugin editor, Solfege dock, or Soundfont Player —
+/// or the instrument picker when the slot is still empty. Icon-only so the
+/// name row stays the track name, not a second plugin label.
+fn instrument_header_button(
+    track: &TrackState,
+    id_num: usize,
+    on_open: TrackCallback,
+) -> impl IntoElement {
+    let loaded = track.solfege.is_some()
+        || track.builtin_soundfont_player
+        || track
+            .instrument_insert()
+            .is_some_and(|slot| !slot.is_empty());
+    let tooltip = if track.solfege.is_some() {
+        "Solfege".to_string()
+    } else if track.builtin_soundfont_player {
+        "Soundfont Player".to_string()
+    } else if let Some(slot) = track.instrument_insert().filter(|slot| !slot.is_empty()) {
+        slot.display_name.clone()
+    } else {
+        "Instrument".to_string()
+    };
+    let rest = if loaded {
+        Colors::accent_muted()
+    } else {
+        Colors::button_bg()
+    };
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let fg = if loaded {
+        Colors::accent_primary()
+    } else {
+        Colors::text_muted()
+    };
+    let track_id = track.id.clone();
+
+    div()
+        .id(("track-instrument", id_num))
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(size::DENSE))
+        .h(px(size::DENSE))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(rest)
+        .border(px(1.0))
+        .border_color(if loaded {
+            Colors::with_alpha(Colors::accent_primary(), 0.45)
+        } else {
+            Colors::border_subtle()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .tooltip(fb_tooltip(tooltip))
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            on_open(&track_id, window, cx);
+        })
+        .child(
+            svg()
+                .path(assets::ICON_KEYBOARD_PATH)
+                .w(px(GLYPH_MD))
+                .h(px(GLYPH_MD))
+                .text_color(fg),
+        )
+}
+
 pub fn track_header(
     track: &TrackState,
     index: usize,
@@ -943,6 +1016,15 @@ pub fn track_header(
                                                 .child(track.name.clone()),
                                         ),
                                 ),
+                        )
+                        .when_some(
+                            callbacks
+                                .on_open_instrument
+                                .clone()
+                                .filter(|_| track.track_type == TrackType::Instrument),
+                            |row, on_open| {
+                                row.child(instrument_header_button(track, id_num, on_open))
+                            },
                         )
                         .child(latch_strip(
                             track,

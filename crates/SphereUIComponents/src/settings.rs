@@ -919,6 +919,17 @@ impl DropoutProtectionMode {
     ];
 }
 
+/// What Space does while the arrangement is focused and not typing into an input.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpacebarAction {
+    /// Start playback, or pause in place.
+    #[default]
+    PlayPause,
+    /// Start playback, or stop and return the playhead to where Play began.
+    PlayStop,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybackSettings {
     /// Align parallel track paths at the master bus (Phase W PDC).
@@ -927,6 +938,12 @@ pub struct PlaybackSettings {
     /// Realtime dropout protection mode.
     #[serde(default)]
     pub dropout_protection: DropoutProtectionMode,
+    /// Spacebar play/pause vs play/stop.
+    #[serde(default)]
+    pub spacebar_action: SpacebarAction,
+    /// When true, the Stop button returns the playhead to where Play began.
+    #[serde(default)]
+    pub return_playhead_on_stop: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -934,6 +951,8 @@ impl Default for PlaybackSettings {
         Self {
             latency_compensation: default_true(),
             dropout_protection: DropoutProtectionMode::default(),
+            spacebar_action: SpacebarAction::default(),
+            return_playhead_on_stop: false,
         }
     }
 }
@@ -1487,5 +1506,17 @@ mod text_rendering_settings_tests {
         }
         assert_eq!(TextRenderingBackend::Gdi.label(), "GDI+");
         assert_eq!(TextRenderingBackend::DirectWrite.as_token(), "directwrite");
+    }
+
+    #[test]
+    fn playback_transport_fields_default_when_missing() {
+        let parsed: PlaybackSettings =
+            serde_json::from_str(r#"{"latency_compensation":true}"#).expect("deserialize");
+        assert_eq!(parsed.spacebar_action, SpacebarAction::PlayPause);
+        assert!(!parsed.return_playhead_on_stop);
+        assert_eq!(
+            serde_json::to_string(&SpacebarAction::PlayStop).unwrap(),
+            "\"play-stop\""
+        );
     }
 }

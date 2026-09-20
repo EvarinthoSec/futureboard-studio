@@ -389,7 +389,7 @@ const components = [
   ["settings.section.playback-transport", "Playback > Transport"],
   ["settings.field.spacebar-action", "Spacebar Action"],
   ["settings.spacebar.play-pause", "Play / Pause"],
-  ["settings.spacebar.play-stop-soon", "Play / Stop (Soon)"],
+  ["settings.spacebar.play-stop-soon", "Play / Stop"],
   ["settings.field.return-to-start", "Return to Start"],
   ["settings.return-on-stop", "Return playhead to start position on Stop"],
   ["settings.section.rendering", "Rendering"],

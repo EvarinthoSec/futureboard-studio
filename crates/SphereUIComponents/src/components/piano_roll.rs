@@ -33,9 +33,9 @@ use crate::assets;
 use crate::components::edit::{normalize_range, EditCommand};
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
-    midi_debug_enabled, ArticulationId, MidiArticulationEvent, MidiChannel, MidiChannelMask,
-    MidiControllerKind, MidiControllerPoint, MidiNoteState, PitchCurve, PitchTransformContext,
-    ScaleKind, ScaleRoot, TimelineState, MIN_NOTE_BEATS,
+    midi_debug_enabled, ArticulationId, ChordInsertKind, MidiArticulationEvent, MidiChannel,
+    MidiChannelMask, MidiControllerKind, MidiControllerPoint, MidiNoteState, PitchCurve,
+    PitchTransformContext, ScaleKind, ScaleRoot, TimelineState, MIN_NOTE_BEATS,
 };
 use crate::theme::Colors;
 use sphere_midi_service::{NoteExpression, NoteExpressionLane};
@@ -1098,6 +1098,9 @@ pub struct PianoRoll {
     /// Scale/root + constrain toggle for scale-aware pitch editing. Off
     /// (`constrain: false`) preserves raw chromatic drag/draw behavior.
     pitch_ctx: PitchTransformContext,
+    /// Draw-tool chord stacking. Independent of Lock: a triad/7th still uses
+    /// the active scale even when chromatic dragging is allowed.
+    chord_kind: ChordInsertKind,
     /// Channel view/edit filter: `ALL` (default) renders and allows editing
     /// every note unchanged; narrowed to a single channel via the toolbar
     /// dropdown, notes on other channels are hidden (and therefore not
@@ -1337,6 +1340,7 @@ impl PianoRoll {
             focus: cx.focus_handle(),
             focus_lost_subscription: None,
             pitch_ctx: PitchTransformContext::default(),
+            chord_kind: ChordInsertKind::Off,
             channel_view: MidiChannelMask::ALL,
         }
     }
@@ -3782,7 +3786,8 @@ impl PianoRoll {
         // mouse-down — so handle it first and return.
         if self.piano_key_drag_active {
             match self.key_lane_pitch_at(event.position) {
-                Some(pitch) => {
+                Some(raw_pitch) => {
+                    let pitch = self.pitch_ctx.constrain_pitch(raw_pitch);
                     // Debounce: only (re)trigger when the pitch actually changes.
                     if self.key_lane_pressed_pitch != Some(pitch) {
                         if midi_debug_enabled() {
@@ -4117,11 +4122,28 @@ impl PianoRoll {
         // Do not clamp the note into the current clip length — a note drawn past
         // the clip end auto-expands the clip (see `CreateMidiNote::execute`).
         // `MidiNoteState::new` clamps start >= 0, pitch 0..=127, dur >= MIN.
-        let mut note = MidiNoteState::new(pitch, lo, duration, DEFAULT_NOTE_VELOCITY);
-        note.channel = channel;
-        let id = note.id;
-        self.run_edit_command(EditCommand::CreateMidiNote { clip_id, note }, cx);
-        self.selection = HashSet::from([id]);
+        let pitches = self.chord_draw_pitches(pitch);
+        let notes: Vec<MidiNoteState> = pitches
+            .into_iter()
+            .map(|chord_pitch| {
+                let mut chord_note =
+                    MidiNoteState::new(chord_pitch, lo, duration, DEFAULT_NOTE_VELOCITY);
+                chord_note.channel = channel;
+                chord_note
+            })
+            .collect();
+        let ids: HashSet<u64> = notes.iter().map(|n| n.id).collect();
+        match notes.len() {
+            0 => {}
+            1 => {
+                let note = notes.into_iter().next().expect("len 1");
+                self.run_edit_command(EditCommand::CreateMidiNote { clip_id, note }, cx);
+            }
+            _ => {
+                self.run_edit_command(EditCommand::CreateMidiNotes { clip_id, notes }, cx);
+            }
+        }
+        self.selection = ids;
         cx.notify();
     }
 
@@ -4538,11 +4560,31 @@ impl PianoRoll {
         });
     }
 
-    /// Snap the selected notes' pitches to the nearest note in the active
-    /// scale (independent of the live `constrain` toggle used for drag).
-    /// No-op when nothing is selected or the active scale is Chromatic.
+    /// Pitches the Draw tool will create for `root`. Chord mode stacks diatonic
+    /// thirds from the active scale; Lock still applies to a single-note draw.
+    fn chord_draw_pitches(&self, root: u8) -> Vec<u8> {
+        match self.chord_kind {
+            ChordInsertKind::Off => vec![self.pitch_ctx.constrain_pitch(root)],
+            kind => self.pitch_ctx.scale.chord_pitches(root, kind.voices()),
+        }
+    }
+
+    /// Snap selected notes (or every note in the clip when nothing is selected)
+    /// to the nearest pitch in the active scale. No-op for Chromatic.
     fn snap_selection_to_scale(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<u64> = self.selection.iter().copied().collect();
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        let mut ids: Vec<u64> = self.selection.iter().copied().collect();
+        if ids.is_empty() {
+            ids = self
+                .timeline
+                .read(cx)
+                .state
+                .midi_clip_notes(&clip_id)
+                .map(|notes| notes.iter().map(|n| n.id).collect())
+                .unwrap_or_default();
+        }
         if ids.is_empty() {
             return;
         }
