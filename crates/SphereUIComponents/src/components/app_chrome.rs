@@ -8,7 +8,8 @@ use gpui::{
 };
 
 use crate::assets;
-use crate::components::controls::fb_tooltip;
+use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
+use crate::keymap::accel_display;
 use crate::components::menu_bar;
 use crate::components::text_input::{
     text_field_with_callbacks, TextInputCallbacks, TextInputState,
@@ -86,6 +87,7 @@ fn chrome_action_button(
     toggled: Option<bool>,
     color: gpui::Rgba,
     action: ChromeActionCb,
+    shortcut: Option<String>,
 ) -> gpui::Stateful<gpui::Div> {
     let label = label.into();
     chrome_button(
@@ -119,6 +121,7 @@ fn chrome_action_button(
     .cursor(gpui::CursorStyle::PointingHand)
     .on_click(move |_, window, cx| action(&(), window, cx))
     .occlude()
+    .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
 }
 
 #[derive(Clone)]
@@ -681,6 +684,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
             Colors::text_secondary(),
             on_return,
+            None,
         ))
         .child(chrome_action_button(
             "transport-play",
@@ -689,6 +693,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.playing),
             play_color,
             on_play,
+            Some(accel_display("Space")),
         ))
         .child(chrome_action_button(
             "transport-stop",
@@ -697,6 +702,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
             Colors::text_secondary(),
             on_stop,
+            Some(accel_display("Shift+Space")),
         ))
         .child(chrome_action_button(
             "transport-record",
@@ -705,6 +711,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.recording),
             record_color,
             on_record,
+            Some(accel_display("R")),
         ));
 
     // Count-in split control: the label is a true on/off toggle, the chevron
@@ -816,6 +823,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.loop_enabled),
             loop_color,
             on_loop,
+            Some(accel_display("L")),
         ))
         .child(chrome_action_button(
             "transport-metronome",
@@ -824,6 +832,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.metronome_enabled),
             metronome_color,
             on_metronome,
+            Some(accel_display("K")),
         ))
         .child(
             chrome_action_button(
@@ -833,6 +842,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 Some(state.follow_playhead),
                 follow_color,
                 on_follow,
+                None,
             )
             .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
                 on_follow_mode(&(), window, cx);
@@ -1098,13 +1108,14 @@ fn panel_toggle_button(
     fallback: impl Into<gpui::SharedString>,
     active: bool,
     on_click: ChromeActionCb,
+    shortcut: Option<String>,
 ) -> impl IntoElement {
     let color = if active {
         Colors::accent_primary()
     } else {
         Colors::text_muted()
     };
-    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click)
+    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click, shortcut)
 }
 
 fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
@@ -1122,6 +1133,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.browser"),
             state.browser_visible,
             on_browser,
+            Some(crate::keymap::accel_display("Ctrl+1")),
         ))
         .child(panel_toggle_button(
             "panel-bottom-toggle",
@@ -1129,6 +1141,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.bottom"),
             state.bottom_panel_visible,
             on_bottom_panel,
+            Some(crate::keymap::accel_display("Ctrl+7")),
         ))
         .child(panel_toggle_button(
             "panel-inspector-toggle",
@@ -1136,38 +1149,20 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.inspector"),
             state.inspector_visible,
             on_inspector,
+            Some(crate::keymap::accel_display("Ctrl+2")),
         ))
 }
 
 #[allow(dead_code)]
-fn utility_buttons(i18n: I18n) -> impl IntoElement {
+fn utility_buttons(_i18n: I18n) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(2.0))
         .px(px(2.0))
-        // Import audio
-        .child(chrome_button(
-            Some(assets::ICON_FOLDER_PATH),
-            i18n.tr("chrome.import"),
-            false,
-            Colors::text_muted(),
-        ))
-        // Save
-        .child(chrome_button(
-            Some(assets::ICON_SAVE_PATH),
-            i18n.tr("chrome.save"),
-            false,
-            Colors::text_muted(),
-        ))
-        // Share
-        .child(chrome_button(
-            Some(assets::ICON_SHARE_PATH),
-            i18n.tr("chrome.share"),
-            false,
-            Colors::text_muted(),
-        ))
+        // Import audio, Save, Share - actions handled by menu commands
+        // Use menu bar or command palette for these instead
 }
 
 #[allow(dead_code)]

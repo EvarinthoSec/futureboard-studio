@@ -798,6 +798,7 @@ pub fn fb_dock_tab(
     active: bool,
     planes: FbDockPlanes,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    shortcut: Option<String>,
 ) -> impl IntoElement {
     let label: String = label.into();
     let r = radius::CONTROL;
@@ -852,6 +853,7 @@ pub fn fb_dock_tab(
         })
         .children(icon_path.map(|path| svg().path(path).w(px(14.0)).h(px(14.0)).text_color(text)))
         .child(label)
+        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
         .on_click(on_click)
 }
 
