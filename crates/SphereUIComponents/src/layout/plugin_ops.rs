@@ -3059,6 +3059,62 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// Track-header shortcut: open the instrument already on this track, or
+    /// the instrument picker when the slot is empty.
+    pub(super) fn open_track_instrument(
+        &mut self,
+        track_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::WorkspaceActivePanel;
+        use crate::components::timeline::timeline_state::TrackType;
+
+        let info = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(track_id)
+            .map(|track| {
+                (
+                    track.track_type,
+                    track.solfege.is_some(),
+                    track.builtin_soundfont_player,
+                    track
+                        .instrument_insert()
+                        .filter(|slot| !slot.is_empty())
+                        .map(|slot| slot.id.clone()),
+                )
+            });
+        let Some((track_type, has_solfege, has_soundfont, insert_id)) = info else {
+            return;
+        };
+        if track_type != TrackType::Instrument {
+            return;
+        }
+        if has_solfege {
+            self.panels.inspector = true;
+            self.set_active_panel(WorkspaceActivePanel::Solfege, cx);
+            cx.notify();
+            return;
+        }
+        if has_soundfont {
+            self.open_soundfont_player_window(Some(window.bounds()), track_id.to_string(), cx);
+            return;
+        }
+        if let Some(insert_id) = insert_id {
+            self.open_insert_editor(track_id, 0, &insert_id, window, cx);
+            return;
+        }
+        self.open_insert_picker_for(
+            track_id,
+            Some(0),
+            PluginInsertKind::Instrument,
+            Some(window),
+            cx,
+        );
+    }
+
     /// Apply a picked plugin: append an insert slot to the picker's target
     /// track and bind the chosen descriptor. `plugin_id` is a
     /// `RegistryPlugin.id` or [`STUB_PLUGIN_ID`]. Closes the picker. No audio

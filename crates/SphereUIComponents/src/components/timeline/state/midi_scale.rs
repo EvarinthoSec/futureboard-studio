@@ -193,6 +193,89 @@ impl MidiScale {
         }
         pitch
     }
+
+    /// Tertian chord built from `root`. `voices` is 1 (the root), 3 (triad) or
+    /// 4 (seventh). The root is snapped to the scale first; additional voices
+    /// stack diatonic thirds. Chromatic uses a major triad / major seventh so
+    /// chord drawing still produces a real chord without a scale selected.
+    pub fn chord_pitches(&self, root: u8, voices: usize) -> Vec<u8> {
+        let voices = voices.clamp(1, 4);
+        let root = self.nearest_pitch(root);
+        if voices == 1 {
+            return vec![root];
+        }
+        if self.kind == ScaleKind::Chromatic {
+            let intervals: &[u8] = if voices >= 4 {
+                &[0, 4, 7, 11]
+            } else {
+                &[0, 4, 7]
+            };
+            return intervals
+                .iter()
+                .filter_map(|interval| root.checked_add(*interval))
+                .filter(|pitch| *pitch <= 127)
+                .collect();
+        }
+        let mut pitches = Vec::with_capacity(voices);
+        let mut pitch = root;
+        pitches.push(pitch);
+        for _ in 1..voices {
+            let mut in_scale_steps = 0;
+            let mut next = None;
+            for candidate in (pitch + 1)..=127 {
+                if self.contains_pitch(candidate) {
+                    in_scale_steps += 1;
+                    if in_scale_steps == 2 {
+                        next = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            let Some(found) = next else {
+                break;
+            };
+            pitch = found;
+            pitches.push(pitch);
+        }
+        pitches
+    }
+}
+
+/// Chord stacked on Draw in the MIDI editor. `Off` keeps single-note drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ChordInsertKind {
+    #[default]
+    Off,
+    Triad,
+    Seventh,
+}
+
+impl ChordInsertKind {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Triad, Self::Seventh];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Chord",
+            Self::Triad => "Triad",
+            Self::Seventh => "7th",
+        }
+    }
+
+    pub fn voices(self) -> usize {
+        match self {
+            Self::Off => 1,
+            Self::Triad => 3,
+            Self::Seventh => 4,
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Triad,
+            Self::Triad => Self::Seventh,
+            Self::Seventh => Self::Off,
+        }
+    }
 }
 
 /// Runtime editor state wrapping a [`MidiScale`]: whether note-drag/draw
@@ -299,5 +382,27 @@ mod tests {
     fn root_and_kind_cycle_wrap_around() {
         assert_eq!(ScaleRoot::B.cycle(), ScaleRoot::C);
         assert_eq!(ScaleKind::Locrian.cycle(), ScaleKind::Chromatic);
+    }
+
+    #[test]
+    fn c_major_triad_stacks_diatonic_thirds() {
+        let scale = MidiScale::new(ScaleRoot::C, ScaleKind::Major);
+        assert_eq!(scale.chord_pitches(60, 3), vec![60, 64, 67]);
+        assert_eq!(scale.chord_pitches(62, 3), vec![62, 65, 69]);
+        assert_eq!(scale.chord_pitches(60, 4), vec![60, 64, 67, 71]);
+    }
+
+    #[test]
+    fn chord_from_out_of_scale_pitch_snaps_the_root() {
+        let scale = MidiScale::new(ScaleRoot::C, ScaleKind::Major);
+        // C#4 (61) snaps down to C4, then the C major triad.
+        assert_eq!(scale.chord_pitches(61, 3), vec![60, 64, 67]);
+    }
+
+    #[test]
+    fn chromatic_chord_is_a_major_triad() {
+        let scale = MidiScale::new(ScaleRoot::C, ScaleKind::Chromatic);
+        assert_eq!(scale.chord_pitches(60, 3), vec![60, 64, 67]);
+        assert_eq!(scale.chord_pitches(60, 4), vec![60, 64, 67, 71]);
     }
 }

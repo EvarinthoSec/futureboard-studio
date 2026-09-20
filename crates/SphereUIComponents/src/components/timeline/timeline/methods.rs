@@ -226,6 +226,7 @@ impl Timeline {
             on_open_editor: None,
             on_tempo_point_edit: None,
             on_open_song_text_editor: None,
+            on_open_track_instrument: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
             ruler_gesture: std::rc::Rc::new(std::cell::Cell::new(Default::default())),
@@ -297,6 +298,7 @@ impl Timeline {
             on_open_editor: None,
             on_tempo_point_edit: None,
             on_open_song_text_editor: None,
+            on_open_track_instrument: None,
             chrome_metrics: TimelineChromeMetrics::default(),
             lane_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
             ruler_gesture: std::rc::Rc::new(std::cell::Cell::new(Default::default())),
@@ -680,6 +682,13 @@ impl Timeline {
 
     pub fn set_open_song_text_editor_callback(&mut self, callback: Option<TimelineOpenEditorCb>) {
         self.on_open_song_text_editor = callback;
+    }
+
+    pub fn set_open_track_instrument_callback(
+        &mut self,
+        callback: Option<TimelineOpenTrackInstrumentCb>,
+    ) {
+        self.on_open_track_instrument = callback;
     }
 
     pub fn set_add_track_callback(&mut self, callback: Option<TimelineAddTrackCb>) {

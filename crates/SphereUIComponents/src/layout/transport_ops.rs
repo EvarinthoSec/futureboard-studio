@@ -200,7 +200,14 @@ impl StudioLayout {
                     .map(|stats| stats.transport_playing)
                     .unwrap_or(false);
                 if playing {
+                    let play_stop = matches!(
+                        self.settings.read(cx).current.playback.spacebar_action,
+                        crate::settings::SpacebarAction::PlayStop
+                    );
                     self.stop_native_playback(cx);
+                    if play_stop {
+                        self.return_playhead_to_playback_anchor(cx);
+                    }
                 } else {
                     self.start_native_playback(cx);
                 }
@@ -208,10 +215,21 @@ impl StudioLayout {
             TransportCommand::Stop => {
                 // Same call as Spacebar below: `stop_native_playback` is the one
                 // Stop, and it decides whether a take has to be finalized first.
-                if self.is_recording_active(cx) {
+                let recording = self.is_recording_active(cx);
+                if recording {
                     self.log_transport_debug("Stop", "stop_recording_and_stop_transport", cx);
                 }
                 self.stop_native_playback(cx);
+                if !recording
+                    && self
+                        .settings
+                        .read(cx)
+                        .current
+                        .playback
+                        .return_playhead_on_stop
+                {
+                    self.return_playhead_to_playback_anchor(cx);
+                }
             }
             TransportCommand::ReturnToStart => self.seek_native_playhead(cx, 0.0),
             TransportCommand::ToggleLoop => {

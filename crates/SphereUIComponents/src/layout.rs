@@ -1104,6 +1104,24 @@ impl StudioLayout {
         {
             let target = cx.entity().clone();
             let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_open_track_instrument_callback(Some(Arc::new(
+                    move |track_id, window, cx| {
+                        let track_id = track_id.clone();
+                        StudioLayout::defer_update_in_window(
+                            &target,
+                            window,
+                            cx,
+                            move |this, window, cx| {
+                                this.open_track_instrument(&track_id, window, cx);
+                            },
+                        );
+                    },
+                )));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
                 timeline.set_plugin_preset_drop_callback(Some(Arc::new(
                     move |(preset_path, track_id), window, cx| {
                         let preset_path = preset_path.clone();

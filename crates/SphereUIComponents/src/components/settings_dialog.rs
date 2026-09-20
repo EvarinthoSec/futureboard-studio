@@ -2018,52 +2018,94 @@ fn build_settings_content(
                 .into_any_element(),
         );
 
-        sections.push(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .child(settings_i18n_header(
-                    i18n,
-                    "settings.section.playback-transport",
-                    assets::ICON_PLAY_PATH,
-                ))
-                .child(settings_daw_row(
-                    i18n.tr("settings.field.spacebar-action"),
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(4.0))
-                        .child(fb_segmented_button(
-                            "space-play-pause",
-                            i18n.tr("settings.spacebar.play-pause"),
-                            true,
-                            |_e, _w, _cx| {},
-                        ))
-                        .child(fb_segmented_button(
-                            "space-play-stop",
-                            i18n.tr("settings.spacebar.play-stop-soon"),
-                            false,
-                            |_e, _w, _cx| {},
-                        )),
-                ))
-                .child(settings_daw_row(
-                    i18n.tr("settings.field.return-to-start"),
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(fb_checkbox("return-on-stop", true, |_e, _w, _cx| {}))
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(Colors::text_muted())
-                                .child(i18n.tr("settings.return-on-stop")),
-                        ),
-                ))
-                .into_any_element(),
-        );
+        {
+            use crate::settings::SpacebarAction;
+            let spacebar = schema.playback.spacebar_action;
+            let return_on_stop = schema.playback.return_playhead_on_stop;
+            let on_update = callbacks.on_update_setting.clone();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(settings_i18n_header(
+                        i18n,
+                        "settings.section.playback-transport",
+                        assets::ICON_PLAY_PATH,
+                    ))
+                    .child(settings_daw_row(
+                        i18n.tr("settings.field.spacebar-action"),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(4.0))
+                            .child({
+                                let on_update = on_update.clone();
+                                fb_segmented_button(
+                                    "space-play-pause",
+                                    i18n.tr("settings.spacebar.play-pause"),
+                                    spacebar == SpacebarAction::PlayPause,
+                                    move |_, w, cx| {
+                                        on_update(
+                                            Arc::new(|s: &mut crate::settings::SettingsSchema| {
+                                                s.playback.spacebar_action =
+                                                    SpacebarAction::PlayPause;
+                                            }),
+                                            w,
+                                            cx,
+                                        );
+                                    },
+                                )
+                            })
+                            .child({
+                                let on_update = on_update.clone();
+                                fb_segmented_button(
+                                    "space-play-stop",
+                                    i18n.tr("settings.spacebar.play-stop-soon"),
+                                    spacebar == SpacebarAction::PlayStop,
+                                    move |_, w, cx| {
+                                        on_update(
+                                            Arc::new(|s: &mut crate::settings::SettingsSchema| {
+                                                s.playback.spacebar_action =
+                                                    SpacebarAction::PlayStop;
+                                            }),
+                                            w,
+                                            cx,
+                                        );
+                                    },
+                                )
+                            }),
+                    ))
+                    .child(settings_daw_row(
+                        i18n.tr("settings.field.return-to-start"),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child({
+                                let on_update = on_update.clone();
+                                fb_checkbox("return-on-stop", return_on_stop, move |_, w, cx| {
+                                    on_update(
+                                        Arc::new(|s: &mut crate::settings::SettingsSchema| {
+                                            s.playback.return_playhead_on_stop =
+                                                !s.playback.return_playhead_on_stop;
+                                        }),
+                                        w,
+                                        cx,
+                                    );
+                                })
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(Colors::text_muted())
+                                    .child(i18n.tr("settings.return-on-stop")),
+                            ),
+                    ))
+                    .into_any_element(),
+            );
+        }
     }
 
     // Performance Panel — Renderer + GPU Device selection.

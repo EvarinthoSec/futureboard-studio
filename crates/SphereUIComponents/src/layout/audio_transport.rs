@@ -276,6 +276,9 @@ pub(crate) struct AudioBridgeState {
     /// Last failure text logged for a retry, so a device that stays missing
     /// reports once instead of once per attempt.
     pub stream_warm_last_error: Option<String>,
+    /// Playhead beat captured when the user last pressed Play. Play/Stop and
+    /// "return on Stop" seek back here rather than to bar 1.
+    pub playback_anchor_beats: Option<f32>,
 }
 
 impl Default for AudioBridgeState {
@@ -323,6 +326,7 @@ impl Default for AudioBridgeState {
             stream_warm_retry_at: None,
             stream_warm_backoff: None,
             stream_warm_last_error: None,
+            playback_anchor_beats: None,
         }
     }
 }
@@ -2183,6 +2187,15 @@ impl StudioLayout {
             return;
         }
 
+        self.audio_bridge.playback_anchor_beats = Some(
+            self.timeline
+                .read(cx)
+                .state
+                .transport
+                .playhead_beats
+                .max(0.0),
+        );
+
         transport_freeze_debug::log("before sync/dirty gates");
         if self.audio_bridge.sync_in_flight {
             self.audio_bridge.play_after_sync = true;
@@ -3667,6 +3680,11 @@ impl StudioLayout {
             timeline.state.transport.playing = false;
             cx.notify();
         });
+    }
+
+    pub(super) fn return_playhead_to_playback_anchor(&mut self, cx: &mut Context<Self>) {
+        let beat = self.audio_bridge.playback_anchor_beats.unwrap_or(0.0);
+        self.seek_native_playhead(cx, beat);
     }
 
     pub(super) fn set_playhead_scrub_active(&mut self, active: bool, _cx: &mut Context<Self>) {

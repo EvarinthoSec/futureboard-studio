@@ -1660,6 +1660,7 @@ impl Render for Timeline {
                     });
                 })
             },
+            on_open_instrument: self.on_open_track_instrument.clone(),
         };
 
         // Shared with the cached lane views, so the row geometry and the
