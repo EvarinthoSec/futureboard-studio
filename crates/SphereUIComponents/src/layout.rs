@@ -1294,6 +1294,29 @@ impl StudioLayout {
         layout.ensure_mixer_tree_defaults_once(cx);
         layout.ensure_mixer_tree_ui_hooks(cx.entity().clone(), cx);
         layout.refresh_mixer_tree_sidebar_entity(cx);
+        // Restore the persisted keyboard shortcut profile. `KeymapManager` starts
+        // on "default"; apply the saved id so a chosen keymap survives a restart.
+        // Done directly on the manager (not via `set_keymap_profile`) so the
+        // restore does not immediately re-persist what we just read. An unknown
+        // or already-default id is a no-op.
+        {
+            let saved_profile = layout
+                .settings
+                .read(cx)
+                .current
+                .general
+                .keymap_profile
+                .clone();
+            if saved_profile != layout.keymap_manager.active_profile_id() {
+                if let Err(error) = layout.keymap_manager.set_active_profile(&saved_profile) {
+                    if crate::keymap::shortcut_debug_enabled() {
+                        eprintln!(
+                            "[shortcut] saved profile id={saved_profile} unavailable: {error}"
+                        );
+                    }
+                }
+            }
+        }
         // Restore saved panel visibility, sizes, and tab selections.
         layout.load_and_restore_workspace_layout();
         // Audio-engine warm-up is preload, not mount work. The pre-studio
@@ -1458,14 +1481,22 @@ impl StudioLayout {
 
     /// Switch the active keyboard shortcut profile. `"default"` restores the
     /// bundled map; any other id loads `<app dir>/Keymaps/<id>.json`. A missing
-    /// or invalid profile file leaves the current map untouched. Returns the
+    /// or invalid profile file leaves the current map untouched. The chosen
+    /// profile is persisted to settings so it survives a restart. Returns the
     /// active profile id after the call.
-    pub fn set_keymap_profile(&mut self, id: &str) -> &str {
+    pub fn set_keymap_profile(&mut self, id: &str, cx: &mut Context<Self>) -> &str {
         if let Err(error) = self.keymap_manager.set_active_profile(id) {
             if crate::keymap::shortcut_debug_enabled() {
                 eprintln!("[shortcut] profile id={id} unavailable: {error}");
             }
         }
+        let active = self.keymap_manager.active_profile_id().to_string();
+        let _ = self.settings.update(cx, |settings, cx| {
+            if settings.current.general.keymap_profile != active {
+                settings
+                    .update_setting(|schema| schema.general.keymap_profile = active.clone(), cx);
+            }
+        });
         self.keymap_manager.active_profile_id()
     }
 
@@ -2994,6 +3025,19 @@ impl StudioLayout {
             && matches!(key, "p" | "P")
         {
             return Some("tools:command-palette".to_string());
+        }
+        // Quit is the one accelerator the shared keymaps can't express portably:
+        // they bind `app:quit` to `Alt+F4` for Windows, which leaves macOS/Linux
+        // with no keyboard quit at all. Cmd+Q (macOS) and Ctrl+Q (Windows/Linux)
+        // are the platform conventions, so honor both here regardless of profile.
+        // `mods.platform` is Cmd on macOS; `mods.control` covers Ctrl elsewhere.
+        if (mods.control || mods.platform)
+            && !mods.shift
+            && !mods.alt
+            && !mods.function
+            && matches!(key, "q" | "Q")
+        {
+            return Some("app:quit".to_string());
         }
         None
     }
