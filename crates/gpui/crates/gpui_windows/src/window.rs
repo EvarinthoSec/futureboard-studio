@@ -133,8 +133,29 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = match DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
+        {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                log::error!(
+                    "DirectX renderer creation failed hwnd={:?} adapter={} direct_composition_disabled={} error={error:#}",
+                    hwnd,
+                    crate::directx_devices::adapter_identity(&directx_devices.adapter),
+                    disable_direct_composition
+                );
+                match unsafe { directx_devices.device.GetDeviceRemovedReason() } {
+                    Ok(()) => {
+                        log::info!("D3D11 device removal status=S_OK during renderer failure")
+                    }
+                    Err(reason) => log::error!(
+                        "D3D11 GetDeviceRemovedReason HRESULT=0x{:08X} message={}",
+                        reason.code().0 as u32,
+                        reason.message()
+                    ),
+                }
+                return Err(error).context("Creating DirectX renderer");
+            }
+        };
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;

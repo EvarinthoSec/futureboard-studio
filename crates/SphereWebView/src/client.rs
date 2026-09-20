@@ -191,6 +191,10 @@ wrap_life_span_handler! {
                     "[cef-lifecycle] event=OnAfterCreated browser_id={id} thread={:?}",
                     std::thread::current().id()
                 );
+                log::info!(
+                    "event=OnAfterCreated browser_id={id} thread={:?}",
+                    std::thread::current().id()
+                );
             }
         }
 
@@ -211,6 +215,10 @@ wrap_life_span_handler! {
             if cef_diagnostics_enabled() {
                 eprintln!(
                     "[cef-lifecycle] event=OnBeforeClose browser_id={id} thread={:?}",
+                    std::thread::current().id()
+                );
+                log::info!(
+                    "event=OnBeforeClose browser_id={id} thread={:?}",
                     std::thread::current().id()
                 );
             }

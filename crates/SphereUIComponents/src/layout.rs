@@ -1884,7 +1884,8 @@ impl StudioLayout {
                 self.create_tempo_automation(cx);
             }
             "tempo:edit-bpm" => {
-                self.begin_bpm_edit(cx);
+                let point_id = self.tempo_track_context_point_id();
+                self.begin_bpm_edit(point_id, cx);
             }
             "tempo:clear" => {
                 self.clear_tempo_automation(cx);

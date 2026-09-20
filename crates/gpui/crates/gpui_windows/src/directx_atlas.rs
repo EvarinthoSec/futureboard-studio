@@ -166,7 +166,13 @@ impl PlatformAtlas for DirectXAtlas {
         let source = lock.open_shared_source(shared_handle)?;
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { source.GetDesc(&mut source_desc) };
-        lock.report_first_shared_texture(&source_desc);
+        lock.report_first_shared_texture(&source, &source_desc);
+        if source_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32 != 0 {
+            lock.shared_textures.remove(&shared_handle);
+            anyhow::bail!(
+                "CEF shared texture requires keyed-mutex synchronization, but no producer key protocol is available; software OSR fallback required"
+            );
+        }
         let source_right = source_origin.x.0.saturating_add(size.width.0);
         let source_bottom = source_origin.y.0.saturating_add(size.height.0);
         if source_origin.x.0 < 0
@@ -261,11 +267,10 @@ impl DirectXAtlasState {
     /// Everything here is fixed for the lifetime of a browser, so it is logged
     /// once rather than measured.
     ///
-    /// `SHARED_KEYEDMUTEX` is the field that decides whether the copy below is
-    /// even correct: a surface carrying that flag expects
-    /// `IDXGIKeyedMutex::AcquireSync`/`ReleaseSync` around every access. This
-    /// path does not take the mutex, so if the flag is set the copy races
-    /// Chromium's writes and the driver is absorbing it with stalls.
+    /// A surface carrying `SHARED_KEYEDMUTEX` expects `AcquireSync`/`ReleaseSync`
+    /// around every access. This importer does not know CEF's producer key
+    /// protocol, so the caller rejects that surface and recreates the browser
+    /// in software OSR instead of racing the producer.
     ///
     /// **Adapter identity is reported, not inferred.** D3D11 has no
     /// "cross-adapter" misc flag to test — that is a D3D12 heap property — and
@@ -275,7 +280,7 @@ impl DirectXAtlasState {
     /// CEF's own GPU selection in `chrome://gpu`. A genuine mismatch surfaces
     /// as `OpenSharedResource1` failing, which the caller reports as a copy
     /// failure and which retires the browser to software OSR.
-    fn report_first_shared_texture(&self, desc: &D3D11_TEXTURE2D_DESC) {
+    fn report_first_shared_texture(&self, source: &ID3D11Texture2D, desc: &D3D11_TEXTURE2D_DESC) {
         use std::sync::atomic::{AtomicBool, Ordering};
         static REPORTED: AtomicBool = AtomicBool::new(false);
         if REPORTED.swap(true, Ordering::Relaxed) {
@@ -283,27 +288,49 @@ impl DirectXAtlasState {
         }
 
         let keyed_mutex = desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32 != 0;
+        let keyed_mutex_available = source
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex>()
+            .is_ok();
         if keyed_mutex {
-            eprintln!(
-                "[osr-gpu] WARNING: CEF shared texture declares SHARED_KEYEDMUTEX but this copy \
-                 path does not Acquire/ReleaseSync. The copy is unsynchronised against Chromium's \
-                 writes; the driver is hiding it behind stalls."
+            log::warn!(
+                "CEF shared texture has SHARED_KEYEDMUTEX; importer will use software fallback because producer synchronization keys are unknown"
             );
         }
-        if !osr_profile::enabled() {
+        if !osr_profile::enabled()
+            && std::env::args_os().skip(1).all(|arg| {
+                !arg.to_string_lossy()
+                    .eq_ignore_ascii_case("--gpu-diagnostics")
+            })
+            && std::env::var_os("FUTUREBOARD_GPU_DIAGNOSTICS").is_none()
+        {
             return;
         }
         eprintln!(
-            "[osr-gpu] first accelerated frame: {}x{} format={:?} samples={} misc_flags=0x{:X} \
-             keyed_mutex={keyed_mutex} nt_handle={} gpui_adapter={} \
+            "[osr-gpu] first accelerated frame: {}x{} format={:?} usage={:?} bind_flags=0x{:X} samples={} misc_flags=0x{:X} \
+             keyed_mutex={keyed_mutex} keyed_mutex_available={keyed_mutex_available} handle_type={} gpui_adapter={} \
              (compare against chrome://gpu's adapter for the CEF GPU process)",
             desc.Width,
             desc.Height,
             desc.Format,
+            desc.Usage,
+            desc.BindFlags,
             desc.SampleDesc.Count,
             desc.MiscFlags,
-            desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32 != 0,
+            if desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32 != 0 {
+                "NT"
+            } else {
+                "legacy"
+            },
             self.adapter_identity(),
+        );
+        log::info!(
+            "CEF shared texture metadata width={} height={} format={:?} usage={:?} bind_flags=0x{:X} misc_flags=0x{:X} keyed_mutex={keyed_mutex} keyed_mutex_available={keyed_mutex_available}",
+            desc.Width,
+            desc.Height,
+            desc.Format,
+            desc.Usage,
+            desc.BindFlags,
+            desc.MiscFlags
         );
     }
 

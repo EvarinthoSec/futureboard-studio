@@ -205,14 +205,16 @@ impl JamApiClient {
 
     /// `DELETE /v1/jams/{jam_id}`
     pub fn close_jam(&self, jam_id: &str) -> Result<()> {
+        let request_id = client_request_id();
         let url = self
             .config
             .api_endpoint(&format!("/v1/jams/{}", encode_segment(jam_id)))?;
         let response = self
             .authorized(self.http.delete(url))?
+            .header("X-Request-Id", &request_id)
             .send()
             .map_err(http_error)?;
-        self.check_status(response).map(|_| ())
+        self.check_status(response, &request_id).map(|_| ())
     }
 
     /// `GET /v1/jams/{jam_id}/participants`
@@ -253,22 +255,26 @@ impl JamApiClient {
     // ── plumbing ────────────────────────────────────────────────────────────
 
     fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let request_id = client_request_id();
         let url = self.config.api_endpoint(path)?;
         let response = self
             .authorized(self.http.get(url))?
+            .header("X-Request-Id", &request_id)
             .send()
             .map_err(http_error)?;
-        self.decode(response, path)
+        self.decode(response, path, &request_id)
     }
 
     fn post<B: Serialize, T: for<'de> Deserialize<'de>>(&self, path: &str, body: &B) -> Result<T> {
+        let request_id = client_request_id();
         let url = self.config.api_endpoint(path)?;
         let response = self
             .authorized(self.http.post(url))?
+            .header("X-Request-Id", &request_id)
             .json(body)
             .send()
             .map_err(http_error)?;
-        self.decode(response, path)
+        self.decode(response, path, &request_id)
     }
 
     fn authorized(
@@ -283,14 +289,15 @@ impl JamApiClient {
         &self,
         response: reqwest::blocking::Response,
         path: &str,
+        request_id: &str,
     ) -> Result<T> {
-        let body = self.check_status(response)?;
+        let body = self.check_status(response, request_id)?;
         if body.trim().is_empty() {
             return Err(JamError::Api(WireError {
                 code: crate::error::ErrorCode::Internal,
                 message: format!("{path} returned an empty body"),
                 retryable: true,
-                request_id: String::new(),
+                request_id: request_id.to_string(),
             }));
         }
         serde_json::from_str(&body).map_err(|error| {
@@ -303,22 +310,59 @@ impl JamApiClient {
     /// A body that is not the documented shape still becomes a typed error
     /// rather than a parse failure: a proxy that returns HTML for a 502 must
     /// not look like a protocol bug.
-    fn check_status(&self, response: reqwest::blocking::Response) -> Result<String> {
+    fn check_status(
+        &self,
+        response: reqwest::blocking::Response,
+        client_request_id: &str,
+    ) -> Result<String> {
         let status = response.status();
+        let request_id = response
+            .headers()
+            .get("X-Request-Id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(client_request_id)
+            .to_string();
+        let cloudflare_ray = response
+            .headers()
+            .get("CF-Ray")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string());
         let body = response.text().unwrap_or_default();
         if status.is_success() {
             return Ok(body);
         }
-        if let Ok(wire) = serde_json::from_str::<WireError>(&body) {
+        if let Ok(mut wire) = serde_json::from_str::<WireError>(&body) {
+            if wire.request_id.trim().is_empty() {
+                wire.request_id = request_id;
+            }
             return Err(JamError::Api(wire));
+        }
+        let mut message = format!("the jam service answered {}", status.as_u16());
+        if let Some(content_type) = content_type {
+            message.push_str(&format!(" with a non-API response ({content_type})"));
+        }
+        if let Some(ray) = cloudflare_ray {
+            message.push_str(&format!(" (Cloudflare Ray ID {ray})"));
         }
         Err(JamError::Api(WireError {
             code: status_code(status.as_u16()),
-            message: format!("the jam service answered {}", status.as_u16()),
+            message,
             retryable: status.is_server_error(),
-            request_id: String::new(),
+            request_id,
         }))
     }
+}
+
+fn client_request_id() -> String {
+    format!("fb-{:032x}", rand::random::<u128>())
 }
 
 fn http_error(error: reqwest::Error) -> JamError {

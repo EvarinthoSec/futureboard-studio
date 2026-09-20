@@ -21,6 +21,7 @@ required-features = ["cef-runtime"]
 cef = { workspace = true, optional = true }
 download-cef = { workspace = true, optional = true }
 thiserror.workspace = true
+log.workspace = true
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
