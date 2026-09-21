@@ -27,6 +27,7 @@ use crate::theme::{self, space, Colors};
 /// align itself under the clicked label.
 pub type MenuOpenCb = menu_bar::MenuOpenCb;
 pub type ChromeActionCb = Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>;
+pub type ChromeRightClickCb = Arc<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>;
 pub type ProjectOpenCb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
 pub type BpmChangeCb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
 pub type BpmDragCb = Arc<dyn Fn(&BpmDragSample, &mut Window, &mut App) + 'static>;
@@ -88,7 +89,7 @@ fn chrome_action_button(
     color: gpui::Rgba,
     action: ChromeActionCb,
     shortcut: Option<String>,
-    on_right_click: Option<impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>,
+    on_right_click: Option<ChromeRightClickCb>,
 ) -> impl gpui::IntoElement {
     let label = label.into();
     // Build the 26×26 stateful button first, then wrap it in a flex-col outer
@@ -126,6 +127,11 @@ fn chrome_action_button(
     .active(move |style| style.bg(chrome_button_pressed(toggled.unwrap_or(false))))
     .cursor(gpui::CursorStyle::PointingHand)
     .on_click(move |_, window, cx| action(&(), window, cx))
+    .when_some(on_right_click, |button, handler| {
+        button.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+            handler(event, window, cx)
+        })
+    })
     .occlude();
 
     div()
@@ -698,6 +704,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Colors::text_secondary(),
             on_return,
             None,
+            None,
         ))
         .child(chrome_action_button(
             "transport-play",
@@ -707,6 +714,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             play_color,
             on_play,
             Some(accel_display("Space")),
+            None,
         ))
         .child(chrome_action_button(
             "transport-stop",
@@ -716,6 +724,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Colors::text_secondary(),
             on_stop,
             Some(accel_display("Shift+Space")),
+            None,
         ))
         .child(chrome_action_button(
             "transport-record",
@@ -725,6 +734,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             record_color,
             on_record,
             Some(accel_display("R")),
+            None,
         ));
 
     // Count-in split control: the label is a true on/off toggle, the chevron
@@ -837,6 +847,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             loop_color,
             on_loop,
             Some(accel_display("L")),
+            None,
         ))
         .child(chrome_action_button(
             "transport-metronome",
@@ -846,21 +857,20 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             metronome_color,
             on_metronome,
             Some(accel_display("K")),
+            None,
         ))
-        .child(
-            chrome_action_button(
-                "transport-follow-playhead",
-                assets::TIMELINE_SCROLL_PATH,
-                label_follow,
-                Some(state.follow_playhead),
-                follow_color,
-                on_follow,
-                None,
-            )
-            .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
+        .child(chrome_action_button(
+            "transport-follow-playhead",
+            assets::TIMELINE_SCROLL_PATH,
+            label_follow,
+            Some(state.follow_playhead),
+            follow_color,
+            on_follow,
+            None,
+            Some(Arc::new(move |_, window, cx| {
                 on_follow_mode(&(), window, cx);
-            }),
-        );
+            })),
+        ));
 
     // ── Centre track: the readout panel ──────────────────────────────────────
     let position_value = div()
@@ -1128,7 +1138,7 @@ fn panel_toggle_button(
     } else {
         Colors::text_muted()
     };
-    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click, shortcut)
+    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click, shortcut, None)
 }
 
 fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
