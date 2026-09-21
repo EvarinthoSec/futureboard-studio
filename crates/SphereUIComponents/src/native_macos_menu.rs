@@ -132,7 +132,7 @@ pub fn install_native_macos_menu(cx: &mut App) {
 mod macos {
     use gpui::{App, KeyBinding, Menu, MenuItem as GpuiMenuItem, SharedString, SystemMenuType};
 
-    use super::{ApplicationMenuEntry, APP_WINDOW_TITLE};
+    use super::{APP_WINDOW_TITLE, ApplicationMenuEntry};
     use crate::menu::{MenuItem as AppMenuItem, MenuItemKind, MenuManifest};
 
     #[derive(Clone, PartialEq, gpui::Action)]
@@ -173,11 +173,10 @@ mod macos {
             }
         }
         let key = key?;
-        // Require a Cmd/Alt anchor: a bare or Shift-only key equivalent would let
-        // the menubar intercept an ordinary keystroke (e.g. Space, R, Shift+B).
-        if !cmd && !alt {
-            return None;
-        }
+        // The native menu is also the shortcut reference surface. Keep bare and
+        // Shift-only accelerators here so macOS renders every manifest shortcut
+        // in the menu (Space, R, L, K, V, P, arrows, etc.). The command is still
+        // dispatched through RunMenuCommand, the same path as the in-app keymap.
         let mut out = String::new();
         if cmd {
             out.push_str("cmd-");
@@ -338,11 +337,8 @@ mod macos {
                 if command == "noop" && !item.enabled {
                     return None;
                 }
-                let name: SharedString = item
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| item.id.clone())
-                    .into();
+                let name: SharedString =
+                    item.label.clone().unwrap_or_else(|| item.id.clone()).into();
                 let command_id: SharedString = command.to_string().into();
                 Some(GpuiMenuItem::action(name, RunMenuCommand { command_id }))
             }
