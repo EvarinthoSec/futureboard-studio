@@ -3,14 +3,12 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
-    Toggled, Window, WindowControlArea,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role, StatefulInteractiveElement,
+    Styled, Toggled, Window, WindowControlArea,
 };
-use crate::theme::space;
 
 use crate::assets;
 use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
-use crate::keymap::accel_display;
 use crate::components::menu_bar;
 use crate::components::text_input::{
     text_field_with_callbacks, TextInputCallbacks, TextInputState,
@@ -20,8 +18,9 @@ use crate::components::title_bar::{
     section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
 };
 use crate::i18n::I18n;
+use crate::keymap::accel_display;
 use crate::platform_chrome::PlatformChromePolicy;
-use crate::theme::{self, Colors};
+use crate::theme::{self, space, Colors};
 
 /// Click handler for top-level menu buttons. Receives `(menu_id, anchor_x)`
 /// — anchor_x is the click X position which the dropdown overlay uses to
@@ -89,7 +88,8 @@ fn chrome_action_button(
     color: gpui::Rgba,
     action: ChromeActionCb,
     shortcut: Option<String>,
-) -> gpui::Div {
+    on_right_click: Option<impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>,
+) -> impl gpui::IntoElement {
     let label = label.into();
     // Build the 26×26 stateful button first, then wrap it in a flex-col outer
     // container so the optional shortcut-hint pill sits *below* the icon rather
@@ -132,7 +132,7 @@ fn chrome_action_button(
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(theme::space::HAIR))
+        .gap(px(space::HAIR))
         .child(button)
         .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
 }
