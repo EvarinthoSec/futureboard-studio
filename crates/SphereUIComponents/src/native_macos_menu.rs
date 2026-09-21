@@ -132,7 +132,7 @@ pub fn install_native_macos_menu(cx: &mut App) {
 mod macos {
     use gpui::{App, KeyBinding, Menu, MenuItem as GpuiMenuItem, SharedString, SystemMenuType};
 
-    use super::{ApplicationMenuEntry, APP_WINDOW_TITLE};
+    use super::{APP_WINDOW_TITLE, ApplicationMenuEntry};
     use crate::menu::{MenuItem as AppMenuItem, MenuItemKind, MenuManifest};
 
     #[derive(Clone, PartialEq, gpui::Action)]
@@ -338,15 +338,89 @@ mod macos {
                 if command == "noop" && !item.enabled {
                     return None;
                 }
-                let name: SharedString = item
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| item.id.clone())
-                    .into();
+                let base_name = item.label.clone().unwrap_or_else(|| item.id.clone());
+
+                // Items whose shortcut is a bare key or Shift-only chord cannot
+                // be registered as an AppKit key equivalent (they would intercept
+                // ordinary keystrokes). For those we append a tab-separated hint
+                // so the shortcut is still discoverable in the menu.
+                // Items that WILL receive a real AppKit key equiv (Cmd/Alt chords)
+                // keep a plain label — AppKit renders their shortcut column itself.
+                let name: SharedString = if manifest_accel_to_mac_keystroke(
+                    command,
+                    item.shortcut.as_deref().unwrap_or(""),
+                )
+                .is_none()
+                {
+                    if let Some(accel) = item.shortcut.as_deref().filter(|s| !s.is_empty()) {
+                        format!("{base_name}\t{}", accel_to_display_hint(accel)).into()
+                    } else {
+                        base_name.into()
+                    }
+                } else {
+                    base_name.into()
+                };
+
                 let command_id: SharedString = command.to_string().into();
                 Some(GpuiMenuItem::action(name, RunMenuCommand { command_id }))
             }
         }
+    }
+
+    /// Format a Windows-style accelerator string as a compact display hint for
+    /// the tab-separated shortcut slot in NSMenuItem titles. Used only for bare
+    /// keys and Shift-only chords that cannot become real AppKit key equivalents.
+    fn accel_to_display_hint(accel: &str) -> String {
+        let mut cmd = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut key = String::new();
+        for part in accel.split('+') {
+            match part.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "ctrl" | "control" | "cmd" | "command" | "meta" | "super" => cmd = true,
+                "alt" | "option" | "opt" => alt = true,
+                "shift" => shift = true,
+                k => {
+                    key = match k {
+                        "space" => "Space".into(),
+                        "escape" | "esc" => "Esc".into(),
+                        "delete" | "del" => "Del".into(),
+                        "backspace" => "⌫".into(),
+                        "return" | "enter" => "↩".into(),
+                        "tab" => "Tab".into(),
+                        "home" => "Home".into(),
+                        "end" => "End".into(),
+                        "pageup" | "page_up" | "pgup" => "PgUp".into(),
+                        "pagedown" | "page_down" | "pgdn" => "PgDn".into(),
+                        "arrowleft" | "arrow_left" | "left" => "←".into(),
+                        "arrowright" | "arrow_right" | "right" => "→".into(),
+                        "arrowup" | "arrow_up" | "up" => "↑".into(),
+                        "arrowdown" | "arrow_down" | "down" => "↓".into(),
+                        s if s.len() > 1
+                            && s.starts_with('f')
+                            && s[1..].chars().all(|c| c.is_ascii_digit()) =>
+                        {
+                            s.to_uppercase()
+                        }
+                        s if s.chars().count() == 1 => s.to_uppercase(),
+                        s => s.to_string(),
+                    };
+                }
+            }
+        }
+        let mut out = String::new();
+        if cmd {
+            out.push('⌘');
+        }
+        if alt {
+            out.push('⌥');
+        }
+        if shift {
+            out.push('⇧');
+        }
+        out.push_str(&key);
+        out
     }
 }
 
