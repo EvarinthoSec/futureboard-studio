@@ -3,9 +3,10 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
     Toggled, Window, WindowControlArea,
 };
+use crate::theme::space;
 
 use crate::assets;
 use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
@@ -20,7 +21,7 @@ use crate::components::title_bar::{
 };
 use crate::i18n::I18n;
 use crate::platform_chrome::PlatformChromePolicy;
-use crate::theme::Colors;
+use crate::theme::{self, Colors};
 
 /// Click handler for top-level menu buttons. Receives `(menu_id, anchor_x)`
 /// — anchor_x is the click X position which the dropdown overlay uses to
@@ -88,9 +89,14 @@ fn chrome_action_button(
     color: gpui::Rgba,
     action: ChromeActionCb,
     shortcut: Option<String>,
-) -> gpui::Stateful<gpui::Div> {
+) -> gpui::Div {
     let label = label.into();
-    chrome_button(
+    // Build the 26×26 stateful button first, then wrap it in a flex-col outer
+    // container so the optional shortcut-hint pill sits *below* the icon rather
+    // than beside it inside the fixed-size box. Previously the pill was appended
+    // as a child of the button div itself (flex-row), which pushed it inline
+    // next to the icon and caused the button to overflow its 26 px width.
+    let button = chrome_button(
         Some(icon_path),
         label.clone(),
         toggled.unwrap_or(false),
@@ -120,8 +126,15 @@ fn chrome_action_button(
     .active(move |style| style.bg(chrome_button_pressed(toggled.unwrap_or(false))))
     .cursor(gpui::CursorStyle::PointingHand)
     .on_click(move |_, window, cx| action(&(), window, cx))
-    .occlude()
-    .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
+    .occlude();
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(theme::space::HAIR))
+        .child(button)
+        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
 }
 
 #[derive(Clone)]
