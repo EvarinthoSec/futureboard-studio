@@ -355,12 +355,87 @@ mod macos {
                 if command == "noop" && !item.enabled {
                     return None;
                 }
-                let name = item.label.clone().unwrap_or_else(|| item.id.clone());
-                // Ensure the action payload owns its command id ('static).
+                let base_name = item.label.clone().unwrap_or_else(|| item.id.clone());
+
+                // For items whose shortcut is a bare key or focus-gated command
+                // that cannot be set as an AppKit key equivalent (it would intercept
+                // ordinary typing or steal focus from the piano roll), append a
+                // display-only hint to the item name. AppKit renders text after a
+                // tab character right-aligned in the shortcut column, matching the
+                // appearance of real key equivalents.
+                let will_have_key_equiv = item
+                    .shortcut
+                    .as_deref()
+                    .and_then(|accel| manifest_accel_to_mac_keystroke(command, accel))
+                    .is_some();
+
+                let name: SharedString = if !will_have_key_equiv {
+                    if let Some(accel) = item.shortcut.as_deref().filter(|s| !s.is_empty()) {
+                        format!("{base_name}\t{}", format_shortcut_for_display(accel)).into()
+                    } else {
+                        base_name.into()
+                    }
+                } else {
+                    base_name.into()
+                };
+
                 let command_id: SharedString = command.to_string().into();
                 Some(GpuiMenuItem::action(name, RunMenuCommand { command_id }))
             }
         }
+    }
+
+    /// Convert a Windows-style shortcut string (e.g. `"Ctrl+X"`, `"Space"`,
+    /// `"Shift+ArrowLeft"`) into a display string suitable for the tab-separated
+    /// shortcut column in an NSMenuItem title. Uses macOS glyph conventions:
+    /// ⌘ Ctrl, ⌥ Alt, ⇧ Shift, then the key.
+    fn format_shortcut_for_display(accel: &str) -> String {
+        let mut cmd = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut key_display = String::new();
+
+        for raw in accel.split('+') {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "ctrl" | "control" | "cmd" | "command" | "meta" | "super" => cmd = true,
+                "alt" | "option" | "opt" => alt = true,
+                "shift" => shift = true,
+                other => {
+                    key_display = match other {
+                        "space" => "Space".to_string(),
+                        "escape" | "esc" => "⎋".to_string(),
+                        "delete" | "del" => "⌫".to_string(),
+                        "backspace" => "⌦".to_string(),
+                        "return" | "enter" => "↩".to_string(),
+                        "tab" => "⇥".to_string(),
+                        "home" => "↖".to_string(),
+                        "end" => "↘".to_string(),
+                        "pageup" | "page_up" | "pgup" => "⇞".to_string(),
+                        "pagedown" | "page_down" | "pgdn" => "⇟".to_string(),
+                        "arrowleft" | "arrow_left" | "left" => "←".to_string(),
+                        "arrowright" | "arrow_right" | "right" => "→".to_string(),
+                        "arrowup" | "arrow_up" | "up" => "↑".to_string(),
+                        "arrowdown" | "arrow_down" | "down" => "↓".to_string(),
+                        "f1" => "F1".to_string(), "f2" => "F2".to_string(),
+                        "f3" => "F3".to_string(), "f4" => "F4".to_string(),
+                        "f5" => "F5".to_string(), "f6" => "F6".to_string(),
+                        "f7" => "F7".to_string(), "f8" => "F8".to_string(),
+                        "f9" => "F9".to_string(), "f10" => "F10".to_string(),
+                        "f11" => "F11".to_string(), "f12" => "F12".to_string(),
+                        k if k.chars().count() == 1 => k.to_uppercase(),
+                        k => k.to_string(),
+                    };
+                }
+            }
+        }
+
+        let mut out = String::new();
+        if cmd   { out.push('⌘'); }
+        if alt   { out.push('⌥'); }
+        if shift { out.push('⇧'); }
+        out.push_str(&key_display);
+        out
     }
 }
 
