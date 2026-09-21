@@ -1156,7 +1156,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.browser"),
             state.browser_visible,
             on_browser,
-            Some(crate::keymap::accel_display("Ctrl+1")),
+            None,
         ))
         .child(panel_toggle_button(
             "panel-bottom-toggle",
@@ -1164,7 +1164,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.bottom"),
             state.bottom_panel_visible,
             on_bottom_panel,
-            Some(crate::keymap::accel_display("Ctrl+7")),
+            None,
         ))
         .child(panel_toggle_button(
             "panel-inspector-toggle",
@@ -1172,7 +1172,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.inspector"),
             state.inspector_visible,
             on_inspector,
-            Some(crate::keymap::accel_display("Ctrl+2")),
+            None,
         ))
 }
 
