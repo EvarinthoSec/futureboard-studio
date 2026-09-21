@@ -713,7 +713,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.playing),
             play_color,
             on_play,
-            Some(accel_display("Space")),
+            None,
             None,
         ))
         .child(chrome_action_button(
@@ -723,7 +723,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
             Colors::text_secondary(),
             on_stop,
-            Some(accel_display("Shift+Space")),
+            None,
             None,
         ))
         .child(chrome_action_button(
@@ -733,7 +733,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.recording),
             record_color,
             on_record,
-            Some(accel_display("R")),
+            None,
             None,
         ));
 
@@ -846,7 +846,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.loop_enabled),
             loop_color,
             on_loop,
-            Some(accel_display("L")),
+            None,
             None,
         ))
         .child(chrome_action_button(
@@ -856,7 +856,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.metronome_enabled),
             metronome_color,
             on_metronome,
-            Some(accel_display("K")),
+            None,
             None,
         ))
         .child(chrome_action_button(
